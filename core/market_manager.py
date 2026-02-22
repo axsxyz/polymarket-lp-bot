@@ -46,6 +46,7 @@ class MarketManager:
         self._client = client
         self._settings = settings
         self._markets: List[MarketCandidate] = []
+        self._token_index: Dict[str, MarketCandidate] = {}
         self._last_refresh: Optional[datetime] = None
 
     @property
@@ -88,6 +89,7 @@ class MarketManager:
 
         self._allocate_capital(ranked)
         self._markets = ranked
+        self._rebuild_token_index()
         self._last_refresh = datetime.now(timezone.utc)
         self._save_cache()
 
@@ -105,6 +107,10 @@ class MarketManager:
             if m.condition_id == condition_id:
                 return m
         return None
+
+    def get_market_by_token(self, token_id: str) -> Optional[MarketCandidate]:
+        """O(1) lookup by token_id (YES or NO). Rebuilt on each refresh."""
+        return self._token_index.get(token_id)
 
     # ------------------------------------------------------------------
     # CLOB fetch (paginated)
@@ -148,10 +154,14 @@ class MarketManager:
         """
         gamma_lookup = await self._fetch_gamma_markets()
 
+        enriched_count = 0
+        unenriched: List[str] = []
         for m in candidates:
             gamma = gamma_lookup.get(m.condition_id)
             if gamma is None:
+                unenriched.append(m.condition_id[:12])
                 continue
+            enriched_count += 1
             if gamma.end_date is not None:
                 m.end_date = gamma.end_date
             if gamma.tags:
@@ -162,6 +172,16 @@ class MarketManager:
                 m.question = gamma.question
             if gamma.tick_size:
                 m.tick_size = gamma.tick_size
+
+        if unenriched:
+            logger.warning(
+                "Gamma enrichment: {}/{} candidates had no Gamma match "
+                "(will be rejected by hard filter — no end_date). "
+                "Sample IDs: {}",
+                len(unenriched), len(candidates),
+                ", ".join(unenriched[:5]),
+            )
+        logger.info("Gamma enrichment complete: {}/{} matched", enriched_count, len(candidates))
 
         return candidates
 
@@ -350,6 +370,19 @@ class MarketManager:
         return adjusted
 
     # ------------------------------------------------------------------
+    # Token index
+    # ------------------------------------------------------------------
+
+    def _rebuild_token_index(self) -> None:
+        """Rebuild {token_id -> MarketCandidate} for O(1) lookups."""
+        self._token_index = {}
+        for m in self._markets:
+            if m.token_id_yes:
+                self._token_index[m.token_id_yes] = m
+            if m.token_id_no:
+                self._token_index[m.token_id_no] = m
+
+    # ------------------------------------------------------------------
     # Cache
     # ------------------------------------------------------------------
 
@@ -415,6 +448,7 @@ class MarketManager:
                     )
                 )
             self._markets = markets
+            self._rebuild_token_index()
             logger.info("Loaded {} markets from cache", len(markets))
             return True
         except Exception as exc:

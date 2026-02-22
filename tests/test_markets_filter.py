@@ -33,10 +33,10 @@ def _candidate(**overrides) -> MarketCandidate:
         "token_id_no": "tok_no",
         "max_spread": 0.10,
         "min_size": 5.0,
-        "reward_rate_daily": 1.0,
+        "reward_rate_daily": 10.0,
         "midpoint": 0.50,
         "end_date": datetime.now(timezone.utc) + timedelta(days=150),
-        "volume_24h": 1000.0,
+        "volume_24h": 5000.0,
         "tick_size": "0.01",
     }
     defaults.update(overrides)
@@ -73,6 +73,18 @@ class TestHardFilters:
         s = _make_settings()
         assert not passes_hard_filters(_candidate(volume_24h=1_000_000), s)
 
+    def test_no_end_date_fails(self):
+        s = _make_settings()
+        assert not passes_hard_filters(_candidate(end_date=None), s)
+
+    def test_too_illiquid_fails(self):
+        s = _make_settings()
+        assert not passes_hard_filters(_candidate(volume_24h=100), s)
+
+    def test_low_reward_rate_fails(self):
+        s = _make_settings()
+        assert not passes_hard_filters(_candidate(reward_rate_daily=1.0), s)
+
 
 class TestDaysRemaining:
     def test_future_end_date(self):
@@ -85,7 +97,8 @@ class TestDaysRemaining:
 
     def test_no_end_date(self):
         c = _candidate(end_date=None)
-        assert c.days_remaining == 999.0
+        assert c.days_remaining == 0.0
+        assert not c.has_end_date
 
 
 class TestNormaliseSpread:

@@ -47,14 +47,20 @@ class Settings(BaseSettings):
     # ── Strategy ────────────────────────────────────────────────────
     MODE: BotMode = BotMode.SAFE
     DRY_RUN: bool = True
-    TIGHTNESS_FACTOR_SAFE: float = Field(default=0.48, ge=0.1, le=0.9)
-    TIGHTNESS_FACTOR_AGGRESSIVE: float = Field(default=0.35, ge=0.1, le=0.9)
+    TIGHTNESS_FACTOR_SAFE: float = Field(default=0.48, ge=0.05, le=0.9)
+    TIGHTNESS_FACTOR_AGGRESSIVE: float = Field(default=0.35, ge=0.05, le=0.9)
     SIZE_MULTIPLIER: float = Field(default=2.0, ge=1.0, le=5.0)
     ALLOW_NAKED_ASKS: bool = True
-    REBALANCE_INTERVAL_SECONDS: int = Field(default=15, ge=5, le=300)
+    REBALANCE_INTERVAL_SECONDS: int = Field(default=15, ge=3, le=300)
     MAX_ORDER_AGE_SECONDS: int = Field(default=600, ge=60, le=3600)
-    ORDER_UPDATE_THRESHOLD_TICKS: int = Field(default=2, ge=1, le=10)
-    POST_BEFORE_CANCEL: bool = True
+    ORDER_UPDATE_THRESHOLD_TICKS: int = Field(default=1, ge=1, le=10)
+    POST_BEFORE_CANCEL: bool = False
+    QUOTE_OFFSET_TICKS: int = Field(default=1, ge=0, le=20)
+
+    # ── WebSocket / Event-Driven Quoting ─────────────────────────────
+    WS_ENABLED: bool = True
+    HOT_REQUOTE_DEBOUNCE_MS: int = Field(default=1000, ge=200, le=5000)
+    ADVERSE_FILL_RATE_THRESHOLD: int = Field(default=3, ge=1, le=20)
 
     # ── API Rate Limiting ───────────────────────────────────────────
     API_RATE_LIMIT_RPS: float = Field(default=3.0, ge=0.1, le=10.0)
@@ -67,6 +73,8 @@ class Settings(BaseSettings):
     MIN_END_DATE_DAYS: int = Field(default=120, ge=1)
     MIN_REWARDS_MAX_SPREAD: float = Field(default=0.03, ge=0.0)
     MAX_24H_VOLUME: float = Field(default=800_000.0, ge=0.0)
+    MIN_24H_VOLUME: float = Field(default=500.0, ge=0.0)
+    MIN_REWARD_RATE_DAILY: float = Field(default=5.0, ge=0.0)
     MIDPOINT_MIN: float = Field(default=0.15, ge=0.0, le=1.0)
     MIDPOINT_MAX: float = Field(default=0.85, ge=0.0, le=1.0)
     PREFERRED_TAGS: List[str] = Field(

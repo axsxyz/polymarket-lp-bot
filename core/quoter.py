@@ -103,10 +103,15 @@ class Quoter:
     def __init__(self, settings: Settings) -> None:
         self._s = settings
         self._scoring_rates: dict[str, float] = {}
+        self._fill_rates: dict[str, float] = {}
 
     def update_scoring_rates(self, rates: dict[str, float]) -> None:
         """Update per-market scoring rates from ScoringMonitor."""
         self._scoring_rates = dict(rates)
+
+    def update_fill_rates(self, rates: dict[str, float]) -> None:
+        """Update per-market fills-per-hour from FillCollector (cold path)."""
+        self._fill_rates = dict(rates)
 
     def compute(
         self,
@@ -166,41 +171,32 @@ class Quoter:
             no_quote=no_quote,
         )
 
-    def _effective_tightness(self, market: MarketCandidate, mid: float) -> float:
-        """Per-market tightness — must stay under 0.50 so full spread < max_spread.
+    def _compute_offset(self, market: MarketCandidate, mid: float) -> float:
+        """Per-market quote offset from mid in dollars.
 
-        The quoter places: bid = mid - max_spread*tf, ask = mid + max_spread*tf.
-        Full spread = 2 * max_spread * tf.  For scoring: full_spread <= max_spread
-        requires tf <= 0.50.  We cap at 0.499 and target 0.30-0.45 for good Q scores.
+        When QUOTE_OFFSET_TICKS > 0, computes the offset directly in dollar
+        terms (ticks * tick_size), incorporating adverse-selection auto-widening.
+        Falls back to the legacy tightness-factor approach when QUOTE_OFFSET_TICKS=0.
 
-        Short-dated or rapidly moving markets get a slight widening (still < 0.50).
-        Scoring-adaptive: non-scoring markets tighten to improve Q; well-scoring
-        markets tighten further to maximize reward.
+        Returns a clamped offset: at least 1 tick, at most max_spread * 0.499.
         """
-        base_tf = self._s.tightness_factor
+        tick = _TICK_MAP.get(market.tick_size, 0.01)
 
-        days = market.days_remaining
-        if days < 7:
-            multiplier = 1.08
-        elif days < 30:
-            multiplier = 1.04
+        if self._s.QUOTE_OFFSET_TICKS > 0:
+            base = self._s.QUOTE_OFFSET_TICKS * tick
+
+            fph = self._fill_rates.get(market.condition_id, 0)
+            adverse_widening = 0
+            if fph > self._s.ADVERSE_FILL_RATE_THRESHOLD:
+                adverse_widening += 1
+            if fph > self._s.ADVERSE_FILL_RATE_THRESHOLD * 3:
+                adverse_widening += 1
+
+            offset = base + adverse_widening * tick
         else:
-            multiplier = 1.0
+            offset = market.max_spread * self._s.tightness_factor
 
-        effective = base_tf * multiplier
-
-        scoring_rate = self._scoring_rates.get(market.condition_id)
-        if scoring_rate is not None:
-            if scoring_rate < 0.3:
-                effective *= 0.90
-            elif scoring_rate > 0.8:
-                effective *= 0.95
-
-        logger.trace("Tightness for {} mid={:.2f} days={:.0f} scoring={} tf={:.3f}",
-                     market.condition_id[:12], mid, days,
-                     f"{scoring_rate:.0%}" if scoring_rate is not None else "n/a",
-                     effective)
-        return max(0.20, min(0.499, effective))
+        return max(tick, min(offset, market.max_spread * 0.499))
 
     def _build_quote(
         self,
@@ -213,55 +209,52 @@ class Quoter:
         is_recovery: bool = False,
         position_size: float = 0.0,
     ) -> Optional[Quote]:
-        """Build bid+ask for a single token book."""
+        """Build bid+ask for a single token book using tick-based offsets."""
         if not token_id:
             return None
         if is_paused:
             logger.debug("Skipping {} — hard-paused due to extreme skew", token_id[:16])
             return None
 
-        tf = self._effective_tightness(market, mid)
+        base_offset = self._compute_offset(market, mid)
+        tick = _TICK_MAP.get(market.tick_size, 0.01)
         max_sp = market.max_spread
         if max_sp > 0.50:
             logger.warning(
-                "max_spread={:.4f} for {} exceeds 0.50 — likely wrong units, capping at 0.50",
+                "max_spread={:.4f} for {} exceeds 0.50 — capping at 0.50",
                 max_sp, market.condition_id[:12],
             )
             max_sp = 0.50
 
-        bid_tf = tf
-        ask_tf = tf
+        bid_offset = base_offset
+        ask_offset = base_offset
 
         if skew_ratio > 0.08:
+            skew_widen = base_offset * skew_ratio * 1.4
+            skew_tighten = base_offset * skew_ratio * 0.85
             if is_heavy_side:
-                bid_tf = min(tf * (1.0 + skew_ratio * 1.4), 0.92)
-                ask_tf = max(tf * (1.0 - skew_ratio * 0.85), 0.12)
+                bid_offset = min(base_offset + skew_widen, max_sp * 0.92)
+                ask_offset = max(base_offset - skew_tighten, tick)
             else:
-                bid_tf = max(tf * (1.0 - skew_ratio * 0.85), 0.12)
-                ask_tf = min(tf * (1.0 + skew_ratio * 1.4), 0.92)
+                bid_offset = max(base_offset - skew_tighten, tick)
+                ask_offset = min(base_offset + skew_widen, max_sp * 0.92)
 
-        # Recovery mode: further widen bid (less buying) and tighten ask
-        # (more selling) on the heavy side to attract fills that reduce position.
         if is_recovery and is_heavy_side:
-            bid_tf = min(bid_tf * 2.0, 0.95)
-            ask_tf = max(ask_tf * 0.5, 0.10)
-
-        bid_offset = max_sp * bid_tf
-        ask_offset = max_sp * ask_tf
+            bid_offset = min(bid_offset * 2.0, max_sp * 0.95)
+            ask_offset = max(ask_offset * 0.5, tick)
 
         raw_bid = mid - bid_offset
         raw_ask = mid + ask_offset
         if raw_bid <= 0.01 or raw_ask >= 0.99:
             logger.warning(
-                "Quote clamped! mid={:.4f} max_spread={:.4f} tf={:.3f} "
+                "Quote clamped! mid={:.4f} max_spread={:.4f} "
                 "bid_offset={:.4f} ask_offset={:.4f} raw_bid={:.4f} raw_ask={:.4f}",
-                mid, max_sp, tf, bid_offset, ask_offset, raw_bid, raw_ask,
+                mid, max_sp, bid_offset, ask_offset, raw_bid, raw_ask,
             )
 
         bid_price = _clamp(_round_to_tick(mid - bid_offset, market.tick_size))
         ask_price = _clamp(_round_to_tick(mid + ask_offset, market.tick_size))
 
-        tick = _TICK_MAP.get(market.tick_size, 0.01)
         if ask_price - bid_price < tick * 1.5:
             bid_price = _clamp(mid - tick * 1.2)
             ask_price = _clamp(mid + tick * 1.2)
@@ -269,17 +262,12 @@ class Quoter:
         half_capital = market.allocated_capital / 2.0
         base_size = market.min_size * self._s.SIZE_MULTIPLIER
 
-        # Capital-constrained sizing: prefer min_size for scoring, but never
-        # exceed what the allocated capital can actually cover.
         max_bid_shares = half_capital / max(bid_price, 0.01)
         max_ask_shares = half_capital / max(1.0 - ask_price, 0.01)
 
         bid_size = round(min(base_size, max_bid_shares), 2)
         ask_size = round(min(base_size, max_ask_shares), 2)
 
-        # Recovery mode: reduce ask size to limit exposure while keeping
-        # the side alive so LP scoring continues and fills can reduce skew.
-        # Never reduce below min_size — sub-min orders don't score.
         if is_recovery and is_heavy_side:
             reduced = round(ask_size * self._s.SKEW_RECOVERY_ASK_SIZE_PCT, 2)
             ask_size = max(reduced, market.min_size)
@@ -289,8 +277,6 @@ class Quoter:
         elif ask_size > position_size:
             ask_size = round(position_size, 2)
 
-        # If we can't meet min_size, skip the side — sub-min orders
-        # don't score for LP rewards and just consume capital/API calls.
         if bid_size > 0 and bid_size < market.min_size:
             logger.info(
                 "Skipping BID for {} — need {} shares but capital only covers {:.0f} (min_size={})",
@@ -312,10 +298,12 @@ class Quoter:
 
         avg_spread = (bid_offset + ask_offset) / 2.0
         q_est = estimate_q_score(max_sp, avg_spread, (bid_size + ask_size) / 2.0)
+        q_pct = ((max_sp - avg_spread) / max_sp) ** 2 * 100 if max_sp > 0 else 0
 
-        logger.trace(
-            "Quote {}  bid={:.4f}x{:.1f}  ask={:.4f}x{:.1f}  Q≈{:.2f}  skew={:.1%}",
-            token_id[:12], bid_price, bid_size, ask_price, ask_size, q_est, skew_ratio
+        logger.info(
+            "Quote {}  bid={:.4f}x{:.1f}  ask={:.4f}x{:.1f}  offset={:.4f}  Q≈{:.2f} ({:.0f}%)  skew={:.1%}",
+            token_id[:12], bid_price, bid_size, ask_price, ask_size,
+            avg_spread, q_est, q_pct, skew_ratio,
         )
 
         return Quote(

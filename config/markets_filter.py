@@ -41,14 +41,27 @@ class MarketCandidate:
 
     @property
     def days_remaining(self) -> float:
+        """Days until market resolves.  Returns 0.0 for unknown end_date
+        so the MIN_END_DATE_DAYS hard filter rejects unenriched markets
+        rather than giving them a 999-day free pass."""
         if self.end_date is None:
-            return 999.0
+            return 0.0
         delta = self.end_date - datetime.now(timezone.utc)
         return max(delta.total_seconds() / 86400, 0.0)
+
+    @property
+    def has_end_date(self) -> bool:
+        return self.end_date is not None
 
 
 def passes_hard_filters(m: MarketCandidate, s: Settings) -> bool:
     """Return True if the market passes all hard (non-negotiable) filters."""
+
+    # Must have a known end_date from Gamma enrichment — without it we
+    # cannot enforce the minimum-days rule and risk entering markets that
+    # resolve imminently (e.g. "NYC snow this weekend" with 1 day left).
+    if not m.has_end_date:
+        return False
 
     if m.max_spread < s.MIN_REWARDS_MAX_SPREAD:
         return False
@@ -60,6 +73,12 @@ def passes_hard_filters(m: MarketCandidate, s: Settings) -> bool:
         return False
 
     if m.volume_24h > s.MAX_24H_VOLUME:
+        return False
+
+    if m.volume_24h < s.MIN_24H_VOLUME:
+        return False
+
+    if m.reward_rate_daily < s.MIN_REWARD_RATE_DAILY:
         return False
 
     if m.max_spread <= 0 or m.min_size <= 0:
@@ -109,12 +128,14 @@ def rank_score(m: MarketCandidate, s: Settings) -> float:
             * (1 + tag_bonus)
             * (1 + spread_bonus)
             * capital_efficiency
+            * longevity_bonus
 
     - reward_rate is the daily USDC reward pool for this market
     - estimated_vol penalises high-churn markets
     - tag_bonus gives up to 30% boost for preferred categories
     - spread_bonus rewards wider max_spread (easier to score)
     - capital_efficiency penalises markets that are expensive to seed/quote
+    - longevity_bonus rewards long-dated markets (more LP scoring time)
     """
     vol = estimate_volatility(m)
     tag_bonus = tag_overlap_score(m, s.PREFERRED_TAGS) * 0.3
@@ -127,7 +148,46 @@ def rank_score(m: MarketCandidate, s: Settings) -> float:
     per_market_budget = s.TOTAL_CAPITAL / max(s.MAX_MARKETS, 1)
     capital_eff = 1.0 if seed_cost <= 0 else min(per_market_budget / seed_cost, 2.0) / 2.0
 
-    return (m.reward_rate_daily / denominator) * (1.0 + tag_bonus) * (1.0 + spread_bonus) * capital_eff
+    # Longevity bonus: markets with 180+ days get full bonus (1.3x),
+    # 120-day minimum gets 1.0x, scales linearly between.
+    days = m.days_remaining
+    longevity = 1.0 + 0.3 * min(max((days - 120) / 60.0, 0.0), 1.0)
+
+    # Volume sweet spot: reward moderate liquidity (easy to fill seeds,
+    # not so liquid that pros dominate).  Peak around $5k-$50k/day.
+    vol_24h = max(m.volume_24h, 1.0)
+    if vol_24h < 5_000:
+        liquidity_factor = 0.7 + 0.3 * (vol_24h / 5_000)
+    elif vol_24h <= 50_000:
+        liquidity_factor = 1.0
+    elif vol_24h <= 200_000:
+        liquidity_factor = 1.0 - 0.3 * ((vol_24h - 50_000) / 150_000)
+    else:
+        liquidity_factor = 0.7
+
+    base = (m.reward_rate_daily / denominator) * (1.0 + tag_bonus) * (1.0 + spread_bonus)
+    return base * capital_eff * longevity * liquidity_factor
+
+
+def _rejection_reason(m: MarketCandidate, s: Settings) -> Optional[str]:
+    """Return a short reason string if the market fails a hard filter, else None."""
+    if not m.has_end_date:
+        return "no end_date"
+    if m.days_remaining < s.MIN_END_DATE_DAYS:
+        return f"too short ({m.days_remaining:.0f}d < {s.MIN_END_DATE_DAYS}d)"
+    if m.max_spread < s.MIN_REWARDS_MAX_SPREAD:
+        return f"spread too narrow ({m.max_spread:.3f})"
+    if not (s.MIDPOINT_MIN <= m.midpoint <= s.MIDPOINT_MAX):
+        return f"midpoint out of range ({m.midpoint:.2f})"
+    if m.volume_24h > s.MAX_24H_VOLUME:
+        return f"too liquid (${m.volume_24h:,.0f}/day)"
+    if m.volume_24h < s.MIN_24H_VOLUME:
+        return f"too illiquid (${m.volume_24h:,.0f}/day < ${s.MIN_24H_VOLUME:,.0f})"
+    if m.reward_rate_daily < s.MIN_REWARD_RATE_DAILY:
+        return f"low reward (${m.reward_rate_daily:.1f}/day)"
+    if m.max_spread <= 0 or m.min_size <= 0:
+        return "zero spread or size"
+    return None
 
 
 def filter_and_rank(
@@ -140,7 +200,24 @@ def filter_and_rank(
     """
     from loguru import logger
 
-    passed = [m for m in candidates if passes_hard_filters(m, settings)]
+    passed: List[MarketCandidate] = []
+    rejection_counts: Dict[str, int] = {}
+
+    for m in candidates:
+        reason = _rejection_reason(m, settings)
+        if reason:
+            bucket = reason.split("(")[0].strip()
+            rejection_counts[bucket] = rejection_counts.get(bucket, 0) + 1
+        else:
+            # Double-check with passes_hard_filters (capital efficiency check)
+            if passes_hard_filters(m, settings):
+                passed.append(m)
+            else:
+                rejection_counts["capital too expensive"] = rejection_counts.get("capital too expensive", 0) + 1
+
+    if rejection_counts:
+        summary = ", ".join(f"{k}: {v}" for k, v in sorted(rejection_counts.items(), key=lambda x: -x[1]))
+        logger.info("Filter rejections ({}→{}): {}", len(candidates), len(passed), summary)
 
     for m in passed:
         m.score = rank_score(m, settings)
@@ -154,7 +231,7 @@ def filter_and_rank(
         seed_est = m.min_size * expensive_side * 2
         logger.info(
             "Rank #{}: {} score={:.2f} reward=${:.2f}/day spread={:.3f} "
-            "mid={:.2f} min_size={:.0f} seed_est=${:.0f} days={:.0f} tags={}",
+            "mid={:.2f} min_size={:.0f} seed_est=${:.0f} days={:.0f} vol24h=${:,.0f} tags={}",
             i + 1,
             (m.question[:50] + "…") if len(m.question) > 50 else (m.question or m.condition_id[:16]),
             m.score,
@@ -164,6 +241,7 @@ def filter_and_rank(
             m.min_size,
             seed_est,
             m.days_remaining,
+            m.volume_24h,
             ",".join(m.tags[:3]) if m.tags else "none",
         )
 
@@ -277,8 +355,10 @@ def parse_gamma_market(raw: Dict[str, Any]) -> MarketCandidate:
 
     # ── volume 24h ───────────────────────────────────────────────
     vol_24h = float(
-        raw.get("volume_num_24hr", 0)
-        or raw.get("volume24hr", 0)
+        raw.get("volume24hr", 0)
+        or raw.get("volume_num_24hr", 0)
+        or raw.get("volumeNum24hr", 0)
+        or raw.get("volume24hrClob", 0)
         or 0
     )
 

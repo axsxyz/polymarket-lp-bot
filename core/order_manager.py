@@ -80,6 +80,11 @@ class OrderManager:
         self._recent_fills: List[FillEvent] = []
         self._usdc_balance: Optional[float] = None
         self._committed_capital: float = 0.0
+        self._market_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+    def market_lock(self, condition_id: str) -> asyncio.Lock:
+        """Return the per-market lock (creates on first access)."""
+        return self._market_locks[condition_id]
 
     @property
     def recent_fills(self) -> List[FillEvent]:
@@ -164,14 +169,27 @@ class OrderManager:
                 return (oid, rec)
         return None
 
-    async def _cancel_single(self, order_id: str) -> None:
-        """Cancel one order by ID and remove from local tracking."""
+    async def _cancel_single(self, order_id: str) -> bool:
+        """Cancel one order by ID and remove from local tracking.
+
+        Returns True if the cancel succeeded (or was a dry run).
+        Returns False if the API call failed — the order is left in
+        _live_orders so it can be retried on the next cycle instead of
+        becoming a ghost order that permanently locks tokens.
+        """
         try:
             if not self._s.DRY_RUN:
                 await self._client.cancel(order_id)
         except Exception as exc:
-            logger.debug("Cancel {} failed (may be filled): {}", order_id[:12], exc)
+            err_str = str(exc).lower()
+            if "not found" in err_str or "already" in err_str:
+                logger.info("Cancel {} — already gone (filled/expired): {}", order_id[:12], exc)
+                self._live_orders.pop(order_id, None)
+                return True
+            logger.warning("Cancel {} FAILED — keeping in tracking to retry: {}", order_id[:12], exc)
+            return False
         self._live_orders.pop(order_id, None)
+        return True
 
     # ------------------------------------------------------------------
     # Stale order cleanup (background safety net)
@@ -292,18 +310,32 @@ class OrderManager:
                     quote.token_id[:10],
                     ", ".join(reasons),
                 )
-                if self._s.POST_BEFORE_CANCEL:
+
+                # ASK orders lock conditional tokens 1:1. POST_BEFORE_CANCEL
+                # would double-commit the same tokens and always fail for ASKs.
+                # Always cancel-first for ASK; respect the setting for BID.
+                cancel_first = (side_label == "ASK") or not self._s.POST_BEFORE_CANCEL
+
+                if cancel_first:
+                    cancelled = await self._cancel_single(oid)
+                    if not cancelled:
+                        kept += 1
+                        continue
                     rec = await self._post_single(
                         cid, quote.token_id, sdk_side, new_price, new_size
                     )
-                    await self._cancel_single(oid)
                     if rec:
                         posted.append(rec)
                 else:
-                    await self._cancel_single(oid)
                     rec = await self._post_single(
                         cid, quote.token_id, sdk_side, new_price, new_size
                     )
+                    cancelled = await self._cancel_single(oid)
+                    if not cancelled:
+                        logger.warning(
+                            "Old BID {} cancel failed after new post — may have duplicate",
+                            oid[:12],
+                        )
                     if rec:
                         posted.append(rec)
 
@@ -375,6 +407,49 @@ class OrderManager:
         logger.info("Periodic cleanup — cancelling all orders")
         await self.cancel_all_orders()
 
+    async def reconcile_ghost_orders(self) -> int:
+        """Detect and cancel ghost orders (live on CLOB but not tracked locally).
+
+        Returns the number of ghost orders cancelled.  Should be called
+        periodically (e.g. every 5-10 minutes) to prevent token lock-up.
+        """
+        if self._s.DRY_RUN:
+            return 0
+        try:
+            exchange_orders = await self._client.get_orders()
+        except Exception as exc:
+            logger.warning("Ghost reconciliation — failed to fetch open orders: {}", exc)
+            return 0
+
+        if not isinstance(exchange_orders, list):
+            return 0
+
+        tracked_ids = set(self._live_orders.keys())
+        ghosts: List[str] = []
+        for order in exchange_orders:
+            if not isinstance(order, dict):
+                continue
+            oid = order.get("id") or order.get("orderID") or order.get("order_id", "")
+            if oid and oid not in tracked_ids:
+                ghosts.append(oid)
+
+        if not ghosts:
+            return 0
+
+        logger.warning(
+            "Ghost reconciliation — found {} orders on CLOB not in local tracking, cancelling",
+            len(ghosts),
+        )
+        cancelled = 0
+        for oid in ghosts:
+            try:
+                await self._client.cancel(oid)
+                cancelled += 1
+                logger.info("Ghost order {} cancelled", oid[:12])
+            except Exception as exc:
+                logger.warning("Failed to cancel ghost order {}: {}", oid[:12], exc)
+        return cancelled
+
     # ------------------------------------------------------------------
     # Internal: cancel
     # ------------------------------------------------------------------
@@ -388,21 +463,29 @@ class OrderManager:
                 self._live_orders.pop(oid, None)
             return
 
+        bulk_ok = True
         try:
             await self._client.cancel_market_orders(condition_id)
         except Exception:
+            bulk_ok = False
             for oid in known_ids:
                 try:
                     await self._client.cancel(oid)
                 except Exception as exc:
-                    logger.debug(
-                        "Cancel {} failed (may already be filled): {}",
-                        oid[:12],
-                        exc,
-                    )
+                    err_str = str(exc).lower()
+                    if "not found" in err_str or "already" in err_str:
+                        logger.info("Cancel {} — already gone: {}", oid[:12], exc)
+                    else:
+                        logger.warning(
+                            "Cancel {} failed — keeping in tracking: {}",
+                            oid[:12], exc,
+                        )
+                        continue
+                self._live_orders.pop(oid, None)
 
-        for oid in known_ids:
-            self._live_orders.pop(oid, None)
+        if bulk_ok:
+            for oid in known_ids:
+                self._live_orders.pop(oid, None)
 
     async def cancel_orders_for_market(self, condition_id: str) -> int:
         """Cancel all tracked orders for a specific market.  Returns count cancelled."""
