@@ -18,6 +18,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import collections
 import signal
 import sys
 from datetime import datetime, timezone
@@ -29,14 +30,19 @@ from config.settings import Settings
 from core.client import AsyncClobClient
 from core.inventory import InventoryTracker
 from core.market_manager import MarketManager
-from core.order_manager import OrderManager
+from core.order_manager import OrderManager, QuoteUpdateResult
 from core.fill_collector import FillCollector
 from core.quoter import Quoter, TwoSidedQuotes
 from core.rewards_tracker import RewardsTracker
+from core.inventory_seeder import InventorySeeder
 from core.scoring_monitor import ScoringMonitor
 from utils.discord import DiscordNotifier
 from utils.helpers import seconds_until_midnight_utc
 from utils.logging import setup_logging
+
+# Locks protecting shared state from concurrent mutation by background tasks
+_market_lock = asyncio.Lock()
+_inventory_lock = asyncio.Lock()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,6 +161,9 @@ def _parse_midpoint_value(val) -> float | None:
 # ──────────────────────────────────────────────────────────────────────
 
 
+_MAX_NOTIFIED_ORDERS = 1000
+_notified_orders: collections.OrderedDict = collections.OrderedDict()
+
 async def run_quoting_cycle(
     market_mgr: MarketManager,
     client: AsyncClobClient,
@@ -166,6 +175,7 @@ async def run_quoting_cycle(
     scoring_monitor: ScoringMonitor,
     settings: Settings,
     cycle_index: int = 0,
+    skip_cids: set | None = None,
 ) -> Optional[Tuple[int, float]]:
     """
     One full cycle: collect fills, fetch midpoints, iterate active markets,
@@ -174,7 +184,8 @@ async def run_quoting_cycle(
     Fill collection and midpoint fetching are done once per cycle (not per-market)
     to minimize API calls and prevent double-counting.
     """
-    markets = market_mgr.markets
+    async with _market_lock:
+        markets = market_mgr.markets
     if not markets:
         logger.warning("No active markets — skipping cycle")
         return
@@ -183,12 +194,21 @@ async def run_quoting_cycle(
 
     # ── Step 1: Collect fills once per cycle (P0-1b / P0-2) ─────
     await fill_collector.poll()
-    new_fills = fill_collector.drain()
+    all_fills = fill_collector.drain()
+    known_cids = {m.condition_id for m in markets}
+    new_fills = [f for f in all_fills if f.condition_id in known_cids]
+    if len(all_fills) > len(new_fills):
+        logger.debug(
+            "Filtered {} fills from non-active markets (orphaned orders)",
+            len(all_fills) - len(new_fills),
+        )
+    filled_cids: set = set()
     if new_fills:
-        inventory.record_fills(new_fills)
+        async with _inventory_lock:
+            inventory.record_fills(new_fills)
         for f in new_fills:
-            if f.filled_size * f.price > 50:
-                await discord.send_fill(f.condition_id, f.side, f.price, f.filled_size)
+            filled_cids.add(f.condition_id)
+            asyncio.create_task(discord.send_fill(f.condition_id, f.side, f.price, f.filled_size))
         logger.info("Recorded {} fills into inventory", len(new_fills))
 
     # ── Step 2: Select markets for this cycle (round-robin) ──────
@@ -196,34 +216,58 @@ async def run_quoting_cycle(
         markets, cycle_index, settings.MAX_MARKETS_PER_CYCLE,
     )
 
+    # ── Step 2b: Refresh USDC balance for collateral pre-checks ──
+    await order_mgr.refresh_usdc_balance()
+
     # ── Step 3: Batch fetch midpoints (P0-4 / P3-1) ─────────────
     midpoints = await _batch_fetch_midpoints(client, markets_this_cycle)
     inventory.update_midpoints(midpoints)
 
+    # ── Step 3b: Feed scoring rates into quoter ─────────────────
+    scoring_rates = scoring_monitor.get_all_scoring_rates()
+    if scoring_rates:
+        quoter.update_scoring_rates(scoring_rates)
+
     # ── Step 4: Check global exposure guard (net + gross) ─────────
-    gross_breached = inventory.is_gross_exposure_breached(order_mgr.open_order_notional)
-    net_breached = inventory.is_global_exposure_breached()
+    # Only consider active markets — stale positions from orphaned fills
+    # must not trigger the global limit (they are unmanageable).
+    active_cids = {m.condition_id for m in markets}
+    gross_breached = inventory.is_gross_exposure_breached(
+        order_mgr.open_order_notional, active_cids,
+    )
+    net_breached = inventory.is_global_exposure_breached(active_cids)
     if net_breached or gross_breached:
-        paused = inventory.most_imbalanced_markets(n=5)
         exposure_type = "gross" if gross_breached else "net"
         exposure_val = (
-            inventory.gross_exposure_usd(order_mgr.open_order_notional)
-            if gross_breached else inventory.global_exposure_usd()
+            inventory.gross_exposure_usd(order_mgr.open_order_notional, active_cids)
+            if gross_breached else inventory.global_exposure_usd(active_cids)
         )
+        # Pause at most N-1 markets so at least one stays active for rebalancing
+        max_pause = max(1, len(active_cids) - 1)
+        paused = inventory.most_imbalanced_markets(n=max_pause, active_cids=active_cids)
         logger.warning(
-            "Global {} exposure breached (${:.0f}) — pausing {} markets",
-            exposure_type, exposure_val, len(paused),
+            "Global {} exposure breached (${:.0f}) — pausing {}/{} markets\n{}",
+            exposure_type, exposure_val, len(paused), len(active_cids),
+            inventory.exposure_breakdown(active_cids),
         )
-        await discord.send_alert(
-            title="Global Exposure Limit",
-            message=f"{exposure_type.title()} exposure ${exposure_val:.0f} exceeds limit. Pausing top-5 skewed markets.",
-            level="warning",
-        )
+        if cycle_index % 20 == 0:
+            await discord.send_alert(
+                title="Global Exposure Limit",
+                message=f"{exposure_type.title()} exposure ${exposure_val:.0f} exceeds limit. Pausing {len(paused)}/{len(active_cids)} markets.",
+                level="warning",
+            )
         paused_set = set(paused)
+
+        # Cancel open orders on paused markets to stop further fills
+        for cid in paused_set:
+            await order_mgr.cancel_orders_for_market(cid)
     else:
         paused_set = set()
 
-    # ── Step 5: Per-market quoting ───────────────────────────────
+    if skip_cids:
+        paused_set |= skip_cids
+
+    # ── Step 5: Per-market quoting (parallel with semaphore) ─────
     if markets_this_cycle:
         m0 = markets_this_cycle[0]
         mid0 = midpoints.get(m0.token_id_yes, m0.midpoint)
@@ -232,69 +276,150 @@ async def run_quoting_cycle(
             m0.condition_id[:12], m0.max_spread, m0.min_size, m0.midpoint, mid0, m0.allocated_capital,
         )
 
-    cycle_posted = 0
-    cycle_errors = 0
+    _sem = asyncio.Semaphore(4)
+    cycle_results: list[tuple[int, int, int]] = []  # (posted, kept, errors)
 
-    for market in markets_this_cycle:
-        if market.condition_id in paused_set:
-            continue
+    async def _process_market(market):
+        async with _sem:
+            posted = kept = errors = 0
+            if market.condition_id in paused_set:
+                return (0, 0, 0)
+            try:
+                async with _inventory_lock:
+                    inventory.ensure_position(
+                        market.condition_id,
+                        yes_token_id=market.token_id_yes,
+                        no_token_id=market.token_id_no,
+                    )
+                    skew_action = inventory.evaluate(market.condition_id)
 
-        try:
-            inventory.ensure_position(
-                market.condition_id,
-                yes_token_id=market.token_id_yes,
-                no_token_id=market.token_id_no,
-            )
+                if skew_action.should_alert:
+                    asyncio.create_task(discord.send_skew_warning(
+                        market.condition_id,
+                        skew_action.skew_ratio,
+                        skew_action.heavy_side,
+                    ))
 
-            skew_action = inventory.evaluate(market.condition_id)
+                if skew_action.pause_triggered:
+                    asyncio.create_task(discord.send_skew_pause(
+                        market.condition_id,
+                        skew_action.skew_ratio,
+                        skew_action.heavy_side,
+                        settings.SKEW_PAUSE_DURATION_SECONDS,
+                    ))
 
-            if skew_action.should_alert:
-                await discord.send_skew_warning(
-                    market.condition_id,
-                    skew_action.skew_ratio,
-                    skew_action.heavy_side,
+                live_mid = midpoints.get(market.token_id_yes, market.midpoint)
+
+                pos = inventory.get_position(market.condition_id)
+                quotes = quoter.compute(
+                    market=market,
+                    live_mid=live_mid,
+                    skew_ratio=skew_action.skew_ratio,
+                    heavy_side=skew_action.heavy_side,
+                    paused_side=skew_action.paused_side,
+                    recovery_side=skew_action.recovery_side,
+                    yes_position=pos.yes_size if pos else 0.0,
+                    no_position=pos.no_size if pos else 0.0,
                 )
 
-            if skew_action.pause_triggered:
-                await discord.send_skew_pause(
-                    market.condition_id,
-                    skew_action.skew_ratio,
-                    skew_action.heavy_side,
-                    settings.SKEW_PAUSE_DURATION_SECONDS,
+                force = market.condition_id in filled_cids
+                result = await order_mgr.cancel_and_replace(quotes, force_replace=force)
+                posted = len(result.posted)
+                kept = result.kept
+
+                for rec in result.posted:
+                    market_key = f"{rec.condition_id}:{rec.side}:{rec.token_id}"
+                    if market_key not in _notified_orders:
+                        _notified_orders[market_key] = None
+                        while len(_notified_orders) > _MAX_NOTIFIED_ORDERS:
+                            _notified_orders.popitem(last=False)
+                        asyncio.create_task(discord.send_order_posted(
+                            condition_id=rec.condition_id,
+                            side=rec.side,
+                            token_label=rec.token_id[:12],
+                            price=rec.price,
+                            size=rec.size,
+                            order_id=rec.order_id,
+                        ))
+
+            except Exception as exc:
+                errors = 1
+                logger.error("Cycle error for {}: {}", market.condition_id[:12], exc)
+            return (posted, kept, errors)
+
+    tasks = [_process_market(m) for m in markets_this_cycle]
+    cycle_results = await asyncio.gather(*tasks)
+    cycle_posted = sum(r[0] for r in cycle_results)
+    cycle_kept = sum(r[1] for r in cycle_results)
+    cycle_errors = sum(r[2] for r in cycle_results)
+
+    # ── Step 6: Scoring check + auto-remediation ─────────────────
+    remediate_cids = await scoring_monitor.check_if_due(markets_this_cycle)
+    if remediate_cids:
+        for market in markets_this_cycle:
+            if market.condition_id not in remediate_cids:
+                continue
+            try:
+                live_mid = midpoints.get(market.token_id_yes, market.midpoint)
+                pos = inventory.get_position(market.condition_id)
+                skew_action = inventory.evaluate(market.condition_id)
+                quotes = quoter.compute(
+                    market=market,
+                    live_mid=live_mid,
+                    skew_ratio=skew_action.skew_ratio,
+                    heavy_side=skew_action.heavy_side,
+                    paused_side=skew_action.paused_side,
+                    recovery_side=skew_action.recovery_side,
+                    yes_position=pos.yes_size if pos else 0.0,
+                    no_position=pos.no_size if pos else 0.0,
                 )
-
-            live_mid = midpoints.get(market.token_id_yes, market.midpoint)
-
-            quotes = quoter.compute(
-                market=market,
-                live_mid=live_mid,
-                skew_ratio=skew_action.skew_ratio,
-                heavy_side=skew_action.heavy_side,
-                paused_side=skew_action.paused_side,
-            )
-
-            posted = await order_mgr.cancel_and_replace(quotes)
-            cycle_posted += len(posted)
-
-        except Exception as exc:
-            cycle_errors += 1
-            logger.error("Cycle error for {}: {}", market.condition_id[:12], exc)
-
-    # ── Step 6: Scoring check (non-blocking, skipped if not due) ──
-    await scoring_monitor.check_if_due(markets_this_cycle)
+                result = await order_mgr.cancel_and_replace(quotes, force_replace=True)
+                if result.posted:
+                    logger.info(
+                        "Remediation: force-replaced {} orders for {}",
+                        len(result.posted), market.condition_id[:12],
+                    )
+                    cycle_posted += len(result.posted)
+            except Exception as exc:
+                logger.error("Remediation failed for {}: {}", market.condition_id[:12], exc)
 
     cycle_volume = sum(f.price * f.filled_size for f in new_fills) if new_fills else 0.0
 
+    # ── Per-market metrics logging (Batch 5a) ──────────────────
+    total_allocated = sum(m.allocated_capital for m in markets_this_cycle)
+    total_deployed = order_mgr.open_order_notional
+    capital_utilization = total_deployed / max(total_allocated, 1.0)
+    if cycle_index % 20 == 0:
+        logger.info(
+            "Capital utilization: ${:.0f} deployed / ${:.0f} allocated = {:.0%}",
+            total_deployed, total_allocated, capital_utilization,
+        )
+
     elapsed = asyncio.get_event_loop().time() - cycle_start
     logger.info(
-        "Cycle #{} complete: {}/{} markets, {} orders posted, {} errors, {:.1f}s",
+        "Cycle #{} complete: {}/{} markets, {} posted / {} kept, {} errors, {:.1f}s",
         cycle_index,
         len(markets_this_cycle),
         len(markets),
         cycle_posted,
+        cycle_kept,
         cycle_errors,
         elapsed,
     )
+
+    fill_count = len(new_fills) if new_fills else 0
+    has_news = fill_count > 0 or cycle_errors > 0 or cycle_index == 0
+    if has_news:
+        await discord.send_cycle_summary(
+            cycle_index=cycle_index,
+            markets_count=len(markets_this_cycle),
+            orders_posted=cycle_posted,
+            errors=cycle_errors,
+            elapsed=elapsed,
+            fills=fill_count,
+            scoring_pct=scoring_monitor.last_ratio,
+        )
+
     return cycle_posted, cycle_volume
 
 
@@ -308,7 +433,8 @@ async def market_refresh_task(market_mgr: MarketManager, interval: int = 900) ->
     while True:
         await asyncio.sleep(interval)
         try:
-            await market_mgr.refresh()
+            async with _market_lock:
+                await market_mgr.refresh()
         except Exception as exc:
             logger.error("Market refresh failed: {}", exc)
 
@@ -347,6 +473,64 @@ async def daily_rewards_task(
             logger.error("Daily rewards task failed: {}", exc)
 
 
+async def periodic_dashboard_task(
+    market_mgr: MarketManager,
+    order_mgr: OrderManager,
+    inventory: InventoryTracker,
+    scoring_monitor: ScoringMonitor,
+    discord: DiscordNotifier,
+    settings: Settings,
+    interval: int = 900,
+) -> None:
+    """Send a periodic status dashboard to Discord every 15 minutes."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            deployed = order_mgr.open_order_notional
+            inv_summary = inventory.summary()
+            skew_parts = []
+            for cid, data in inv_summary.items():
+                if cid.startswith("_"):
+                    continue
+                if isinstance(data, dict) and data.get("skew", 0) > 0.15:
+                    skew_parts.append(f"{cid[:8]}={data['skew']:.0%}")
+            skew_str = ", ".join(skew_parts[:5]) if skew_parts else "balanced"
+
+            await discord.send_status_dashboard(
+                capital_deployed=deployed,
+                capital_total=settings.TOTAL_CAPITAL,
+                scoring_pct=scoring_monitor.last_ratio,
+                market_count=market_mgr.market_count,
+                fill_count=inventory.total_fill_count,
+                pnl=inventory.realised_pnl,
+                skew_summary=skew_str,
+            )
+        except Exception as exc:
+            logger.debug("Dashboard send failed: {}", exc)
+
+
+async def dynamic_realloc_task(
+    market_mgr: MarketManager,
+    scoring_monitor: ScoringMonitor,
+    settings: Settings,
+) -> None:
+    """Periodically reallocate capital based on scoring performance."""
+    if not settings.DYNAMIC_REALLOC_ENABLED:
+        return
+    while True:
+        await asyncio.sleep(settings.DYNAMIC_REALLOC_INTERVAL_SECONDS)
+        try:
+            rates = scoring_monitor.get_all_scoring_rates()
+            if rates:
+                async with _market_lock:
+                    market_mgr.apply_performance_multipliers(rates)
+                    adjusted = market_mgr.reallocate_capital(rates)
+                if adjusted:
+                    logger.info("Dynamic reallocation adjusted {} market(s)", adjusted)
+        except Exception as exc:
+            logger.error("Dynamic reallocation failed: {}", exc)
+
+
 async def reconciliation_task(
     client: "AsyncClobClient",
     inventory: InventoryTracker,
@@ -362,11 +546,11 @@ async def reconciliation_task(
                 logger.debug("No balance data for reconciliation — skipping")
                 continue
 
-            exchange_pos = _parse_exchange_positions(balances, inventory)
-            if not exchange_pos:
-                continue
-
-            corrected = inventory.reconcile(exchange_pos)
+            async with _inventory_lock:
+                exchange_pos = _parse_exchange_positions(balances, inventory)
+                if not exchange_pos:
+                    continue
+                corrected = inventory.reconcile(exchange_pos)
             if corrected > 0:
                 logger.info("Reconciliation corrected {} position(s)", corrected)
                 if corrected >= 3:
@@ -462,8 +646,18 @@ async def main() -> None:
     order_mgr = OrderManager(client, settings)
     inventory = InventoryTracker(settings)
     fill_collector = FillCollector(client)
-    scoring_monitor = ScoringMonitor(client, settings, discord)
+    scoring_monitor = ScoringMonitor(client, settings, discord, order_manager=order_mgr)
     rewards = RewardsTracker(client, settings, inventory)
+
+    # ── Cancel orphaned orders from previous sessions ───────────
+    # Orders posted by earlier runs survive restarts.  If left live they
+    # generate fills the inventory tracker cannot attribute correctly,
+    # creating phantom one-sided exposure that triggers the global limit.
+    try:
+        await order_mgr.cancel_all_orders()
+        logger.info("Startup: cleared all pre-existing orders on exchange")
+    except Exception as exc:
+        logger.warning("Startup: failed to clear pre-existing orders: {}", exc)
 
     # ── Load markets ─────────────────────────────────────────────
     if not market_mgr.load_cache():
@@ -477,6 +671,60 @@ async def main() -> None:
         sys.exit(1)
 
     logger.info("Active markets: {}", market_mgr.market_count)
+
+    # ── Inventory seed (acquire minimal token positions for ASK orders) ──
+    unseeded_markets: set = set()
+    if settings.SEED_ENABLED:
+        seeder = InventorySeeder(client, settings, discord)
+        unseeded_markets = await seeder.seed_all(market_mgr.markets)
+
+        if unseeded_markets:
+            logger.info(
+                "{} market(s) failed seeding — BID-only (no ASK without tokens, won't score LP)",
+                len(unseeded_markets),
+            )
+
+        # Re-sync CONDITIONAL allowances so the CLOB recognises the new balances
+        token_ids = []
+        for m in market_mgr.markets:
+            if m.condition_id in unseeded_markets:
+                continue
+            if m.token_id_yes:
+                token_ids.append(m.token_id_yes)
+            if m.token_id_no:
+                token_ids.append(m.token_id_no)
+        if token_ids:
+            await client.sync_conditional_allowances(token_ids)
+
+    # ── Sync on-chain balances into inventory so quoter knows position sizes ──
+    for m in market_mgr.markets:
+        if m.condition_id in unseeded_markets:
+            continue
+        pos = inventory.ensure_position(m.condition_id, m.token_id_yes, m.token_id_no)
+        if m.token_id_yes:
+            bal = await client.get_conditional_balance(m.token_id_yes)
+            if bal > 0 and bal > pos.yes_size:
+                pos.yes_size = bal
+                if pos.yes_cost <= 0:
+                    mid = m.midpoint if m.midpoint > 0 else 0.50
+                    pos.yes_cost = bal * mid
+                logger.info("Inventory sync: {} YES = {:.2f}", m.condition_id[:12], bal)
+        if m.token_id_no:
+            bal = await client.get_conditional_balance(m.token_id_no)
+            if bal > 0 and bal > pos.no_size:
+                pos.no_size = bal
+                if pos.no_cost <= 0:
+                    no_mid = (1.0 - m.midpoint) if m.midpoint > 0 else 0.50
+                    pos.no_cost = bal * no_mid
+                logger.info("Inventory sync: {} NO = {:.2f}", m.condition_id[:12], bal)
+
+    # Advance fill collector watermark past any seed trades so they
+    # don't get reported as regular fills on the first cycle.
+    import time as _time
+    fill_collector._watermark_ts = int(_time.time())
+    fill_collector._save_watermark()
+    logger.debug("Fill watermark advanced to now (skip seed trades)")
+
     await discord.send_startup(
         market_mgr.market_count,
         settings.TOTAL_CAPITAL,
@@ -499,6 +747,10 @@ async def main() -> None:
         asyncio.create_task(stale_order_cleanup_task(order_mgr)),
         asyncio.create_task(daily_rewards_task(rewards, market_mgr, discord, scoring_monitor)),
         asyncio.create_task(reconciliation_task(client, inventory, discord)),
+        asyncio.create_task(dynamic_realloc_task(market_mgr, scoring_monitor, settings)),
+        asyncio.create_task(periodic_dashboard_task(
+            market_mgr, order_mgr, inventory, scoring_monitor, discord, settings,
+        )),
     ]
 
     # ── Main quoting loop ────────────────────────────────────────
@@ -521,6 +773,7 @@ async def main() -> None:
                     scoring_monitor=scoring_monitor,
                     settings=settings,
                     cycle_index=cycle_index,
+                    skip_cids=unseeded_markets,
                 )
                 if result:
                     posted, volume = result
