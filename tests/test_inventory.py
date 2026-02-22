@@ -158,12 +158,50 @@ class TestEvaluate:
         action = inv.evaluate("c1")
         assert action.should_alert
 
-    def test_pause_threshold_triggers_once(self):
-        s = _make_settings(SKEW_PAUSE_THRESHOLD=0.45, SKEW_PAUSE_DURATION_SECONDS=60)
+    def test_recovery_mode_at_intermediate_skew(self):
+        """Skew between SKEW_PAUSE_THRESHOLD and SKEW_HARD_PAUSE_THRESHOLD enters recovery."""
+        s = _make_settings(
+            SKEW_PAUSE_THRESHOLD=0.45,
+            SKEW_HARD_PAUSE_THRESHOLD=0.70,
+            SKEW_PAUSE_DURATION_SECONDS=60,
+        )
+        inv = InventoryTracker(s)
+        inv.ensure_position("c1", yes_token_id="y")
+        inv._positions["c1"].yes_size = 75
+        inv._positions["c1"].no_size = 25  # skew = 0.50
+
+        action = inv.evaluate("c1")
+        assert action.recovery_side == "YES"
+        assert action.paused_side == ""
+        assert not action.pause_triggered
+
+    def test_hard_pause_at_extreme_skew(self):
+        """Skew >= SKEW_HARD_PAUSE_THRESHOLD triggers full pause."""
+        s = _make_settings(
+            SKEW_PAUSE_THRESHOLD=0.45,
+            SKEW_HARD_PAUSE_THRESHOLD=0.70,
+            SKEW_PAUSE_DURATION_SECONDS=60,
+        )
         inv = InventoryTracker(s)
         inv.ensure_position("c1", yes_token_id="y")
         inv._positions["c1"].yes_size = 90
-        inv._positions["c1"].no_size = 10
+        inv._positions["c1"].no_size = 10  # skew = 0.80
+
+        action = inv.evaluate("c1")
+        assert action.pause_triggered
+        assert action.paused_side == "YES"
+        assert action.recovery_side == ""
+
+    def test_pause_threshold_triggers_once(self):
+        s = _make_settings(
+            SKEW_PAUSE_THRESHOLD=0.45,
+            SKEW_HARD_PAUSE_THRESHOLD=0.70,
+            SKEW_PAUSE_DURATION_SECONDS=60,
+        )
+        inv = InventoryTracker(s)
+        inv.ensure_position("c1", yes_token_id="y")
+        inv._positions["c1"].yes_size = 90
+        inv._positions["c1"].no_size = 10  # skew = 0.80
 
         action1 = inv.evaluate("c1")
         assert action1.pause_triggered
