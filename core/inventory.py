@@ -92,7 +92,8 @@ class SkewAction:
     heavy_side: str
     should_alert: bool = False
     should_adjust_quotes: bool = False
-    paused_side: str = ""  # token side to stop quoting entirely
+    paused_side: str = ""  # token side to stop quoting entirely (hard pause >= 0.70)
+    recovery_side: str = ""  # token side in recovery mode (reduced quoting, 0.45-0.70)
     pause_triggered: bool = False  # True only on transition to paused
 
 
@@ -110,12 +111,16 @@ class InventoryTracker:
         self._pause_until: Dict[str, _PauseState] = {}
         self._last_alert_time: Dict[str, datetime] = {}
         self._midpoints: Dict[str, float] = {}  # token_id → mid price
+        self._token_map: Dict[str, tuple] = {}  # token_id → (condition_id, "yes"|"no")
         self._realised_pnl: float = 0.0
         self._total_fill_count: int = 0
 
     @property
     def positions(self) -> Dict[str, MarketPosition]:
         return dict(self._positions)
+
+    def get_position(self, condition_id: str) -> Optional[MarketPosition]:
+        return self._positions.get(condition_id)
 
     # ------------------------------------------------------------------
     # Position tracking
@@ -134,8 +139,10 @@ class InventoryTracker:
         pos = self._positions[condition_id]
         if yes_token_id:
             pos.yes_token_id = yes_token_id
+            self._token_map[yes_token_id] = (condition_id, "yes")
         if no_token_id:
             pos.no_token_id = no_token_id
+            self._token_map[no_token_id] = (condition_id, "no")
         return pos
 
     def update_midpoints(self, midpoints: Dict[str, float]) -> None:
@@ -149,6 +156,14 @@ class InventoryTracker:
     @property
     def total_fill_count(self) -> int:
         return self._total_fill_count
+
+    def register_token_mapping(self, token_id: str, condition_id: str, side: str) -> None:
+        """Register a token → (condition_id, side) mapping for fill routing.
+
+        Called at startup and on market refresh so fills with unknown token IDs
+        can still be attributed to the correct position.
+        """
+        self._token_map[token_id] = (condition_id, side)
 
     def record_fills(self, fills: List[FillEvent]) -> None:
         """
@@ -166,6 +181,15 @@ class InventoryTracker:
 
             self._total_fill_count += 1
 
+            # Try to set missing token IDs from the global token map
+            if not pos.yes_token_id or not pos.no_token_id:
+                mapping = self._token_map.get(f.token_id)
+                if mapping and mapping[0] == f.condition_id:
+                    if mapping[1] == "yes" and not pos.yes_token_id:
+                        pos.yes_token_id = f.token_id
+                    elif mapping[1] == "no" and not pos.no_token_id:
+                        pos.no_token_id = f.token_id
+
             if pos.yes_token_id and f.token_id == pos.yes_token_id:
                 is_yes = True
             elif pos.no_token_id and f.token_id == pos.no_token_id:
@@ -177,9 +201,9 @@ class InventoryTracker:
                 )
                 continue
             elif pos.yes_token_id:
-                is_yes = False  # not YES → must be NO
+                is_yes = False
             else:
-                is_yes = True  # not NO → must be YES
+                is_yes = True
 
             if f.side == "BID":
                 if is_yes:
@@ -235,17 +259,28 @@ class InventoryTracker:
         if ratio >= self._s.SKEW_ACTION_THRESHOLD:
             action.should_adjust_quotes = True
 
-        if ratio >= self._s.SKEW_PAUSE_THRESHOLD or self._is_paused(condition_id):
-            if ratio >= self._s.SKEW_PAUSE_THRESHOLD and not self._is_paused(condition_id):
+        # Two-tier skew management:
+        #   SKEW_PAUSE_THRESHOLD (0.45) .. SKEW_HARD_PAUSE_THRESHOLD (0.70) → recovery mode
+        #   >= SKEW_HARD_PAUSE_THRESHOLD (0.70) or timer still active       → full pause
+        #
+        # Recovery mode keeps reduced ASK to attract fills that reduce the position.
+        # Full pause only at extreme skew where the market is dangerously one-sided.
+        if ratio >= self._s.SKEW_HARD_PAUSE_THRESHOLD or self._is_paused(condition_id):
+            if ratio >= self._s.SKEW_HARD_PAUSE_THRESHOLD and not self._is_paused(condition_id):
                 self._set_pause(condition_id, heavy)
                 action.pause_triggered = True
                 logger.warning(
-                    "SKEW PAUSE TRIGGERED {} → {:.1%} heavy side {} for {}s",
+                    "SKEW HARD PAUSE {} → {:.1%} heavy side {} for {}s",
                     condition_id[:12], ratio, heavy, self._s.SKEW_PAUSE_DURATION_SECONDS
                 )
-            # Use the side that triggered the pause (not current heavy side)
             pause_state = self._pause_until.get(condition_id)
             action.paused_side = pause_state.side if pause_state else heavy
+        elif ratio >= self._s.SKEW_PAUSE_THRESHOLD:
+            action.recovery_side = heavy
+            logger.debug(
+                "Skew recovery mode {} → {:.1%} (heavy: {})",
+                condition_id[:12], ratio, heavy,
+            )
 
         return action
 
@@ -257,35 +292,73 @@ class InventoryTracker:
     # Global exposure guard
     # ------------------------------------------------------------------
 
-    def global_exposure_usd(self) -> float:
-        return sum(p.net_exposure_usd for p in self._positions.values())
+    def global_exposure_usd(self, active_cids: Optional[set] = None) -> float:
+        """Total net exposure, optionally scoped to a set of active markets.
 
-    def is_global_exposure_breached(self) -> bool:
+        Stale positions from non-active markets are excluded when *active_cids*
+        is provided — this prevents orphaned fills from triggering the limit.
+        """
+        positions = self._positions.values()
+        if active_cids is not None:
+            positions = [p for p in positions if p.condition_id in active_cids]
+        return sum(p.net_exposure_usd for p in positions)
+
+    def is_global_exposure_breached(self, active_cids: Optional[set] = None) -> bool:
         limit = self._s.GLOBAL_MAX_EXPOSURE_PCT * self._s.TOTAL_CAPITAL
-        return self.global_exposure_usd() > limit
+        return self.global_exposure_usd(active_cids) > limit
 
-    def gross_exposure_usd(self, open_order_notional: float = 0.0) -> float:
+    def gross_exposure_usd(
+        self, open_order_notional: float = 0.0, active_cids: Optional[set] = None,
+    ) -> float:
         """Total gross exposure: filled positions (mark-to-mid) + open order notional."""
+        positions = self._positions.values()
+        if active_cids is not None:
+            positions = [p for p in positions if p.condition_id in active_cids]
         filled = sum(
             pos.gross_exposure_at_mid(
                 self._midpoints.get(pos.yes_token_id, 0.5)
             )
-            for pos in self._positions.values()
+            for pos in positions
         )
         return filled + open_order_notional
 
-    def is_gross_exposure_breached(self, open_order_notional: float = 0.0) -> bool:
+    def is_gross_exposure_breached(
+        self, open_order_notional: float = 0.0, active_cids: Optional[set] = None,
+    ) -> bool:
         limit = self._s.GLOBAL_MAX_GROSS_EXPOSURE_PCT * self._s.TOTAL_CAPITAL
-        return self.gross_exposure_usd(open_order_notional) > limit
+        return self.gross_exposure_usd(open_order_notional, active_cids) > limit
 
-    def most_imbalanced_markets(self, n: int = 5) -> List[str]:
-        """Return condition_ids of the N most skewed markets."""
+    def most_imbalanced_markets(
+        self, n: int = 5, active_cids: Optional[set] = None,
+    ) -> List[str]:
+        """Return condition_ids of the N most skewed active markets."""
+        positions = self._positions.values()
+        if active_cids is not None:
+            positions = [p for p in positions if p.condition_id in active_cids]
         ranked = sorted(
-            self._positions.values(),
+            positions,
             key=lambda p: p.skew_ratio,
             reverse=True,
         )
         return [p.condition_id for p in ranked[:n]]
+
+    def exposure_breakdown(self, active_cids: Optional[set] = None) -> str:
+        """Per-position exposure breakdown for diagnostic logging."""
+        lines = []
+        positions = sorted(
+            self._positions.values(),
+            key=lambda p: p.net_exposure_usd,
+            reverse=True,
+        )
+        for p in positions:
+            if p.yes_size == 0 and p.no_size == 0:
+                continue
+            tag = "active" if (active_cids and p.condition_id in active_cids) else "STALE"
+            lines.append(
+                f"  {p.condition_id[:12]} [{tag}] YES={p.yes_size:.1f} NO={p.no_size:.1f} "
+                f"skew={p.skew_ratio:.0%} net=${p.net_exposure_usd:.1f}"
+            )
+        return "\n".join(lines) if lines else "  (no positions)"
 
     # ------------------------------------------------------------------
     # Pause management
