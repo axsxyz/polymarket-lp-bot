@@ -65,6 +65,13 @@ def passes_hard_filters(m: MarketCandidate, s: Settings) -> bool:
     if m.max_spread <= 0 or m.min_size <= 0:
         return False
 
+    estimated_per_market = s.TOTAL_CAPITAL / max(s.MAX_MARKETS, 1)
+    half_budget = estimated_per_market / 2.0
+    expensive_side = max(m.midpoint, 1.0 - m.midpoint) if m.midpoint > 0 else 0.5
+    min_cost_per_side = m.min_size * expensive_side
+    if min_cost_per_side > half_budget * 1.5:
+        return False
+
     return True
 
 
@@ -98,16 +105,29 @@ def rank_score(m: MarketCandidate, s: Settings) -> float:
     Composite ranking score used to sort filtered candidates.
     Higher is better.
 
-    score = reward_rate / (1 + estimated_vol) * (1 + tag_bonus)
+    score = reward_rate / (1 + estimated_vol)
+            * (1 + tag_bonus)
+            * (1 + spread_bonus)
+            * capital_efficiency
 
     - reward_rate is the daily USDC reward pool for this market
     - estimated_vol penalises high-churn markets
     - tag_bonus gives up to 30% boost for preferred categories
+    - spread_bonus rewards wider max_spread (easier to score)
+    - capital_efficiency penalises markets that are expensive to seed/quote
     """
     vol = estimate_volatility(m)
     tag_bonus = tag_overlap_score(m, s.PREFERRED_TAGS) * 0.3
     denominator = 1.0 + vol
-    return (m.reward_rate_daily / denominator) * (1.0 + tag_bonus)
+
+    spread_bonus = min(m.max_spread / 0.05, 1.0) * 0.25
+
+    expensive_side = max(m.midpoint, 1.0 - m.midpoint) if m.midpoint > 0 else 0.5
+    seed_cost = m.min_size * expensive_side * 2
+    per_market_budget = s.TOTAL_CAPITAL / max(s.MAX_MARKETS, 1)
+    capital_eff = 1.0 if seed_cost <= 0 else min(per_market_budget / seed_cost, 2.0) / 2.0
+
+    return (m.reward_rate_daily / denominator) * (1.0 + tag_bonus) * (1.0 + spread_bonus) * capital_eff
 
 
 def filter_and_rank(
@@ -118,6 +138,8 @@ def filter_and_rank(
     Apply hard filters, compute ranking scores, sort descending, and
     return the top MAX_MARKETS candidates.
     """
+    from loguru import logger
+
     passed = [m for m in candidates if passes_hard_filters(m, settings)]
 
     for m in passed:
@@ -125,7 +147,27 @@ def filter_and_rank(
 
     passed.sort(key=lambda m: m.score, reverse=True)
 
-    return passed[: settings.MAX_MARKETS]
+    selected = passed[: settings.MAX_MARKETS]
+
+    for i, m in enumerate(selected):
+        expensive_side = max(m.midpoint, 1.0 - m.midpoint) if m.midpoint > 0 else 0.5
+        seed_est = m.min_size * expensive_side * 2
+        logger.info(
+            "Rank #{}: {} score={:.2f} reward=${:.2f}/day spread={:.3f} "
+            "mid={:.2f} min_size={:.0f} seed_est=${:.0f} days={:.0f} tags={}",
+            i + 1,
+            (m.question[:50] + "…") if len(m.question) > 50 else (m.question or m.condition_id[:16]),
+            m.score,
+            m.reward_rate_daily,
+            m.max_spread,
+            m.midpoint,
+            m.min_size,
+            seed_est,
+            m.days_remaining,
+            ",".join(m.tags[:3]) if m.tags else "none",
+        )
+
+    return selected
 
 
 def parse_gamma_market(raw: Dict[str, Any]) -> MarketCandidate:

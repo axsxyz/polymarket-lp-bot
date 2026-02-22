@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     MAX_CAPITAL_PER_MARKET: float = 500.0
     MIN_CAPITAL_PER_MARKET: float = 200.0
     GLOBAL_MAX_EXPOSURE_PCT: float = Field(default=0.30, ge=0.0, le=1.0)
-    GLOBAL_MAX_GROSS_EXPOSURE_PCT: float = Field(default=0.80, ge=0.0, le=1.0)
+    GLOBAL_MAX_GROSS_EXPOSURE_PCT: float = Field(default=0.80, ge=0.0, le=5.0)
 
     # ── Strategy ────────────────────────────────────────────────────
     MODE: BotMode = BotMode.SAFE
@@ -50,12 +50,15 @@ class Settings(BaseSettings):
     TIGHTNESS_FACTOR_SAFE: float = Field(default=0.48, ge=0.1, le=0.9)
     TIGHTNESS_FACTOR_AGGRESSIVE: float = Field(default=0.35, ge=0.1, le=0.9)
     SIZE_MULTIPLIER: float = Field(default=2.0, ge=1.0, le=5.0)
-    REBALANCE_INTERVAL_SECONDS: int = Field(default=45, ge=10, le=300)
+    ALLOW_NAKED_ASKS: bool = True
+    REBALANCE_INTERVAL_SECONDS: int = Field(default=15, ge=5, le=300)
     MAX_ORDER_AGE_SECONDS: int = Field(default=600, ge=60, le=3600)
+    ORDER_UPDATE_THRESHOLD_TICKS: int = Field(default=2, ge=1, le=10)
+    POST_BEFORE_CANCEL: bool = True
 
     # ── API Rate Limiting ───────────────────────────────────────────
-    API_RATE_LIMIT_RPS: float = Field(default=1.3, ge=0.1, le=10.0)
-    API_RATE_LIMIT_BURST: float = Field(default=10.0, ge=1.0, le=50.0)
+    API_RATE_LIMIT_RPS: float = Field(default=3.0, ge=0.1, le=10.0)
+    API_RATE_LIMIT_BURST: float = Field(default=20.0, ge=1.0, le=50.0)
     MAX_MARKETS_PER_CYCLE: int = Field(default=20, ge=1, le=200)
 
     # ── Market Selection ────────────────────────────────────────────
@@ -82,12 +85,31 @@ class Settings(BaseSettings):
     SKEW_ALERT_THRESHOLD: float = Field(default=0.25, ge=0.0, le=1.0)
     SKEW_ACTION_THRESHOLD: float = Field(default=0.30, ge=0.0, le=1.0)
     SKEW_PAUSE_THRESHOLD: float = Field(default=0.45, ge=0.0, le=1.0)
+    SKEW_HARD_PAUSE_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0)
     SKEW_PAUSE_DURATION_SECONDS: int = Field(default=600, ge=0)
     SKEW_ALERT_COOLDOWN_SECONDS: int = Field(default=900, ge=0)
+    SKEW_RECOVERY_ASK_SIZE_PCT: float = Field(default=0.50, ge=0.05, le=1.0)
+
+    # ── Inventory Seeding ─────────────────────────────────────────────
+    SEED_ENABLED: bool = True
+    SEED_SHARES: float = Field(default=1.0, ge=1.0, le=100.0)
+    SEED_MAX_USD_PER_SIDE: float = Field(default=150.0, ge=0.5, le=500.0)
+    SEED_AGGRESSIVE_TICKS: int = Field(default=3, ge=1, le=10)
+    SEED_BUDGET_PCT: float = Field(default=0.30, ge=0.05, le=0.80)
 
     # ── Scoring ─────────────────────────────────────────────────────
     SCORING_CHECK_INTERVAL_SECONDS: int = Field(default=300, ge=60, le=3600)
     SCORING_ALERT_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0)
+    SCORING_REMEDIATION_THRESHOLD: int = Field(default=3, ge=1, le=20)
+
+    # ── Dynamic Reallocation ─────────────────────────────────────
+    DYNAMIC_REALLOC_ENABLED: bool = True
+    DYNAMIC_REALLOC_INTERVAL_SECONDS: int = Field(default=300, ge=60, le=1800)
+    DYNAMIC_REALLOC_MAX_SHIFT_PCT: float = Field(default=0.20, ge=0.0, le=0.50)
+
+    # ── Circuit Breaker ───────────────────────────────────────────
+    CIRCUIT_BREAKER_MAX_FAILURES: int = Field(default=3, ge=1, le=20)
+    CIRCUIT_BREAKER_COOLDOWN_SECONDS: int = Field(default=300, ge=30, le=3600)
 
     # ── Discord ─────────────────────────────────────────────────────
     DISCORD_WEBHOOK_URL: str = ""
