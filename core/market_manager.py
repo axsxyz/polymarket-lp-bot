@@ -91,6 +91,13 @@ class MarketManager:
         self._last_refresh = datetime.now(timezone.utc)
         self._save_cache()
 
+        # Sync CONDITIONAL (ERC1155) per token so the CLOB accepts ASK orders
+        token_ids = list(
+            {m.token_id_yes for m in ranked if m.token_id_yes}
+            | {m.token_id_no for m in ranked if m.token_id_no}
+        )
+        await self._client.sync_conditional_allowances(token_ids)
+
         return self._markets
 
     def get_market_by_condition(self, condition_id: str) -> Optional[MarketCandidate]:
@@ -252,6 +259,95 @@ class MarketManager:
             scale = budget / total_allocated
             for m in markets:
                 m.allocated_capital *= scale
+
+    # ------------------------------------------------------------------
+    # Performance-based market scoring
+    # ------------------------------------------------------------------
+
+    def apply_performance_multipliers(self, scoring_rates: dict[str, float]) -> None:
+        """Adjust rank scores based on live performance.
+
+        Markets with 0% scoring for extended periods get deprioritized.
+        Markets consistently scoring get a small boost.
+        """
+        if not scoring_rates or not self._markets:
+            return
+
+        for m in self._markets:
+            rate = scoring_rates.get(m.condition_id)
+            if rate is None:
+                continue
+            if rate == 0.0:
+                m.score *= 0.1  # heavily deprioritize
+            elif rate < 0.3:
+                m.score *= 0.5
+            elif rate > 0.8:
+                m.score *= 1.1  # small boost for consistent scorers
+
+        self._markets.sort(key=lambda m: m.score, reverse=True)
+
+    # ------------------------------------------------------------------
+    # Dynamic capital reallocation
+    # ------------------------------------------------------------------
+
+    def reallocate_capital(self, scoring_rates: dict[str, float]) -> int:
+        """Shift capital from non-scoring markets to scoring ones.
+
+        Returns number of markets whose allocation changed by > 5%.
+        Caps total shift at DYNAMIC_REALLOC_MAX_SHIFT_PCT per cycle.
+        """
+        if not self._markets or not scoring_rates:
+            return 0
+
+        max_shift = self._settings.DYNAMIC_REALLOC_MAX_SHIFT_PCT
+        budget = self._settings.TOTAL_CAPITAL
+        adjusted = 0
+
+        scoring_markets = [m for m in self._markets if scoring_rates.get(m.condition_id, 0) > 0.5]
+        non_scoring = [m for m in self._markets if scoring_rates.get(m.condition_id, 0) <= 0.5]
+
+        if not scoring_markets or not non_scoring:
+            return 0
+
+        # Calculate how much to redistribute
+        total_from_non_scoring = sum(m.allocated_capital for m in non_scoring)
+        shift_amount = min(total_from_non_scoring * max_shift, budget * max_shift)
+
+        per_non_scoring_cut = shift_amount / len(non_scoring) if non_scoring else 0
+        per_scoring_boost = shift_amount / len(scoring_markets) if scoring_markets else 0
+
+        for m in non_scoring:
+            old = m.allocated_capital
+            m.allocated_capital = max(
+                self._settings.MIN_CAPITAL_PER_MARKET,
+                m.allocated_capital - per_non_scoring_cut,
+            )
+            if abs(m.allocated_capital - old) / max(old, 1) > 0.05:
+                adjusted += 1
+
+        for m in scoring_markets:
+            old = m.allocated_capital
+            m.allocated_capital = min(
+                self._settings.MAX_CAPITAL_PER_MARKET,
+                m.allocated_capital + per_scoring_boost,
+            )
+            if abs(m.allocated_capital - old) / max(old, 1) > 0.05:
+                adjusted += 1
+
+        # Clamp total to budget
+        total = sum(m.allocated_capital for m in self._markets)
+        if total > budget:
+            scale = budget / total
+            for m in self._markets:
+                m.allocated_capital *= scale
+
+        if adjusted:
+            logger.info(
+                "Dynamic realloc: shifted ${:.0f} from {} non-scoring to {} scoring markets ({} adjusted)",
+                shift_amount, len(non_scoring), len(scoring_markets), adjusted,
+            )
+
+        return adjusted
 
     # ------------------------------------------------------------------
     # Cache
