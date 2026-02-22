@@ -102,6 +102,11 @@ class Quoter:
 
     def __init__(self, settings: Settings) -> None:
         self._s = settings
+        self._scoring_rates: dict[str, float] = {}
+
+    def update_scoring_rates(self, rates: dict[str, float]) -> None:
+        """Update per-market scoring rates from ScoringMonitor."""
+        self._scoring_rates = dict(rates)
 
     def compute(
         self,
@@ -110,6 +115,9 @@ class Quoter:
         skew_ratio: float = 0.0,
         heavy_side: str = "",
         paused_side: str = "",
+        recovery_side: str = "",
+        yes_position: float = 0.0,
+        no_position: float = 0.0,
     ) -> TwoSidedQuotes:
         """
         Build two-sided quotes for a market.
@@ -120,7 +128,10 @@ class Quoter:
             skew_ratio: Current inventory skew ratio [0, 1].  0 = perfectly balanced.
             heavy_side: "YES" or "NO" indicating which side is over-weight.
             paused_side: if set, we skip quoting on this token side entirely
-                         (used when skew > SKEW_PAUSE_THRESHOLD).
+                         (hard pause when skew >= SKEW_HARD_PAUSE_THRESHOLD).
+            recovery_side: if set, reduced quoting on this side (skew 0.45-0.70).
+            yes_position: Current YES token holding (used to skip sells when flat).
+            no_position: Current NO token holding (used to skip sells when flat).
         """
         if not market.token_id_yes or not market.token_id_no:
             logger.debug("Skipping market %s - missing token_ids", market.condition_id[:12])
@@ -133,9 +144,10 @@ class Quoter:
             skew_ratio=skew_ratio,
             is_heavy_side=(heavy_side == "YES"),
             is_paused=(paused_side == "YES"),
+            is_recovery=(recovery_side == "YES"),
+            position_size=yes_position,
         )
 
-        # NO token mid is the complement
         no_mid = _clamp(1.0 - live_mid)
         no_quote = self._build_quote(
             market=market,
@@ -144,6 +156,8 @@ class Quoter:
             skew_ratio=skew_ratio,
             is_heavy_side=(heavy_side == "NO"),
             is_paused=(paused_side == "NO"),
+            is_recovery=(recovery_side == "NO"),
+            position_size=no_position,
         )
 
         return TwoSidedQuotes(
@@ -153,29 +167,40 @@ class Quoter:
         )
 
     def _effective_tightness(self, market: MarketCandidate, mid: float) -> float:
-        """Per-market tightness based on estimated volatility (P5-6).
+        """Per-market tightness — must stay under 0.50 so full spread < max_spread.
 
-        Stable long-dated markets → tighter (higher Q scores).
-        Volatile short-dated markets → wider (more protection).
+        The quoter places: bid = mid - max_spread*tf, ask = mid + max_spread*tf.
+        Full spread = 2 * max_spread * tf.  For scoring: full_spread <= max_spread
+        requires tf <= 0.50.  We cap at 0.499 and target 0.30-0.45 for good Q scores.
+
+        Short-dated or rapidly moving markets get a slight widening (still < 0.50).
+        Scoring-adaptive: non-scoring markets tighten to improve Q; well-scoring
+        markets tighten further to maximize reward.
         """
         base_tf = self._s.tightness_factor
 
-        mid_vol = 0.5 - abs(mid - 0.5)
         days = market.days_remaining
-        time_factor = 1.5 if days < 7 else (1.2 if days < 30 else 1.0)
-        vol_estimate = mid_vol * time_factor
-
-        if vol_estimate < 0.05:
-            multiplier = 0.75
-        elif vol_estimate > 0.15:
-            multiplier = 1.3
+        if days < 7:
+            multiplier = 1.08
+        elif days < 30:
+            multiplier = 1.04
         else:
             multiplier = 1.0
 
         effective = base_tf * multiplier
-        logger.trace("Tightness for {} mid={:.2f} vol≈{:.3f} tf={:.3f}",
-                     market.condition_id[:12], mid, vol_estimate, effective)
-        return max(0.25, min(0.70, effective))
+
+        scoring_rate = self._scoring_rates.get(market.condition_id)
+        if scoring_rate is not None:
+            if scoring_rate < 0.3:
+                effective *= 0.90
+            elif scoring_rate > 0.8:
+                effective *= 0.95
+
+        logger.trace("Tightness for {} mid={:.2f} days={:.0f} scoring={} tf={:.3f}",
+                     market.condition_id[:12], mid, days,
+                     f"{scoring_rate:.0%}" if scoring_rate is not None else "n/a",
+                     effective)
+        return max(0.20, min(0.499, effective))
 
     def _build_quote(
         self,
@@ -185,12 +210,14 @@ class Quoter:
         skew_ratio: float,
         is_heavy_side: bool,
         is_paused: bool,
+        is_recovery: bool = False,
+        position_size: float = 0.0,
     ) -> Optional[Quote]:
         """Build bid+ask for a single token book."""
         if not token_id:
             return None
         if is_paused:
-            logger.debug("Skipping {} — paused due to extreme skew", token_id[:16])
+            logger.debug("Skipping {} — hard-paused due to extreme skew", token_id[:16])
             return None
 
         tf = self._effective_tightness(market, mid)
@@ -205,13 +232,19 @@ class Quoter:
         bid_tf = tf
         ask_tf = tf
 
-        if skew_ratio > 0.08:  # start adjusting earlier
+        if skew_ratio > 0.08:
             if is_heavy_side:
                 bid_tf = min(tf * (1.0 + skew_ratio * 1.4), 0.92)
                 ask_tf = max(tf * (1.0 - skew_ratio * 0.85), 0.12)
             else:
                 bid_tf = max(tf * (1.0 - skew_ratio * 0.85), 0.12)
                 ask_tf = min(tf * (1.0 + skew_ratio * 1.4), 0.92)
+
+        # Recovery mode: further widen bid (less buying) and tighten ask
+        # (more selling) on the heavy side to attract fills that reduce position.
+        if is_recovery and is_heavy_side:
+            bid_tf = min(bid_tf * 2.0, 0.95)
+            ask_tf = max(ask_tf * 0.5, 0.10)
 
         bid_offset = max_sp * bid_tf
         ask_offset = max_sp * ask_tf
@@ -233,21 +266,49 @@ class Quoter:
             bid_price = _clamp(mid - tick * 1.2)
             ask_price = _clamp(mid + tick * 1.2)
 
-        # Capital analysis (P1-3): For allocated_capital = C, each token book
-        # (YES/NO) gets C/2. Each book places bid + ask.
-        # Worst-case bid-side: YES_bid + NO_bid = C/2 + C/2 = C, but these
-        # are economically hedged (buying both sides ≈ $1/share combined).
-        # Ask-side requires existing inventory from prior fills (we start flat).
-        # Conclusion: current C/2-per-book sizing is safe — worst-case
-        # capital consumption ≤ allocated_capital per market.
         half_capital = market.allocated_capital / 2.0
         base_size = market.min_size * self._s.SIZE_MULTIPLIER
 
-        bid_size = max(market.min_size, min(base_size, half_capital / max(bid_price, 0.01)))
-        ask_size = max(market.min_size, min(base_size, half_capital / max(1.0 - ask_price, 0.01)))
+        # Capital-constrained sizing: prefer min_size for scoring, but never
+        # exceed what the allocated capital can actually cover.
+        max_bid_shares = half_capital / max(bid_price, 0.01)
+        max_ask_shares = half_capital / max(1.0 - ask_price, 0.01)
 
-        bid_size = round(bid_size, 2)
-        ask_size = round(ask_size, 2)
+        bid_size = round(min(base_size, max_bid_shares), 2)
+        ask_size = round(min(base_size, max_ask_shares), 2)
+
+        # Recovery mode: reduce ask size to limit exposure while keeping
+        # the side alive so LP scoring continues and fills can reduce skew.
+        # Never reduce below min_size — sub-min orders don't score.
+        if is_recovery and is_heavy_side:
+            reduced = round(ask_size * self._s.SKEW_RECOVERY_ASK_SIZE_PCT, 2)
+            ask_size = max(reduced, market.min_size)
+
+        if position_size <= 0:
+            ask_size = 0.0
+        elif ask_size > position_size:
+            ask_size = round(position_size, 2)
+
+        # If we can't meet min_size, skip the side — sub-min orders
+        # don't score for LP rewards and just consume capital/API calls.
+        if bid_size > 0 and bid_size < market.min_size:
+            logger.info(
+                "Skipping BID for {} — need {} shares but capital only covers {:.0f} (min_size={})",
+                token_id[:12], market.min_size, max_bid_shares, market.min_size,
+            )
+            bid_price = 0.0
+            bid_size = 0.0
+
+        if ask_size > 0 and ask_size < market.min_size:
+            logger.info(
+                "Skipping ASK for {} — need {} shares but capital only covers {:.0f} (min_size={})",
+                token_id[:12], market.min_size, max_ask_shares, market.min_size,
+            )
+            ask_price = 0.0
+            ask_size = 0.0
+
+        if bid_size == 0 and ask_size == 0:
+            return None
 
         avg_spread = (bid_offset + ask_offset) / 2.0
         q_est = estimate_q_score(max_sp, avg_spread, (bid_size + ask_size) / 2.0)

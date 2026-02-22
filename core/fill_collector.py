@@ -26,8 +26,9 @@ from core.client import AsyncClobClient
 from core.order_manager import FillEvent
 
 WATERMARK_PATH = Path("data/trade_watermark.json")
-MAX_SEEN_IDS = 1000
-OVERLAP_SECONDS = 2
+MAX_SEEN_IDS = 500
+OVERLAP_SECONDS = 5
+WATERMARK_SAFETY_MARGIN = 1  # advance watermark to max_ts - this many seconds
 
 
 class FillCollector:
@@ -45,8 +46,9 @@ class FillCollector:
 
     def __init__(self, client: AsyncClobClient) -> None:
         self._client = client
-        self._watermark_ts: int = self._load_watermark()
-        self._seen_ids: Dict[str, None] = {}
+        wm, seen = self._load_watermark()
+        self._watermark_ts: int = wm
+        self._seen_ids: Dict[str, None] = seen
         self._pending_fills: List[FillEvent] = []
 
     @property
@@ -126,7 +128,7 @@ class FillCollector:
             new_count += 1
 
         if max_ts > self._watermark_ts:
-            self._watermark_ts = max_ts
+            self._watermark_ts = max(self._watermark_ts, max_ts - WATERMARK_SAFETY_MARGIN)
             self._save_watermark()
 
         # Evict oldest entries to bound memory (dict preserves insertion order)
@@ -142,30 +144,36 @@ class FillCollector:
         self._pending_fills = []
         return fills
 
-    def _load_watermark(self) -> int:
-        """Load persisted watermark from disk, fall back to current time."""
+    def _load_watermark(self) -> tuple[int, Dict[str, None]]:
+        """Load persisted watermark + seen_ids from disk, fall back to current time."""
+        seen: Dict[str, None] = {}
         try:
             if WATERMARK_PATH.exists():
                 data = json.loads(WATERMARK_PATH.read_text())
                 ts = int(data.get("watermark_ts", 0))
+                for sid in data.get("seen_ids", []):
+                    seen[str(sid)] = None
                 if ts > 0:
                     logger.info(
-                        "Loaded trade watermark: {} ({})",
+                        "Loaded trade watermark: {} ({}) with {} seen IDs",
                         ts,
                         datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                        len(seen),
                     )
-                    return ts
+                    return ts, seen
         except Exception as exc:
             logger.warning("Failed to load trade watermark: {}", exc)
-        return int(time.time())
+        return int(time.time()), seen
 
     def _save_watermark(self) -> None:
-        """Persist watermark to disk for crash recovery."""
+        """Persist watermark + recent seen_ids to disk for crash recovery."""
         try:
             WATERMARK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            recent_ids = list(self._seen_ids.keys())[-MAX_SEEN_IDS:]
             WATERMARK_PATH.write_text(json.dumps({
                 "watermark_ts": self._watermark_ts,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
+                "seen_ids": recent_ids,
             }))
         except Exception as exc:
             logger.warning("Failed to save trade watermark: {}", exc)
