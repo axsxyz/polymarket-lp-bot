@@ -100,8 +100,8 @@ class TestQuoteSizing:
 
 class TestSkewAdjustment:
     def test_heavy_side_widens_bid(self):
-        q = Quoter(_make_settings())
-        m = _market()
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=3))
+        m = _market(max_spread=0.20)
 
         neutral = q.compute(m, live_mid=0.50, skew_ratio=0.0,
                             yes_position=_POS, no_position=_POS)
@@ -121,22 +121,59 @@ class TestSkewAdjustment:
         assert result.no_quote is not None
 
 
-class TestDynamicTightness:
-    def test_stable_market_tighter(self):
-        q = Quoter(_make_settings())
-        stable = _market(mid=0.95, days=90)
-        volatile = _market(mid=0.50, days=5)
+class TestComputeOffset:
+    """Test the tick-based _compute_offset replacement for _effective_tightness."""
 
-        tf_stable = q._effective_tightness(stable, 0.95)
-        tf_volatile = q._effective_tightness(volatile, 0.50)
+    def test_offset_is_tick_based(self):
+        """With QUOTE_OFFSET_TICKS=1, offset should equal 1 tick."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=1))
+        m = _market(max_spread=0.10)
+        offset = q._compute_offset(m, 0.50)
+        assert offset == pytest.approx(0.01)
 
-        assert tf_stable < tf_volatile
+    def test_offset_scales_with_ticks(self):
+        """With QUOTE_OFFSET_TICKS=3, offset should equal 3 ticks."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=3))
+        m = _market(max_spread=0.10)
+        offset = q._compute_offset(m, 0.50)
+        assert offset == pytest.approx(0.03)
 
-    def test_tightness_clamped(self):
-        q = Quoter(_make_settings())
-        m = _market(mid=0.50, days=1)
-        tf = q._effective_tightness(m, 0.50)
-        assert 0.25 <= tf <= 0.70
+    def test_offset_clamped_to_max_spread(self):
+        """Offset must not exceed max_spread * 0.499."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=10))
+        m = _market(max_spread=0.05)
+        offset = q._compute_offset(m, 0.50)
+        assert offset <= 0.05 * 0.499 + 1e-9
+
+    def test_offset_at_least_one_tick(self):
+        """Offset must always be at least 1 tick."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=0))
+        m = _market(max_spread=0.10)
+        offset = q._compute_offset(m, 0.50)
+        assert offset >= 0.01
+
+    def test_adverse_fill_rate_widens(self):
+        """High fill rate should add extra ticks of widening."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=1, ADVERSE_FILL_RATE_THRESHOLD=3))
+        q.update_fill_rates({"cond_test": 5.0})
+        m = _market(max_spread=0.10)
+        offset = q._compute_offset(m, 0.50)
+        assert offset == pytest.approx(0.02)
+
+    def test_extreme_adverse_fills_double_widen(self):
+        """Very high fill rate (>3x threshold) should add +2 ticks."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=1, ADVERSE_FILL_RATE_THRESHOLD=3))
+        q.update_fill_rates({"cond_test": 12.0})
+        m = _market(max_spread=0.10)
+        offset = q._compute_offset(m, 0.50)
+        assert offset == pytest.approx(0.03)
+
+    def test_fallback_to_tightness_factor(self):
+        """With QUOTE_OFFSET_TICKS=0, should fall back to legacy tightness."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=0, TIGHTNESS_FACTOR_SAFE=0.30))
+        m = _market(max_spread=0.10)
+        offset = q._compute_offset(m, 0.50)
+        assert offset == pytest.approx(0.03)
 
 
 class TestRecoveryMode:

@@ -36,6 +36,7 @@ from core.quoter import Quoter, TwoSidedQuotes
 from core.rewards_tracker import RewardsTracker
 from core.inventory_seeder import InventorySeeder
 from core.scoring_monitor import ScoringMonitor
+from core.ws_feed import WebSocketFeed
 from utils.discord import DiscordNotifier
 from utils.helpers import seconds_until_midnight_utc
 from utils.logging import setup_logging
@@ -43,6 +44,9 @@ from utils.logging import setup_logging
 # Locks protecting shared state from concurrent mutation by background tasks
 _market_lock = asyncio.Lock()
 _inventory_lock = asyncio.Lock()
+
+# Per-market debounce timestamps for hot requotes
+_hot_requote_last: Dict[str, float] = {}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -82,44 +86,53 @@ def _select_cycle_markets(
 async def _batch_fetch_midpoints(
     client: AsyncClobClient,
     markets: list,
+    ws_feed: Optional[WebSocketFeed] = None,
 ) -> dict:
     """
-    Fetch midpoints in a single batch call. Falls back to individual calls
-    if the batch endpoint is unavailable or fails.
+    Fetch midpoints — reads from the WS cache first (instant, free),
+    falls back to REST batch/individual calls for any misses.
     """
     token_ids = [m.token_id_yes for m in markets if m.token_id_yes]
     result: dict = {}
     if not token_ids:
         return result
 
+    # Phase 1: read from WS cache (instant, no API calls)
+    ws_hits = 0
+    if ws_feed:
+        for tid in token_ids:
+            mid = ws_feed.get_mid(tid)
+            if mid is not None:
+                result[tid] = mid
+                ws_hits += 1
+        if ws_hits:
+            logger.debug("WS cache: {}/{} midpoints from cache", ws_hits, len(token_ids))
+
+    # Phase 2: REST fallback for any tokens the WS didn't cover
+    missing = [tid for tid in token_ids if tid not in result]
+    if not missing:
+        return result
+
     try:
         from py_clob_client.clob_types import BookParams
-        params = [BookParams(token_id=tid) for tid in token_ids]
+        params = [BookParams(token_id=tid) for tid in missing]
         batch_resp = await client.get_midpoints(params)
 
         if isinstance(batch_resp, list):
-            if batch_resp:
-                logger.info("Midpoint response type=list sample[0]={} type={}", batch_resp[0], type(batch_resp[0]))
-            for i, tid in enumerate(token_ids):
+            for i, tid in enumerate(missing):
                 if i >= len(batch_resp):
                     break
                 mid = _parse_midpoint_value(batch_resp[i])
                 if mid is not None:
                     result[tid] = mid
         elif isinstance(batch_resp, dict):
-            if batch_resp:
-                sample_key = next(iter(batch_resp))
-                logger.info(
-                    "Midpoint response type=dict sample: key={}… val={} type={}",
-                    sample_key[:20], batch_resp[sample_key], type(batch_resp[sample_key]),
-                )
-            for tid in token_ids:
+            for tid in missing:
                 mid = _parse_midpoint_value(batch_resp.get(tid))
                 if mid is not None:
                     result[tid] = mid
 
-        if result:
-            logger.debug("Batch midpoints: {}/{} fetched", len(result), len(token_ids))
+        if len(result) > ws_hits:
+            logger.debug("REST batch: {}/{} additional midpoints", len(result) - ws_hits, len(missing))
             return result
     except Exception as exc:
         logger.debug("Batch midpoint fetch unavailable ({}), using individual calls", exc)
@@ -157,12 +170,102 @@ def _parse_midpoint_value(val) -> float | None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Event-driven hot requote (triggered by WebSocket mid-price changes)
+# ──────────────────────────────────────────────────────────────────────
+
+# These module-level refs are set by main() once components are initialised.
+_ws_feed: Optional[WebSocketFeed] = None
+_hot_market_mgr: Optional[MarketManager] = None
+_hot_order_mgr: Optional[OrderManager] = None
+_hot_inventory: Optional["InventoryTracker"] = None
+_hot_quoter: Optional[Quoter] = None
+_hot_settings: Optional[Settings] = None
+
+
+async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> None:
+    """Event-driven requote triggered by WS mid-price change.
+
+    Fires for a single market when its mid has moved >= 1 tick from the
+    current order center.  Lightweight: no fill collection, no skew eval,
+    no exposure checks — the cold path handles all that.
+    """
+    if not all((_hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings)):
+        return
+
+    market = _hot_market_mgr.get_market_by_token(token_id)
+    if not market:
+        return
+
+    now = asyncio.get_event_loop().time()
+    last = _hot_requote_last.get(market.condition_id, 0)
+    debounce_s = _hot_settings.HOT_REQUOTE_DEBOUNCE_MS / 1000.0
+    if now - last < debounce_s:
+        return
+    _hot_requote_last[market.condition_id] = now
+
+    try:
+        async with _hot_order_mgr.market_lock(market.condition_id):
+            pos = _hot_inventory.get_position(market.condition_id)
+            skew_action = _hot_inventory.evaluate(market.condition_id)
+
+            yes_mid = new_mid if token_id == market.token_id_yes else (1.0 - new_mid)
+
+            quotes = _hot_quoter.compute(
+                market=market,
+                live_mid=yes_mid,
+                skew_ratio=skew_action.skew_ratio,
+                heavy_side=skew_action.heavy_side,
+                paused_side=skew_action.paused_side,
+                yes_position=pos.yes_size if pos else 0.0,
+                no_position=pos.no_size if pos else 0.0,
+            )
+            result = await _hot_order_mgr.cancel_and_replace(quotes)
+
+        if result.posted and _ws_feed:
+            _ws_feed.update_order_center(market.token_id_yes, yes_mid)
+            _ws_feed.update_order_center(market.token_id_no, 1.0 - yes_mid)
+            logger.debug(
+                "Hot requote {} — {} orders posted (fast={})",
+                market.condition_id[:12], len(result.posted), is_fast,
+            )
+    except Exception as exc:
+        logger.error("Hot requote failed for {}: {}", market.condition_id[:12], exc)
+        try:
+            ghosts = await _hot_order_mgr.reconcile_ghost_orders()
+            if ghosts > 0:
+                logger.warning("Hot-path ghost sweep: cancelled {} orphaned orders", ghosts)
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Quoting cycle
 # ──────────────────────────────────────────────────────────────────────
 
 
 _MAX_NOTIFIED_ORDERS = 1000
 _notified_orders: collections.OrderedDict = collections.OrderedDict()
+
+# Rolling fill counter for adverse-selection detection
+_fill_timestamps: Dict[str, list] = collections.defaultdict(list)
+
+
+def _update_fill_rates(new_fills: list, quoter: Quoter) -> None:
+    """Track fills-per-hour per market and push rates to the quoter."""
+    import time as _time
+    now = _time.time()
+    one_hour_ago = now - 3600
+
+    for f in new_fills:
+        _fill_timestamps[f.condition_id].append(now)
+
+    rates: Dict[str, float] = {}
+    for cid, timestamps in list(_fill_timestamps.items()):
+        _fill_timestamps[cid] = [t for t in timestamps if t > one_hour_ago]
+        rates[cid] = float(len(_fill_timestamps[cid]))
+
+    if rates:
+        quoter.update_fill_rates(rates)
 
 async def run_quoting_cycle(
     market_mgr: MarketManager,
@@ -176,6 +279,7 @@ async def run_quoting_cycle(
     settings: Settings,
     cycle_index: int = 0,
     skip_cids: set | None = None,
+    ws_feed: Optional[WebSocketFeed] = None,
 ) -> Optional[Tuple[int, float]]:
     """
     One full cycle: collect fills, fetch midpoints, iterate active markets,
@@ -211,6 +315,9 @@ async def run_quoting_cycle(
             asyncio.create_task(discord.send_fill(f.condition_id, f.side, f.price, f.filled_size))
         logger.info("Recorded {} fills into inventory", len(new_fills))
 
+    # Compute fills-per-hour per market for adverse-selection widening
+    _update_fill_rates(new_fills, quoter)
+
     # ── Step 2: Select markets for this cycle (round-robin) ──────
     markets_this_cycle = _select_cycle_markets(
         markets, cycle_index, settings.MAX_MARKETS_PER_CYCLE,
@@ -220,7 +327,7 @@ async def run_quoting_cycle(
     await order_mgr.refresh_usdc_balance()
 
     # ── Step 3: Batch fetch midpoints (P0-4 / P3-1) ─────────────
-    midpoints = await _batch_fetch_midpoints(client, markets_this_cycle)
+    midpoints = await _batch_fetch_midpoints(client, markets_this_cycle, ws_feed=ws_feed)
     inventory.update_midpoints(midpoints)
 
     # ── Step 3b: Feed scoring rates into quoter ─────────────────
@@ -285,47 +392,53 @@ async def run_quoting_cycle(
             if market.condition_id in paused_set:
                 return (0, 0, 0)
             try:
-                async with _inventory_lock:
-                    inventory.ensure_position(
-                        market.condition_id,
-                        yes_token_id=market.token_id_yes,
-                        no_token_id=market.token_id_no,
+                async with order_mgr.market_lock(market.condition_id):
+                    async with _inventory_lock:
+                        inventory.ensure_position(
+                            market.condition_id,
+                            yes_token_id=market.token_id_yes,
+                            no_token_id=market.token_id_no,
+                        )
+                        skew_action = inventory.evaluate(market.condition_id)
+
+                    if skew_action.should_alert:
+                        asyncio.create_task(discord.send_skew_warning(
+                            market.condition_id,
+                            skew_action.skew_ratio,
+                            skew_action.heavy_side,
+                        ))
+
+                    if skew_action.pause_triggered:
+                        asyncio.create_task(discord.send_skew_pause(
+                            market.condition_id,
+                            skew_action.skew_ratio,
+                            skew_action.heavy_side,
+                            settings.SKEW_PAUSE_DURATION_SECONDS,
+                        ))
+
+                    live_mid = midpoints.get(market.token_id_yes, market.midpoint)
+
+                    pos = inventory.get_position(market.condition_id)
+                    quotes = quoter.compute(
+                        market=market,
+                        live_mid=live_mid,
+                        skew_ratio=skew_action.skew_ratio,
+                        heavy_side=skew_action.heavy_side,
+                        paused_side=skew_action.paused_side,
+                        recovery_side=skew_action.recovery_side,
+                        yes_position=pos.yes_size if pos else 0.0,
+                        no_position=pos.no_size if pos else 0.0,
                     )
-                    skew_action = inventory.evaluate(market.condition_id)
 
-                if skew_action.should_alert:
-                    asyncio.create_task(discord.send_skew_warning(
-                        market.condition_id,
-                        skew_action.skew_ratio,
-                        skew_action.heavy_side,
-                    ))
+                    force = market.condition_id in filled_cids
+                    result = await order_mgr.cancel_and_replace(quotes, force_replace=force)
+                    posted = len(result.posted)
+                    kept = result.kept
 
-                if skew_action.pause_triggered:
-                    asyncio.create_task(discord.send_skew_pause(
-                        market.condition_id,
-                        skew_action.skew_ratio,
-                        skew_action.heavy_side,
-                        settings.SKEW_PAUSE_DURATION_SECONDS,
-                    ))
-
-                live_mid = midpoints.get(market.token_id_yes, market.midpoint)
-
-                pos = inventory.get_position(market.condition_id)
-                quotes = quoter.compute(
-                    market=market,
-                    live_mid=live_mid,
-                    skew_ratio=skew_action.skew_ratio,
-                    heavy_side=skew_action.heavy_side,
-                    paused_side=skew_action.paused_side,
-                    recovery_side=skew_action.recovery_side,
-                    yes_position=pos.yes_size if pos else 0.0,
-                    no_position=pos.no_size if pos else 0.0,
-                )
-
-                force = market.condition_id in filled_cids
-                result = await order_mgr.cancel_and_replace(quotes, force_replace=force)
-                posted = len(result.posted)
-                kept = result.kept
+                    # Update WS order centers so hot path knows current quote position
+                    if result.posted and ws_feed:
+                        ws_feed.update_order_center(market.token_id_yes, live_mid)
+                        ws_feed.update_order_center(market.token_id_no, 1.0 - live_mid)
 
                 for rec in result.posted:
                     market_key = f"{rec.condition_id}:{rec.side}:{rec.token_id}"
@@ -420,6 +533,16 @@ async def run_quoting_cycle(
             scoring_pct=scoring_monitor.last_ratio,
         )
 
+    if cycle_errors > 0:
+        try:
+            ghosts = await order_mgr.reconcile_ghost_orders()
+            if ghosts > 0:
+                logger.warning(
+                    "Post-error ghost sweep: cancelled {} orphaned orders", ghosts
+                )
+        except Exception as exc:
+            logger.error("Post-error ghost sweep failed: {}", exc)
+
     return cycle_posted, cycle_volume
 
 
@@ -429,12 +552,25 @@ async def run_quoting_cycle(
 
 
 async def market_refresh_task(market_mgr: MarketManager, interval: int = 900) -> None:
-    """Refresh market universe every 15 minutes."""
+    """Refresh market universe every 15 minutes. Re-subscribes WS feed on change."""
     while True:
         await asyncio.sleep(interval)
         try:
             async with _market_lock:
                 await market_mgr.refresh()
+
+            # Re-subscribe WS feed with refreshed token set
+            if _ws_feed and market_mgr.markets:
+                token_ids = []
+                tick_sizes: Dict[str, float] = {}
+                for m in market_mgr.markets:
+                    tick = {"0.1": 0.1, "0.01": 0.01, "0.001": 0.001, "0.0001": 0.0001}.get(m.tick_size, 0.01)
+                    for tid in (m.token_id_yes, m.token_id_no):
+                        if tid:
+                            token_ids.append(tid)
+                            tick_sizes[tid] = tick
+                await _ws_feed.subscribe(token_ids, tick_sizes)
+                logger.info("WS feed re-subscribed with {} tokens after market refresh", len(token_ids))
         except Exception as exc:
             logger.error("Market refresh failed: {}", exc)
 
@@ -447,6 +583,25 @@ async def stale_order_cleanup_task(order_mgr: OrderManager, interval: int = 120)
             await order_mgr.cancel_stale_orders()
         except Exception as exc:
             logger.error("Stale order cleanup failed: {}", exc)
+
+
+async def ghost_order_reconciliation_task(order_mgr: OrderManager, interval: int = 30) -> None:
+    """Detect and cancel ghost orders frequently.
+
+    Ghost orders are orders live on the CLOB but not in local tracking,
+    typically caused by cancel API failures during stale-order replacement.
+    A ghost + real order on the same side can both fill on a price move,
+    doubling unintended exposure — so we check every 30s.
+    """
+    await asyncio.sleep(30)  # initial delay — let first cycle seed orders
+    while True:
+        try:
+            cancelled = await order_mgr.reconcile_ghost_orders()
+            if cancelled > 0:
+                logger.info("Ghost reconciliation cleaned up {} orphaned orders", cancelled)
+        except Exception as exc:
+            logger.error("Ghost order reconciliation failed: {}", exc)
+        await asyncio.sleep(interval)
 
 
 async def daily_rewards_task(
@@ -619,6 +774,9 @@ async def main() -> None:
     logger.info("Mode: {}  DRY_RUN: {}  Capital: ${:,.0f}", settings.MODE.value, settings.DRY_RUN, settings.TOTAL_CAPITAL)
     logger.info("Tightness: {:.2f}  Size mult: {:.1f}x  Interval: {}s", settings.tightness_factor, settings.SIZE_MULTIPLIER, settings.REBALANCE_INTERVAL_SECONDS)
     logger.info("API rate: {:.1f} req/s  Burst: {:.0f}  Max markets/cycle: {}", settings.API_RATE_LIMIT_RPS, settings.API_RATE_LIMIT_BURST, settings.MAX_MARKETS_PER_CYCLE)
+    logger.info("WS: {}  Offset ticks: {}  Debounce: {}ms  Adverse threshold: {} fills/hr",
+                settings.WS_ENABLED, settings.QUOTE_OFFSET_TICKS,
+                settings.HOT_REQUOTE_DEBOUNCE_MS, settings.ADVERSE_FILL_RATE_THRESHOLD)
     logger.info("=" * 60)
 
     # ── Init components ──────────────────────────────────────────
@@ -731,6 +889,34 @@ async def main() -> None:
         settings.MODE.value,
     )
 
+    # ── WebSocket feed (event-driven quoting) ────────────────────
+    global _ws_feed, _hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings
+    ws_feed: Optional[WebSocketFeed] = None
+
+    if settings.WS_ENABLED:
+        ws_feed = WebSocketFeed(on_mid_change=hot_requote)
+        _ws_feed = ws_feed
+        _hot_market_mgr = market_mgr
+        _hot_order_mgr = order_mgr
+        _hot_inventory = inventory
+        _hot_quoter = quoter
+        _hot_settings = settings
+
+        token_ids = []
+        tick_sizes: Dict[str, float] = {}
+        for m in market_mgr.markets:
+            if m.condition_id in unseeded_markets:
+                continue
+            tick = {"0.1": 0.1, "0.01": 0.01, "0.001": 0.001, "0.0001": 0.0001}.get(m.tick_size, 0.01)
+            for tid in (m.token_id_yes, m.token_id_no):
+                if tid:
+                    token_ids.append(tid)
+                    tick_sizes[tid] = tick
+        await ws_feed.subscribe(token_ids, tick_sizes)
+        logger.info("WS feed: subscribed to {} tokens", len(token_ids))
+    else:
+        logger.info("WS feed disabled (WS_ENABLED=false)")
+
     # ── Graceful shutdown ────────────────────────────────────────
     shutdown_event = asyncio.Event()
 
@@ -745,6 +931,7 @@ async def main() -> None:
     bg_tasks = [
         asyncio.create_task(market_refresh_task(market_mgr)),
         asyncio.create_task(stale_order_cleanup_task(order_mgr)),
+        asyncio.create_task(ghost_order_reconciliation_task(order_mgr)),
         asyncio.create_task(daily_rewards_task(rewards, market_mgr, discord, scoring_monitor)),
         asyncio.create_task(reconciliation_task(client, inventory, discord)),
         asyncio.create_task(dynamic_realloc_task(market_mgr, scoring_monitor, settings)),
@@ -752,6 +939,8 @@ async def main() -> None:
             market_mgr, order_mgr, inventory, scoring_monitor, discord, settings,
         )),
     ]
+    if ws_feed:
+        bg_tasks.append(asyncio.create_task(ws_feed.run_forever()))
 
     # ── Main quoting loop ────────────────────────────────────────
     logger.info("Entering main quoting loop (interval={}s)", settings.REBALANCE_INTERVAL_SECONDS)
@@ -774,6 +963,7 @@ async def main() -> None:
                     settings=settings,
                     cycle_index=cycle_index,
                     skip_cids=unseeded_markets,
+                    ws_feed=ws_feed,
                 )
                 if result:
                     posted, volume = result
