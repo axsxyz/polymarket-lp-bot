@@ -8,6 +8,7 @@ logs/*.jsonl
 data/selected_markets.json
 data/trade_watermark.json
 data/rewards_history.json
+data/airdrop_metrics.json
 .venv/
 venv/
 *.egg-info/
