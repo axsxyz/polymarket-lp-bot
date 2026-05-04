@@ -13,23 +13,30 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 - **Structure** : `main.py` (~1003 LOC orchestrateur), `core/` (client, quoter, order_manager, inventory, fill_collector, scoring_monitor, rewards_tracker, ws_feed, market_manager, inventory_seeder), `config/` (settings, markets_filter), `utils/`, `scripts/`, `tests/`.
 - **Entrée** : `python main.py`.
 
+### ⚠️ Modules qui N'EXISTENT PAS (doc stale — ne jamais référencer)
+- `dashboard/` — absent. `ENABLE_DASHBOARD=true` sans effet.
+- `core/positions_aggregator.py` — absent.
+- `scripts/positions_cli.py` — absent.
+- Retiré de CLAUDE.md et AGENTS.md le 2026-05-04.
+
 ### Capital & mode (Stage 1 — vérifier `.env` local)
 
 | Paramètre | Valeur |
 |-----------|--------|
 | `TOTAL_CAPITAL` | 300 USDC |
-| `MAX_MARKETS` | **15** (était 3 avant 2026-05-04) |
+| `MAX_MARKETS` | **20** (3→15→20 le 2026-05-04, ROADMAP Appendix A) |
+| `MAX_MARKETS_PER_CYCLE` | 20 |
 | `MAX_CAPITAL_PER_MARKET` | 80 |
 | `DRY_RUN` | `false` (live) |
 | `MODE` | `safe` |
-| `REBALANCE_INTERVAL_SECONDS` | 10 |
+| `REBALANCE_INTERVAL_SECONDS` | **45** (était 10, ROADMAP Appendix A sweet spot) |
 | `WS_ENABLED` | `true` |
-| `API_RATE_LIMIT_RPS` | **1.5** (était 5.0 avant 2026-05-04) |
+| `API_RATE_LIMIT_RPS` | **1.5** (était 5.0, plafond CLOB ~1.67 RPS) |
 
 ### Stage produit
 
-- **Stage 1** : validation live minimale (capital réduit, marchés élargis à 15), aligné ROADMAP P5-5.
-- **Avant scaling** (> ~1k USDC) : implémenter le drawdown daily circuit breaker en **P1 prioritaire**.
+- **Stage 1** : validation live minimale (capital réduit, 20 marchés, cycle 45s).
+- **Avant scaling > 1 000 USDC** : implémenter le drawdown daily circuit breaker **(P1 BLOCKER)**.
 
 ---
 
@@ -37,48 +44,81 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 | Fichier:ligne | Problème | Statut |
 |---------------|----------|--------|
-| `main.py:866-876` | `pos.yes_cost` / `pos.no_cost` initialisés avec `bal * mid` au lieu du prix seed réel → PnL biaisé | NON FIXÉ |
-| `rewards_tracker.py:274` | `estimated_rewards_usd / 10.0` — hardcodé, non fondé sur la concurrence réelle | NON FIXÉ |
-| `config/settings.py:66` | `API_RATE_LIMIT_RPS` dépassait le plafond CLOB (~1.67 RPS) | **FIXÉ 2026-05-04** : 5.0 → 1.5 |
-| `main.py:977` | Sleep cycle sans jitter → fingerprint déterministe | **FIXÉ 2026-05-04** : `+random.uniform(-2.0, 2.0)` |
-| *(aucun fichier)* | Pas de **circuit breaker drawdown journalier** | NON FIXÉ — **PROCHAIN P1** |
+| `main.py:866-876` | `pos.yes_cost/no_cost` initialisés avec `bal * mid` au lieu du prix seed réel → PnL biaisé | NON FIXÉ |
+| `rewards_tracker.py:274` | `estimated_rewards_usd / 10.0` hardcodé | NON FIXÉ |
+| `config/settings.py:66` | `API_RATE_LIMIT_RPS` dépassait le plafond CLOB | **FIXÉ 2026-05-04** : 5.0 → 1.5 |
+| `main.py:977` | Sleep cycle sans jitter | **FIXÉ 2026-05-04** : `+random.uniform(-2.0, 2.0)` |
+| *(aucun fichier)* | Pas de circuit breaker drawdown journalier | NON FIXÉ — **P1 BLOCKER** |
 
 ---
 
-## 3. Changements effectués (session 2026-05-04)
+## 3. Tous les changements du 2026-05-04
 
 | Fichier | Changement |
 |---------|------------|
 | `.env:61` + `config/settings.py:66` | `API_RATE_LIMIT_RPS` : `5.0` → `1.5` |
 | `main.py:20` | `import random` ajouté |
 | `main.py:978` | `sleep_time += random.uniform(-2.0, 2.0)` — jitter anti-fingerprint |
-| `.env:35` | `MAX_MARKETS` : `3` → `15` — breadth airdrop |
-| `.env:36` | `PREFERRED_TAGS` ajouté : politics + election + fed + geopolitics + midterms + 2026 + 2028 + **sports + crypto + ai + science + entertainment + culture** |
+| `.env:25` | `REBALANCE_INTERVAL_SECONDS` : `10` → `45` (ROADMAP Appendix A) |
+| `.env:35` | `MAX_MARKETS` : `3` → `15` → `20` (ROADMAP Appendix A sweet spot) |
+| `.env:36` | `PREFERRED_TAGS` ajouté : +sports,crypto,ai,science,entertainment,culture |
+| `.env.example` | `API_RATE_LIMIT_RPS`: 5.0→1.5, `BURST`: 25→20, `REBALANCE`: 10→45, `MAX_MARKETS`: 60→20 |
 | `requirements.txt` | `pip freeze` complet depuis `.venv` (versions épinglées) |
+| `CLAUDE.md` + `AGENTS.md` | Retrait `dashboard/`, `positions_aggregator.py`, `positions_cli.py` + "15s" → "45s" |
+| `README.md` | `API_RATE_LIMIT_RPS` default 3.0→1.5, `REBALANCE_INTERVAL_SECONDS` 15→45 |
+| `.cursor/TASK.md` | Critères d'acceptance P1 + section P3 (Tier 1/2 ANALYSIS.md) |
 
 ---
 
 ## 4. Décisions d'architecture
 
-- **Python / asyncio**, pas Go : SDK officiel synchrone enveloppé dans `asyncio.to_thread()`, pas de binaire séparé.
-- **Règles Cursor** (workspace) : `.cursor/rules/01-core-behavior.mdc`, `02-architecture.mdc`, `03-polymarket-api.mdc`, `04-airdrop-priority.mdc`.
-- **Configuration** : une seule classe `Settings` dans `config/settings.py` — ne pas inventer de variables d'environnement absentes de ce fichier.
-- **`DRY_RUN`** : ne passer à `false` ou modifier le comportement live **que** sur instruction explicite du propriétaire du wallet.
-- **Invariants prod** : conserver `cancel_all_orders` au démarrage (~815 `main.py`), handler SIGTERM / shutdown gracieux, logging via loguru (pas `print()`).
+- **Python / asyncio**, pas Go : SDK officiel synchrone enveloppé dans `asyncio.to_thread()`.
+- **Règles Cursor** : `.cursor/rules/01-core-behavior.mdc`, `02-architecture.mdc`, `03-polymarket-api.mdc`, `04-airdrop-priority.mdc`.
+- **Configuration** : une seule classe `Settings` dans `config/settings.py` — ne pas inventer de variables absentes.
+- **`DRY_RUN`** : ne passer à `false` que sur instruction explicite du propriétaire du wallet.
+- **Invariants prod** : conserver `cancel_all_orders` au démarrage (~815 `main.py`), handler SIGTERM, logging via loguru (pas `print()`).
+- **`dashboard/` n'existe pas** : ne jamais générer de code pour ce module.
 
 ---
 
 ## 5. Prochain chantier prioritaire (P1)
 
-1. **URGENT — Drawdown daily circuit breaker** (`core/inventory.py` + `main.py`) : pause globale + alerte Discord si PnL journalier dépasse un seuil configurable (ex. `DAILY_DRAWDOWN_LIMIT_PCT=5`) vs `TOTAL_CAPITAL`. **Blocker pour scaler > 1000 USDC.**
-2. **Midpoint guard continu [0.18, 0.82]** (`core/quoter.py:141`) : pause marché si `live_mid` sort de la bande sur N cycles consécutifs.
-3. **Fix cost basis seed** (`main.py:866-876`) : utiliser le prix réel du seed order, pas `bal * mid`.
-4. **Tracker volume quoted notional** (`core/order_manager.py:617`) : incrémenter `price * size` sur chaque POST `/order` réussi, persister dans `rewards_tracker.py`.
+### 🔴 BLOCKER — Drawdown daily circuit breaker
+- **Fichiers** : `core/inventory.py` + `main.py`
+- **Acceptance** : `DAILY_DRAWDOWN_LIMIT_PCT` dans `settings.py` (default `0.05`). Si `realised_pnl_today < -(pct × TOTAL_CAPITAL)` → pause globale + alerte Discord. Reset à minuit UTC.
+- **BLOQUANT pour tout scaling > 1 000 USDC.**
+
+### Midpoint guard continu [0.18, 0.82]
+- **Fichiers** : `core/quoter.py:141`
+- **Acceptance** : pause marché si `live_mid` sort de la bande 3 cycles consécutifs. Seuils configurables (`MIDPOINT_GUARD_MIN`, `MIDPOINT_GUARD_MAX`, `MIDPOINT_GUARD_CYCLES`).
+
+### Fix cost basis seed
+- **Fichiers** : `main.py:866-876`
+- **Acceptance** : `pos.yes_cost/no_cost` = prix réel seed order (pas `bal * mid`). Test : buy 0.40, sell 0.60 → PnL +$0.20/share.
+
+### Tracker volume quoted notional
+- **Fichiers** : `core/order_manager.py` ~617
+- **Acceptance** : compteur `total_quoted_notional` (`price × size` par POST réussi), persisté dans `data/airdrop_metrics.json`.
 
 ---
 
-## 6. Liens utiles
+## 6. Roadmap P3 (chantiers structurants, ANALYSIS.md)
+
+### Tier 1 — Impact 2-3× sur les retours
+1. **`core/toxicity_analyzer.py`** — VPIN + fill-vs-mid scoring + corrélation marchés liés
+2. **`core/resolution_guard.py`** — midpoint ongoing + max-loss calculator + auto-delist >15 % en 24h
+3. **`backtest/`** — replay orderbook historique Gamma `/trades`, grid search params, Q-score réalisé vs max
+
+### Tier 2 — Impact 1.5-2× sur les retours
+4. Market-specific strategy profiles (tightness adaptée par marché)
+5. Multi-level quoting L1/L2/L3 par token
+6. Cross-market hedging (matrice corrélation, YES A ↔ NO B)
+
+---
+
+## 7. Liens utiles
 
 - ROADMAP détail : `ROADMAP.md`
 - README opérationnel : `README.md`
+- Analyse codebase : `docs/ANALYSIS.md`
 - Graph Memory MCP : entités `Polymarket LP Farmer Bot`, `P0 Quick Wins May 2026`, `Known Bugs`, `Next Priority Work`
