@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import random
 import signal
 import sys
 from datetime import datetime, timezone
@@ -974,7 +975,7 @@ async def main() -> None:
 
             cycle_index += 1
             elapsed = asyncio.get_event_loop().time() - cycle_start
-            sleep_time = max(0, settings.REBALANCE_INTERVAL_SECONDS - elapsed)
+            sleep_time = max(0, settings.REBALANCE_INTERVAL_SECONDS - elapsed + random.uniform(-2.0, 2.0))
             logger.info("Cycle took {:.1f}s — sleeping {:.1f}s", elapsed, sleep_time)
 
             try:

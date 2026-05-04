@@ -1,0 +1,73 @@
+---
+description: LP bot real architecture map — what exists, what does not
+alwaysApply: true
+---
+
+# LP FARMING BOT — ARCHITECTURE MAP (audit-verified, May 2026)
+
+## Stack
+- Python async (asyncio) — single process, single wallet
+- py-clob-client >= 0.34.0 (CLOB auth, order management)
+- web3 >= 7.0.0 (on-chain allowance checks)
+- aiohttp, websockets, loguru, pydantic-settings
+
+## Module map — what EXISTS and what it does
+
+| Module | Role |
+|--------|------|
+| `main.py` (1003 LOC) | Orchestrator: hot WS path, cold cycle, startup/shutdown |
+| `core/quoter.py` | Spread calc (tick-based + legacy), skew adjustment, Q-score |
+| `core/inventory.py` | Position tracking, skew 4-tier, realised PnL average-cost |
+| `core/order_manager.py` | Smart-diff cancel-replace, circuit breaker per market, GTC orders |
+| `core/fill_collector.py` | Fill reconciliation, trade pagination dedup |
+| `core/scoring_monitor.py` | `are_orders_scoring` polling every 5min, remediation after 3 failures |
+| `core/rewards_tracker.py` | Daily snapshot, airdrop_metrics.json, pool fetch via Gamma |
+| `core/ws_feed.py` | WebSocket market feed, reconnect backoff, mid extraction |
+| `config/markets_filter.py` | Market scoring composite, filters, double-shape parser |
+| `config/market_manager.py` | Market discovery (Gamma paginated), capital allocation |
+| `config/settings.py` | Pydantic-settings: ALL valid env vars live here |
+| `utils/discord.py` | Discord alerts, rate-limited 5 msg/sec |
+| `utils/logging.py` | Loguru stderr + rotating file + JSONL |
+| `scripts/setup_allowances.py` | One-shot ERC20/ERC1155 approvals on Polygon |
+| `scripts/inventory_seeder.py` | Initial position seeding |
+
+## What does NOT exist (doc is stale — do not generate)
+- `dashboard/` — referenced in CLAUDE.md but absent. `ENABLE_DASHBOARD=true` has NO effect.
+- `core/positions_aggregator.py` — does not exist
+- `scripts/positions_cli.py` — does not exist
+- `backtest/` — no backtesting framework
+- `.github/workflows/` — no CI pipeline
+
+## Key architecture patterns to preserve
+
+### Hot path (WS-driven, ~1s latency)
+```
+ws_feed.py → price_change event → main.py:hot_requote() → quoter → order_manager
+```
+- Debounce: 1s minimum between requotes per market
+- Velocity guard: skip if 3 ticks moved in 5s
+
+### Cold path (cycle-based, 10s)
+```
+main.py:run_cycle() → market_manager → quoter → order_manager → fill_collector → scoring_monitor
+```
+- REBALANCE_INTERVAL_SECONDS=10 (configurable)
+- Smart-diff: only replace order if price moved > THRESHOLD ticks OR size changed > 10% OR age > MAX_ORDER_AGE_SECONDS
+
+### Skew protection (4 tiers, inventory.py:248-285)
+- Alert: 25% → log warning
+- Action: 30% → widen bid offset
+- Recovery: 45% → reduce ASK size 50%
+- Hard pause: 70% → stop quoting this market
+
+## Known bugs (from audit — fix these, do not work around them)
+1. `main.py:866-876` — cost basis bug: initializes `pos.yes_cost = bal * mid` instead of actual seed price
+2. `rewards_tracker.py:274` — LP share estimated by dividing pool by 10 (hardcoded, inaccurate)
+3. `config/settings.py:66` — `API_RATE_LIMIT_RPS=5.0` exceeds documented Polymarket limit (~1.67 RPS)
+4. `main.py:977` — cycle sleep has no jitter (deterministic 10s fingerprint)
+5. No drawdown daily circuit breaker anywhere in the codebase
+
+## Capital configuration (live Stage 1)
+- TOTAL_CAPITAL=300, MAX_MARKETS=3, DRY_RUN=false, MODE=safe
+- MAX_CAPITAL_PER_MARKET=80
+- Never change DRY_RUN without explicit user instruction

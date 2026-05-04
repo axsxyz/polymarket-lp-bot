@@ -1,0 +1,71 @@
+---
+description: Core agent behavior — anti-hallucination, search-first protocol
+alwaysApply: true
+---
+
+# AGENT BEHAVIOR — NON-NEGOTIABLE
+
+## Context7 — auto-trigger
+Always use Context7 MCP before writing code that touches:
+- py-clob-client (any method call)
+- web3.py (contract interactions)
+- aiohttp, websockets (connection patterns)
+Never rely on training data for these libraries — fetch docs first, then code.
+
+## Memory MCP — protocole obligatoire
+
+DÉBUT de chaque session :
+- Appelle memory search "lp bot polymarket" pour récupérer le contexte
+- Lis ce qui remonte avant de toucher au code
+
+FIN de chaque session où du code a changé :
+- Sauvegarde dans memory : ce qui a été modifié, pourquoi, et le prochain chantier
+- Format : "[date] [fichier:ligne] [changement] → [raison]"
+
+Ce qu'on stocke dans memory :
+- Bugs fixés et leur root cause
+- Paramètres tuned et les valeurs testées
+- Décisions d'architecture et pourquoi
+- Prochaine tâche prioritaire
+
+Ce qu'on NE stocke PAS :
+- Code complet (trop long, inutile)
+- Choses déjà dans les .mdc rules (doublon)
+
+## TASK.md — protocole
+- Début de session : lis @.cursor/TASK.md
+- Exécute les tâches P0 non cochées dans l'ordre
+- Coche [x] avant de commencer, remet [ ] si échec avec raison
+- Déplace en "Complété" avec la date quand c'est propre et testé
+- Ne passe jamais à P1 sans que tous les P0 soient faits
+
+## Mindset
+- Do NOT affirm my statements automatically. Question assumptions. Prioritize truth over agreement.
+- If you are unsure whether a file, function, or variable exists: SEARCH FIRST. Never assume.
+- Start every reply with the rules you are applying: "Applying: [rule names]"
+
+## Execution protocol (always in this order)
+1. SEARCH — use codebase_search or grep to find existing implementations before writing anything
+2. READ — open and read the relevant files. Never infer content from filenames alone.
+3. PLAN — state what you will change and why, before touching code
+4. ACT — make changes file by file. Stop after each file for review.
+5. VERIFY — after changes, confirm no imports are broken, no existing tests are affected
+
+## Hard limits — hallucination prevention
+- NEVER invent a function, class, or module that you have not seen in the code
+- NEVER assume a file exists because CLAUDE.md or AGENTS.md mentions it — verify with ls/grep first
+- NEVER generate code that references `dashboard/`, `core/positions_aggregator.py`, or `scripts/positions_cli.py` — these DO NOT EXIST in the repo (doc is stale)
+- NEVER suggest `DRY_RUN=false` changes without explicit user confirmation — bot is live on mainnet
+- If a config key is not in `config/settings.py`, it does not exist. Do not invent env vars.
+
+## Code quality rules
+- All async functions must handle exceptions — no bare `await` without try/except in prod paths
+- All changes to `main.py` must preserve the `cancel_all_orders` startup sequence (line ~815)
+- Never remove the SIGTERM graceful shutdown handler
+- Logging: use `logger.info/warning/error` (loguru) — never `print()`
+- Type hints required on all new functions
+
+## Response format
+- File references: always `filename.py:line_number`
+- When proposing a fix: show diff-style (old → new), not just the new version
+- One file at a time. Never batch 5 files in one shot without asking.
