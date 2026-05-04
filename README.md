@@ -102,7 +102,7 @@ Where `v` is the market's `max_spread` and `s` is your quote's distance from the
 - **Two-sided bonus** — the protocol takes `min(Q_bid_side, Q_ask_side)`, so balanced quoting is critical.
 - The bot targets `mid ± (max_spread × tightness_factor)` where tightness_factor defaults to **0.48** (safe mode) or **0.35** (aggressive mode).
 
-### Cycle Flow (every 15 seconds by default)
+### Cycle Flow (every 45 seconds by default)
 
 1. **Collect fills** — poll the CLOB trades API; filter to active markets only (prevents phantom exposure from orphaned orders).
 2. **Batch-fetch midpoints** — one API call for all active markets.
@@ -180,7 +180,7 @@ All settings are in `.env` (see `.env.example`). Key parameters:
 | `TIGHTNESS_FACTOR_SAFE` | Spread multiplier for safe mode | 0.48 |
 | `TIGHTNESS_FACTOR_AGGRESSIVE` | Spread multiplier for aggressive mode | 0.35 |
 | `SIZE_MULTIPLIER` | Order size as multiple of min_incentive_size | 2.0 |
-| `REBALANCE_INTERVAL_SECONDS` | Seconds between quoting cycles | 15 |
+| `REBALANCE_INTERVAL_SECONDS` | Seconds between quoting cycles | 45 |
 | `ORDER_UPDATE_THRESHOLD_TICKS` | Min price change (in ticks) before replacing an order | 2 |
 
 ### Risk
@@ -210,7 +210,7 @@ All settings are in `.env` (see `.env.example`). Key parameters:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `API_RATE_LIMIT_RPS` | Max API requests per second | 3.0 |
+| `API_RATE_LIMIT_RPS` | Max API requests per second | 1.5 |
 | `API_RATE_LIMIT_BURST` | Token bucket burst capacity | 20 |
 | `MAX_MARKETS_PER_CYCLE` | Max markets processed per cycle | 20 |
 

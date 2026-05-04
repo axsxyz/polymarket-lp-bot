@@ -28,8 +28,6 @@ pytest tests/test_quoter.py::TestComputeOffset::test_offset_is_tick_based
 # Scripts
 python scripts/setup_allowances.py          # one-time token approvals
 python scripts/sell_positions.py             # liquidate positions
-python scripts/positions_cli.py              # CLI dashboard
-python scripts/positions_cli.py --watch      # auto-refresh positions
 ```
 
 There is no linter, type checker, or formatter configured. Tests use pytest with no special plugins.
@@ -40,7 +38,7 @@ There is no linter, type checker, or formatter configured. Tests use pytest with
 
 `main.py` is a single ~1000-line async orchestrator. It runs an infinite loop with two quoting paths:
 
-- **Cold path** (every `REBALANCE_INTERVAL_SECONDS`, default 15s): full cycle — collect fills, batch-fetch midpoints, check global exposure, per-market quote computation with skew evaluation, smart-diff cancel-and-replace.
+- **Cold path** (every `REBALANCE_INTERVAL_SECONDS`, default 45s): full cycle — collect fills, batch-fetch midpoints, check global exposure, per-market quote computation with skew evaluation, smart-diff cancel-and-replace.
 - **Hot path** (event-driven via WebSocket): `hot_requote()` fires when a mid-price moves ≥1 tick from the current order center. Lightweight — no fill collection, no skew eval, no exposure checks.
 
 Background tasks scheduled from `main.py`: market refresh (15 min), periodic cleanup (4 h), daily rewards snapshot (midnight UTC). Graceful shutdown on SIGINT/SIGTERM cancels all orders first.
@@ -70,10 +68,6 @@ All components are instantiated in `main.py` and passed references to each other
 - **`discord.py` — `DiscordNotifier`**: Rate-limited webhook sender with rich embeds. Self-rate-limits to avoid Discord's 5 msg/sec throttle.
 - **`logging.py`**: Loguru setup — stderr (colored), rotating file (`logs/bot_*.log`), structured JSON (`logs/bot_*.jsonl`).
 - **`helpers.py`**: Pure functions — `round_to_tick`, `clamp_price`, `estimate_reward_score`, `two_sided_q_score`, `seconds_until_midnight_utc`.
-
-### Dashboard (`dashboard/`)
-
-Optional FastAPI web UI (`ENABLE_DASHBOARD=true`). Serves HTMX partials for auto-refresh. Uses `core/positions_aggregator.py` to merge wallet + bot state.
 
 ### Concurrency Model
 
