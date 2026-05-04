@@ -70,7 +70,17 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 4. Décisions d'architecture
+## 4. Tooling / Ops
+
+### Hook post-commit (`scripts/post-commit.sh`)
+- **Versionné** dans `scripts/post-commit.sh` (rwx).
+- **Installé** dans `.git/hooks/post-commit`.
+- **Comportement** : affiche un rappel "⚡ MEMORY UPDATE REQUIRED" avec le hash + message du commit après chaque `git commit`.
+- **Sur un nouveau clone** : `cp scripts/post-commit.sh .git/hooks/post-commit`
+
+---
+
+## 5. Décisions d'architecture
 
 - **Python / asyncio**, pas Go : SDK officiel synchrone enveloppé dans `asyncio.to_thread()`.
 - **Règles Cursor** : `.cursor/rules/01-core-behavior.mdc`, `02-architecture.mdc`, `03-polymarket-api.mdc`, `04-airdrop-priority.mdc`.
@@ -81,7 +91,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 5. Prochain chantier prioritaire (P1)
+## 6. Prochain chantier prioritaire (P1)
 
 ### 🔴 BLOCKER — Drawdown daily circuit breaker
 - **Fichiers** : `core/inventory.py` + `main.py`
@@ -102,7 +112,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 6. Roadmap P3 (chantiers structurants, ANALYSIS.md)
+## 7. Roadmap P3 (chantiers structurants, ANALYSIS.md)
 
 ### Tier 1 — Impact 2-3× sur les retours
 1. **`core/toxicity_analyzer.py`** — VPIN + fill-vs-mid scoring + corrélation marchés liés
@@ -116,7 +126,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 7. Liens utiles
+## 8. Liens utiles
 
 - ROADMAP détail : `ROADMAP.md`
 - README opérationnel : `README.md`
