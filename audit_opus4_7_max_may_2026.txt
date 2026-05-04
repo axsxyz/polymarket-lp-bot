@@ -1,0 +1,376 @@
+J'ai lu l'intégralité du code (6 125 lignes Python sur 12 modules + tests + scripts). Voici l'audit complet en respectant le protocole.
+
+---
+
+# AUDIT — Polymarket LP Farmer Bot
+
+## Préambule — État réel du repo
+
+| Élément | Valeur observée |
+|---|---|
+| LOC Python | 6 125 (dont `main.py` = 1 003) |
+| Couverture tests | 4 fichiers (`tests/test_quoter.py`, `test_inventory.py`, `test_order_manager.py`, `test_markets_filter.py`) — pure unit, sans mocks réseau |
+| Configuration runtime (`.env`) | `TOTAL_CAPITAL=300`, `MAX_MARKETS=3`, `DRY_RUN=false`, `MODE=safe` → bot **déjà en live trading** sur capital réduit (Stage 1) |
+| Branche git | 10 commits, dernière feature = WS requoting + tick-based quoting |
+| Dépendances | `py-clob-client>=0.34.0`, `web3>=7.0.0`, `aiohttp`, `loguru`, `pydantic-settings`, `websockets` |
+| Documentation incohérente | `CLAUDE.md`/`AGENTS.md` mentionnent `dashboard/`, `core/positions_aggregator.py`, `scripts/positions_cli.py` → **aucun n'existe** dans le repo |
+
+**Note ambiguïté** : La doc affirme l'existence de modules absents — sans doute scripts perdus / projetés. Je n'audite QUE le code réel.
+
+---
+
+## [MODULE 1] LP MECHANICS AUDIT
+
+### A. Stratégie de quoting
+
+| Aspect | Implémentation | Verdict |
+|---|---|---|
+| Mid-price source | WebSocket prioritaire (`main.py:102-109`) avec fallback REST batch (`get_midpoints`) puis appels individuels | OK — design dual hot/cold solide |
+| Calcul du spread | Mode tick-based : `offset = QUOTE_OFFSET_TICKS * tick` (`core/quoter.py:185-195`) avec auto-élargissement adverse-fill (`fph > ADVERSE_FILL_RATE_THRESHOLD → +1 tick`). Fallback legacy : `max_spread * tightness_factor` | Correct mais **simpliste** |
+| Skew adjustment | 4 paliers : alert 25% → action 30% → recovery 45% → hard pause 70% (`core/inventory.py:248-285`). Côté lourd : `bid_offset += skew_widen` (`quoter.py:232-240`) | Bien calibré |
+| Order sizing | `min_size * SIZE_MULTIPLIER`, capé par `allocated_capital / 2` par côté (`quoter.py:262-278`). ASK strict ≤ position détenue (`quoter.py:275-278`) | Conservateur — capital efficiency moyenne |
+| Refresh logic | **Hybride event-driven + cycle** : hot path WS `hot_requote()` (`main.py:185-238`) avec debounce 1s ; cold path 10s (`REBALANCE_INTERVAL_SECONDS=10`) | Très sophistiqué pour un OSS bot |
+| Cancellation | Smart-diff : ne replace que si `price_moved > ORDER_UPDATE_THRESHOLD_TICKS * 0.01`, `size_changed > 10%`, ou `age > MAX_ORDER_AGE_SECONDS` (`order_manager.py:282-294`) | Excellent — preserve scoring uptime |
+
+### B. Couverture des marchés
+
+| Filtre (`config/markets_filter.py:57-94`) | Valeur |
+|---|---|
+| `MIN_END_DATE_DAYS` | 120 jours |
+| `MAX_24H_VOLUME` | $800k (évite marchés où les pros dominent) |
+| `MIN_24H_VOLUME` | $500 |
+| `MIDPOINT_MIN/MAX` | 0.15 – 0.85 |
+| `MIN_REWARD_RATE_DAILY` | $5/jour |
+| Scoring composite | reward_rate × volume_sweet_spot × longevity_bonus × tag_bonus × capital_eff (`markets_filter.py:122-169`) |
+| Multi-market parallèle | `MAX_MARKETS=60` (default) / `MAX_MARKETS_PER_CYCLE=20` avec round-robin top-15 toujours servi (`main.py:57-83`) |
+| Gestion near-resolution | **Filtre statique uniquement à la sélection** — aucun garde-fou continu si un marché passe de 0.50 à 0.92 in-flight |
+
+**Faiblesse critique** : `markets_filter.py:72` rejette mid hors [0.15, 0.85] *au moment de la sélection* mais aucune relecture en boucle. Un marché peut dériver dans la zone toxique sans être délisté. → ANALYSIS.md le reconnaît déjà ligne 121.
+
+### C. Reward mechanics
+
+| Élément | Statut | Référence |
+|---|---|---|
+| Tracking `are_orders_scoring` | OUI, périodique 5 min | `core/scoring_monitor.py:61-151` |
+| Remediation auto sur non-scoring | OUI, après 3 échecs consécutifs → force-replace | `scoring_monitor.py:107-116`, `main.py:469-497` |
+| Calcul Q-score quadratique | Correct : `((v-s)/v)^2 * size` | `quoter.py:85-93`, `helpers.py:38-53` |
+| Fee accrual / claim | **NON** — Polymarket distribue auto à minuit UTC, donc rien à claim, mais le bot ne **mesure pas** sa part réelle | `rewards_tracker.py:149-182` ne récupère que `total_pool` |
+| P&L fees vs capital | Reporting : `realised_pnl` via average-cost (`inventory.py:215-227`). **Approximation grossière** : `format_summary` divise pool par 10 LPs hypothétiques (`rewards_tracker.py:274`) |
+| Daily rewards endpoint | Snapshot quotidien à minuit UTC + 60s | `main.py:613-628` |
+
+### D. Gestion des fills
+
+| Cas | Comportement |
+|---|---|
+| Partial fill | `FillEvent.filled_size` = `trade.size` (réelle), pas `order.size` original (`fill_collector.py:97-127`). Correct depuis fix P2-3 |
+| Adverse fill | Trigger force-replace (`force=market.condition_id in filled_cids`, `main.py:433`) + cumul `_fill_rates` pour widening |
+| Max position per market | Implicite via `MAX_CAPITAL_PER_MARKET` ($80 dans le `.env` actuel) + `SKEW_HARD_PAUSE_THRESHOLD` |
+| Rebalancing après skew | Recovery mode réduit ASK (`SKEW_RECOVERY_ASK_SIZE_PCT=0.50`) côté lourd ; widen BID (`skew_widen = base_offset * skew_ratio * 1.4`) |
+
+### Verdict Module 1
+
+**Ce n'est PAS un order spammer**. C'est un *vrai* market maker amateur-pro :
+- Smart-diff évite churn inutile → preserve quote uptime (CRITIQUE pour scoring quadratique)
+- WS hot path réagit en ~1s aux moves
+- Skew management 4-tier protège du drift directionnel
+
+**MAIS** : aucune intelligence d'adverse selection (toxicity scoring, VPIN, lambda), aucun garde-fou résolution continu. C'est un **market-making naïf calibré pour fuir le danger** plutôt que pour le détecter activement.
+
+**Score LP mechanics : 7/10**
+
+---
+
+## [MODULE 2] AIRDROP PROFILE ENGINEERING
+
+### A. Détectabilité Sybil
+
+| Signal | Implémentation | Risque |
+|---|---|---|
+| Timing des ordres | Cycle déterministe 10s + hot WS 1s debounce. **Aucun jitter** dans `main.py:976-986` (`sleep_time = max(0, REBALANCE_INTERVAL_SECONDS - elapsed)`) | **Red flag** — un détecteur de patterns trouvera la grille 10s |
+| Gas price | Délégué au SDK `py-clob-client` qui utilise `w3.eth.gas_price` (`scripts/setup_allowances.py:217`). Pas custom. Mais **les ordres CLOB sont signés EIP-712 hors chaîne** — pas de gas par ordre | OK pour les orders ; gas pattern uniquement sur approvals (one-shot) |
+| Wallet pattern | **Mono-wallet** — `PRIVATE_KEY` unique, `FUNDER_ADDRESS` optionnel. Aucune logique multi-wallet | Profile facilement attribuable à 1 entité |
+| Montants | Sizes calculées : `min(base_size, max_bid_shares)` arrondies à 2 décimales (`quoter.py:268-269`). **Pas de round numbers systématiques** — varie selon `min_size` du marché | OK |
+
+### B. Signaux de légitimité
+
+| Signal | Status |
+|---|---|
+| Diversité catégories | `PREFERRED_TAGS=["politics","election","fed","geopolitics","midterms","2026","2028"]` — **monoculture politique** (`config/settings.py:80-90`). Manque : sport, crypto, culture, science, arts |
+| Volume sur marchés liquides | Bon : `MIN_24H_VOLUME=500`, `MAX_24H_VOLUME=800k` cible le sweet-spot (`markets_filter.py:75-78`) |
+| Mix taker/maker | **100% maker** — toutes commandes en `OrderType.GTC` (`order_manager.py:587-598`). Seul exception : seeder utilise GTC limit aggressif (`inventory_seeder.py:451-459`), pas FOK. Aucune intention de prendre du flow | **Red flag majeur** — un airdrop pondérant volume taker exclura le bot |
+| Heures variables | Bot 24/7 cycle continu → couverture homogène **mais identifiable** comme bot |
+
+### C. Métriques de contribution
+
+| Métrique | Trackée ? | Référence |
+|---|---|---|
+| Volume quoted total | NON — seul `volume_usd` *fillé* tracké (`main.py:499`) |
+| Spread contribution | NON — pas de mesure "j'ai resserré le spread de marché" |
+| Uptime liquidité | OUI partiellement via `scoring_uptime_pct` (`rewards_tracker.py:124`) |
+| Depth ajoutée | NON — pas de calcul vs book existant |
+| Distinct markets | OUI : `distinct_markets_scored` (`rewards_tracker.py:123`) |
+| Consecutive active days | OUI persisté `data/airdrop_metrics.json` (`rewards_tracker.py:251-266`) |
+| Total orders posted | OUI (`rewards_tracker.py:125`) |
+
+### D. Conflits config airdrop vs P&L
+
+`.env` actuel :
+- `MAX_MARKETS=3` → minimise breadth airdrop
+- `TOTAL_CAPITAL=300` → volume quotidien plafonné à ~$50-200
+- `SIZE_MULTIPLIER=1.0` → orders au strict `min_size`
+- `MODE=safe` → tightness 0.48 → Q-score sous-optimal
+
+**Tout est calibré Stage 1 validation P&L**, pas profil airdrop. Pour un airdrop, il faudrait l'inverse : breadth, volume, consistency.
+
+### Score airdrop profile : **3/10**
+
+### 5 tweaks immédiats (sans dégrader P&L)
+
+1. **`MAX_MARKETS=15-20`** au lieu de 3 → triple breadth sans changer la qualité du quoting (capital reste protégé via `MAX_CAPITAL_PER_MARKET`).
+2. **Ajouter jitter** dans le cycle : `sleep_time = max(0, REBALANCE_INTERVAL_SECONDS - elapsed) + random.uniform(-2, 2)` à `main.py:977` → casse la signature timing déterministe.
+3. **Diversifier `PREFERRED_TAGS`** : ajouter `"sports","crypto","ai","science"` (`config/settings.py:80-90`) → couvre 4-5 verticales au lieu d'une.
+4. **Forcer un swap taker mensuel** symbolique (~$10-50) sur 1 marché aléatoire → injecte un signal taker dans le profile sans bouleverser le bot.
+5. **Tracker volume quoted (notional posté)** en plus de filled : nouveau compteur dans `OrderManager._post_single` à `order_manager.py:617`. Métrique critique si l'airdrop pondère "liquidité fournie" indépendamment des fills.
+
+---
+
+## [MODULE 3] ROI & BACKTEST ASSESSMENT
+
+### A. Modèle P&L du code
+
+**Revenus modélisés** :
+- LP rewards : pool fetché via Gamma `/markets`, **divisé arbitrairement par 10** (`rewards_tracker.py:274`) — *aucune* mesure réelle de la part user
+- Realised PnL : average-cost basis correct (`inventory.py:217-227`) mais ignore les fills de seed mal valorisés
+
+**Coûts non comptabilisés** :
+- Gas Polygon : ignoré (~$0 par order signé EIP-712 ; ~$0.50 par cycle d'allowance approval, mais one-shot)
+- Adverse selection : non quantifié — uniquement compteur grossier `_fill_rates` (`quoter.py:188-194`)
+- Spread cost : non mesuré (BID-ASK roundtrip si rebalance manuel)
+- **Cost basis bug** : `main.py:866-876` initialise `pos.yes_cost = bal * mid` quand un balance on-chain existe, mais le seeder a acheté à `mid + SEED_AGGRESSIVE_TICKS * tick` (typiquement +3 ticks) → cost basis sous-estimé → realised PnL surestimé
+
+### B. Adverse selection risk
+
+| Mécanisme défensif présent | Limites |
+|---|---|
+| `_fill_rates` widening (>3 fills/h → +1 tick, >9/h → +2) | Réactif, pas prédictif |
+| Velocity guard WS (3 ticks dans 5s) | Bon mais ne cible pas le sens directionnel adverse |
+| Skew management | Limite l'exposition mais n'identifie pas la *toxicity* du flow |
+| Force-replace après fill | Évite la double-fill au même prix |
+
+**Ce qui manque** :
+- Aucune analyse fill vs mid futur (5s, 30s, 5min)
+- Aucune corrélation cross-market
+- Aucun event calendar (élections, FOMC dates)
+- Aucun arrêt automatique si midpoint sort de [0.20, 0.80] *en cours de vie*
+
+**Conséquence** : un trader informé peut systématiquement picker les ordres BID quand il sait que le marché va baisser. Le bot le détecte *après* coup via `_fill_rates` mais a déjà perdu.
+
+### C. Simulation
+
+**Aucune donnée historique disponible** dans le repo (`logs/` est gitignored et vide via `.gitkeep`).
+**Aucun framework de backtest** (`backtest/` n'existe pas).
+
+→ Tout le tuning (`TIGHTNESS_FACTOR_SAFE=0.48`, `QUOTE_OFFSET_TICKS=1`, `SKEW_*` thresholds) est **arbitraire**. Aucune preuve empirique que ces paramètres optimisent quoi que ce soit.
+
+### D. Stress test
+
+| Scénario | Comportement |
+|---|---|
+| Marché résout à 0 alors que bot long YES | Aucune protection — perte = `yes_size * yes_avg_cost`. Le filtre `MIN_END_DATE_DAYS=120` ne suffit pas si le marché bouge fort. |
+| Drawdown journalier | **Aucun circuit breaker P&L** — seulement circuit breaker *par marché* sur erreurs API (`order_manager.py:686-706`) |
+| Marché suspendu mid-position | Position bloquée, watermark ne progresse plus, ASK orders peuvent rester pendants |
+| Crash process | `cancel_all_orders` au shutdown OK ; au restart `cancel_all` au startup (`main.py:815`). Watermark trades persisté → fills reconciliés |
+
+### Estimation APY (capital $10k baseline)
+
+| Scénario | LP rewards/mois | Adverse selection | Net mensuel | APY |
+|---|---|---|---|---|
+| Best case (top 5% scoring, low vol) | $600-800 | $50-100 | $500-750 | 60-90% |
+| Base case | $300-500 | $150-250 | $150-250 | 18-30% |
+| Worst case (1 mauvaise résolution) | $200 | $400+ | -$200 à -$1000 | -2% à -12% |
+
+**Verdict P&L : BREAKEVEN à PROFITABLE en base case, MAIS variance énorme — un seul résolution event peut effacer 2-3 mois de gains.**
+
+**Score P&L/edge : 5/10**
+
+---
+
+## [MODULE 4] POLYMARKET API COMPLIANCE
+
+| Endpoint / Mécanisme | Statut | Référence |
+|---|---|---|
+| **CLOB Auth L1+L2** | OK — `create_or_derive_api_creds` au startup ; `set_api_creds` (`client.py:169-171`) | OK |
+| `POST /order` structure | OK — `OrderArgs(token_id, price, size, side)` + `OrderType.GTC` (`order_manager.py:587-598`) | OK |
+| Order types GTC vs GTD | **GTC partout** — pas de GTD avec expiration. Risque : zombies si le bot crashe avant cancel. **Mitigation présente** : `cancel_all_orders` au startup (`main.py:815`) + `MAX_ORDER_AGE_SECONDS` rolling refresh | RISKY mais mitigé |
+| `GET /orders` polling vs WS | Polling périodique via `get_orders` dans `reconcile_ghost_orders` (`order_manager.py:419`). WS sur `/ws/market` pour midpoints — pas pour user orders | OK (suffisant) |
+| `DELETE /orders/{id}` | `cancel(order_id)` + `cancel_market_orders(condition_id)` + `cancel_all()` (`client.py:415-425`) | OK |
+| Nonce management | Délégué au SDK | OK |
+| **Gamma API** | `get(/markets?active=true&closed=false&limit=200&offset=N)` paginé (`market_manager.py:200`). Parse double-shape (camelCase + snake_case) (`markets_filter.py:251-393`) | OK — robuste aux changements de shape |
+| Rewards endpoint | Lecture pool via `/markets` `clobRewards/rewards.rates` (`rewards_tracker.py:163`). **Pas d'endpoint user-share** (n'existe pas côté Polymarket) | OK (limitation API) |
+| **WebSocket** `/ws/market` | Connexion `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`ws_feed.py:24`), subscribe `{assets_ids, type: "market", custom_feature_enabled: true}` (`ws_feed.py:88-92`) | OK |
+| WS heartbeat / reconnect | `ping_interval=10`, `ping_timeout=20`, exp backoff `delay = min(delay*2, 30)` (`ws_feed.py:113-149`) | OK |
+| WS book parsing | Gère `book` snapshots, `price_change` deltas, `best_bid_ask`, `last_trade_price` (`ws_feed.py:155-214`). **Pas de book local maintenu** — uniquement extract du best bid/ask pour le mid | Suffisant pour mid-tracking |
+| Staleness | `STALENESS_SECONDS=60` invalide le mid (`ws_feed.py:54-59`) | OK |
+| **Rate limit** | `API_RATE_LIMIT_RPS=5.0` dans `.env` (`config/settings.py:66`) — Polymarket documente ~100 req/min ≈ **1.67 RPS**. **5 RPS = 3× la limite documentée** | **RISKY** — risque 429 |
+| 429 retry | Exp backoff `_with_retry(max_retries=3)` (`client.py:93-138`). Patterns non-retryables : `couldn't be fully filled`, `is invalid. duplicated`, etc. (`client.py:78-84`) | OK |
+| 503 / timeout | Caught dans même retry decorator | OK |
+| **Smart contracts** | Polygon mainnet : USDC `0x2791…84174`, CTF `0x4D97…6045`, CTF Exchange `0x4bFb…982E`, NegRisk Exchange `0xC5d5…0a`, NegRisk Adapter `0xd91E…5296` (`scripts/setup_allowances.py:40-49`, `utils/allowance_check.py:11-17`) — **adresses correctes au date d'audit** | OK |
+| ERC1155 setApprovalForAll | OK (`setup_allowances.py:224-235`) |
+| ERC20 approve MAX_UINT256 | OK pour USDC.e |
+| neg_risk routing | `MarketCandidate.neg_risk` propagé mais **jamais utilisé pour router vers le bon Exchange** dans le post_order. Le SDK gère probablement en interne via le token_id, mais c'est non-vérifiable depuis le code |
+
+### Checklist API
+
+| Item | Statut | File:Line |
+|---|---|---|
+| L1+L2 auth | OK | `client.py:164-173` |
+| GTC orders | OK | `order_manager.py:587-598` |
+| GTD orders | MISSING (acceptable mais risque zombies si crash) | — |
+| Cancel by ID | OK | `client.py:415-416` |
+| Cancel by market | OK | `client.py:422-425` |
+| Cancel all | OK | `client.py:418-420` |
+| Batch midpoints | OK | `client.py:310-313` |
+| are_orders_scoring | OK | `client.py:331-364` |
+| Gamma `/markets` paginé | OK | `market_manager.py:189-244` |
+| WS market feed | OK | `ws_feed.py` |
+| WS user feed | MISSING — pas de subscribe sur user trades | `ws_feed.py` (limitation) |
+| Rate limit conservateur | **OUTDATED** — 5 RPS > 1.67 RPS doc | `.env:61`, `settings.py:66` |
+| Trade pagination dedup | OK | `fill_collector.py:78-136` |
+| Allowances on-chain | OK | `setup_allowances.py` |
+| Reconciliation balance | OK partiel | `main.py:689-760` |
+| neg_risk explicit routing | RISKY — non vérifiable code-side | `markets_filter.py:366` |
+
+---
+
+## [MODULE 5] PRODUCTION READINESS CHECKLIST
+
+### Question : peut-on appuyer sur start aujourd'hui ?
+
+**Le bot est DÉJÀ en live** (`.env`: `DRY_RUN=false`, `TOTAL_CAPITAL=300`, `MAX_MARKETS=3`). C'est explicitement Stage 1 du plan documenté dans `ROADMAP.md:743-750`.
+
+→ **GO conditionnel** sur capital limité ($300). **NO-GO scaling >$1k** sans corrections.
+
+### Sécurité des clés
+
+| Item | Statut |
+|---|---|
+| `PRIVATE_KEY` en env var | OK (`.env` gitignored — `.gitignore:1`) |
+| **Clé en clair dans `.env` local** | OK opérationnellement, mais **AUCUN chiffrement** (vault, KMS, hardware wallet). Si la machine est compromise → perte totale instantanée |
+| `FUNDER_ADDRESS` | Vide → utilise EOA derived address |
+| USDC allowance | Setup via `scripts/setup_allowances.py` — **doit être lancé manuellement avant le bot** |
+| Approvals révocables | OUI (`scripts/setup_allowances.py --revoke`) |
+
+### Robustesse opérationnelle
+
+| Item | Statut | Référence |
+|---|---|---|
+| Cancel-all on crash | Pas de hook crash. Au **startup suivant** : `await order_mgr.cancel_all_orders()` (`main.py:815`) | OK partiel |
+| Graceful shutdown | OUI — SIGINT/SIGTERM → `cancel_all_orders` puis cancel des bg_tasks (`main.py:921-998`) | OK |
+| Signal handler dans asyncio | **Utilise `signal.signal()` synchrone** (`main.py:927-928`) au lieu de `loop.add_signal_handler` recommandé. Marche en pratique, fragile en théorie | RISKY mineur |
+| Logging structuré | OUI — Loguru stderr coloré + `bot_*.log` rotatif 50MB/30 jours + `bot_*.jsonl` JSON (`utils/logging.py`) | EXCELLENT |
+| Per-order audit trail | OUI — chaque post/cancel/fill loggé | OK |
+| Discord alerting | Riche : startup, fills, skew, exposure, daily, errors. Rate-limited 5 msg/sec (`utils/discord.py`) | EXCELLENT |
+| Dashboard | DOC mention mais **NON IMPLÉMENTÉ** (`ENABLE_DASHBOARD=true` dans `.env` n'a aucun effet) | MISLEADING |
+
+### Capital safety
+
+| Item | Statut | Référence |
+|---|---|---|
+| Max capital total | OUI : `TOTAL_CAPITAL` cap dans `_allocate_capital` (`market_manager.py:267-281`) |
+| Per-market cap | OUI : `MAX_CAPITAL_PER_MARKET=$80` |
+| Net exposure limit | OUI : `GLOBAL_MAX_EXPOSURE_PCT=0.50` → pause des marchés les plus déséquilibrés |
+| Gross exposure limit | OUI : `GLOBAL_MAX_GROSS_EXPOSURE_PCT=1.50` (mark-to-mid + open orders) (`inventory.py:310-329`) |
+| **Drawdown journalier circuit breaker** | **MANQUANT** — pas de pause auto si realised_pnl < -X | MISSING |
+| Per-market circuit breaker | OUI : `CIRCUIT_BREAKER_MAX_FAILURES=3` → cooldown 300s (`order_manager.py:686-706`) |
+| Emergency stop | OUI : SIGTERM ou kill du process. Pas de fichier-flag style `STOP.flag` watch | OK partiel |
+
+### Déploiement
+
+| Item | Statut |
+|---|---|
+| DRY_RUN mode | OUI par défaut, override `.env` |
+| Config externalisée | OUI 100% via `pydantic-settings` (`config/settings.py`) |
+| `requirements.txt` pinné | **NON pinné** — `>=` minimums seulement (`requirements.txt:1-8`). Risque : break sur upgrade major SDK |
+| README démarrage | OUI complet (414 lignes, `README.md`) |
+| systemd service template | OUI (`README.md:293-318`) |
+| Dockerfile | OUI inline dans README (`README.md:323-329`) — mais **pas de Dockerfile au repo** |
+| Tests CI | NON — pas de `.github/workflows/`, pas de `pyproject.toml` config |
+
+### GO / NO-GO
+
+**GO** sur configuration actuelle ($300, 3 markets) — Stage 1 documenté, surface d'attaque minimale.
+
+**NO-GO scaling > $1k** sans :
+
+| Blocker | Urgence | Estimation |
+|---|---|---|
+| `requirements.txt` pinné | Haute | 30 min |
+| Drawdown journalier circuit breaker | Haute | 2-3 h |
+| Garde-fou continu midpoint hors [0.20, 0.80] | Haute | 1-2 h |
+| Rate limit RPS aligné avec doc Polymarket (5→1.5) ou validation 429-counts | Haute | 1 h test + 15 min config |
+| Resolution risk per-market max-loss calc | Moyenne | 4-6 h |
+| Cost basis bug seed (`main.py:866-876`) | Moyenne | 1 h |
+| Dashboard ou suppression fausses options `.env` | Basse | 30 min |
+| Sortie pour `signal.signal` → `loop.add_signal_handler` | Basse | 30 min |
+
+**Temps total pour GO scaling : 10-15 heures.**
+
+---
+
+## [MODULE 6] FINAL VERDICT & 48H ROADMAP
+
+### 1. VERDICT (5 lignes)
+
+Bot LP **prototype mature en cours de validation Stage 1** ($300 / 3 marchés / live). Architecture sophistiquée (dual hot/cold WS + REST, smart-diff cancel-replace, skew 4-tier, ghost reconciliation) au-dessus de la moyenne OSS. **Risque #1 si lancé en scaling** : adverse selection non détectée + résolution event sur marché qui dérive après sélection. **Levier #1 EV airdrop** : passer `MAX_MARKETS` de 3 à 20+ et diversifier `PREFERRED_TAGS` au-delà du politique pour multiplier la breadth, principal critère probable d'un airdrop $POLY.
+
+### 2. SCORE COMPOSITE
+
+| Dimension | Score /10 | Poids | Pondéré |
+|---|---|---|---|
+| Mécanique LP (quoting) | 7/10 | 25% | 1.75 |
+| Airdrop profile quality | 3/10 | 30% | 0.90 |
+| Robustesse production | 7/10 | 20% | 1.40 |
+| Alignement API Polymarket | 7/10 | 15% | 1.05 |
+| P&L/edge théorique | 5/10 | 10% | 0.50 |
+| **EV TOTAL PONDÉRÉ** | | 100% | **5.6/10** |
+
+### 3. ROADMAP 48H (priorité décroissante)
+
+| Tâche | Fichier | Temps | Impact EV |
+|---|---|---|---|
+| Pin `requirements.txt` aux versions actuelles (`pip freeze > requirements.txt`) | `requirements.txt` | 15 min | Stabilité production |
+| Aligner rate limit avec doc : `API_RATE_LIMIT_RPS=1.5` ou run validation 429-counts | `.env`, `config/settings.py:66` | 30 min | Évite ban API |
+| Augmenter `MAX_MARKETS=15` + diversifier `PREFERRED_TAGS=politics,sports,crypto,fed,ai` | `.env:35,80` | 10 min | **Breadth airdrop +400%** |
+| Ajouter jitter cycle : `sleep_time + random.uniform(-2, 2)` | `main.py:977` | 15 min | Anti-fingerprinting Sybil |
+| Drawdown daily circuit breaker : si `inventory.realised_pnl < -PCT*TOTAL_CAPITAL` → pause + Discord alert | `core/inventory.py`, `main.py` | 2 h | Capital safety |
+| Garde-fou midpoint continu : marquer market `paused=True` si `live_mid` sort de [0.18, 0.82] pendant 3 cycles consécutifs | `core/quoter.py:141`, `main.py:419` | 1.5 h | Anti-résolution adverse |
+| Fix cost basis seed : remplacer `pos.yes_cost = bal * mid` par cost réel via balance API trade history | `main.py:866-876` | 1 h | PnL précis |
+| Tracker volume *quoted* (notional posté, pas filled) dans `RewardsTracker` | `core/rewards_tracker.py:86-90`, `core/order_manager.py:617` | 1 h | Métrique airdrop critique |
+| Implémenter 1 trade taker mensuel symbolique (~$20) sur marché aléatoire | nouveau `core/taker_signal.py` | 2-3 h | Profile mix maker/taker |
+| `loop.add_signal_handler` au lieu de `signal.signal` pour SIGINT/SIGTERM | `main.py:927-928` | 30 min | Shutdown robuste |
+| Documenter ou supprimer les options `.env` fantômes (`ENABLE_DASHBOARD`, `DASHBOARD_*`) | `.env`, `README.md` | 20 min | Clarté config |
+
+### 4. QUICK WINS IMMÉDIATS (< 30 min chacun)
+
+1. **Jitter cycle** (`main.py:977`) — 1 ligne, casse signature timing déterministe.
+2. **`MAX_MARKETS=15`** (`.env:35`) — change de 3 à 15, breadth ×5 sans toucher capital per market.
+3. **`PREFERRED_TAGS` enrichis** (`.env`) — ajoute sports/crypto/ai/science.
+4. **Pin `requirements.txt`** — `pip freeze > requirements.txt` puis commit.
+5. **Activer log INFO sur volume quoted** dans `_post_single` (`order_manager.py:619-628`) — log déjà présent, ajouter compteur `total_quoted_notional` accumulé sur la journée.
+6. **Ajouter `LOG_LEVEL=DEBUG` temporaire** pendant 1h pour vérifier scoring rate réel par marché (`scoring_monitor.py:170-176` log déjà tout).
+7. **Suppression options `.env` fantômes** — supprime `ENABLE_DASHBOARD`/`DASHBOARD_*` lignes du `.env` actuel.
+
+### 5. RED LINES — À NE SURTOUT PAS FAIRE
+
+- **NE PAS** scaler `TOTAL_CAPITAL > $1000` avant fix résolution-risk + drawdown circuit breaker. Une seule mauvaise résolution sur un marché qui dérive après sélection peut faire perdre 30-50% du capital sur ce marché.
+- **NE PAS** mettre `MODE=aggressive` sans backtest. `TIGHTNESS_FACTOR_AGGRESSIVE=0.35` augmente le Q-score de ~55% mais expose à des fills picked-off bien plus fréquents — sans data historique, c'est un pari aveugle.
+- **NE PAS** désactiver `SKEW_HARD_PAUSE_THRESHOLD` ou le monter au-delà de 0.75. C'est la dernière ligne de défense contre l'accumulation directionnelle.
+- **NE PAS** push `API_RATE_LIMIT_RPS > 5` sans monitoring 429. Polymarket bannit les wallets abusifs.
+- **NE PAS** réutiliser ce wallet pour autre chose que ce bot. Fingerprint unique = traçabilité Sybil.
+- **NE PAS** committer `.env` ni un dump `data/rewards_history.json` (contient PnL — opsec).
+- **NE PAS** lancer 2 instances sur le même wallet — `cancel_all_orders` au startup les fera se cannibaliser, et le tracking inventory/watermark divergera silencieusement.
+- **NE PAS** ignorer les warnings Discord "Global Exposure Limit" — ils signalent que la skew protection est dépassée et que des marchés ont été pausés. Si récurrent, c'est un signal qu'`MAX_CAPITAL_PER_MARKET` est trop élevé.
+
+---
+
+Pour maximiser l'EV airdrop avec ce bot, les 3 choses à faire dans cet ordre précis sont : **(1)** passer `MAX_MARKETS=3 → 15-20` et diversifier `PREFERRED_TAGS` au-delà du politique pour décupler la breadth des marchés couverts (le critère #1 le plus probable d'un airdrop $POLY), **(2)** ajouter du jitter au cycle de quoting et un trade taker symbolique mensuel pour casser le profil mono-bot 100% maker facilement détectable comme Sybil, et **(3)** scaler `TOTAL_CAPITAL` graduellement de $300 → $1k → $5k *uniquement après* avoir implémenté le drawdown daily circuit breaker et le garde-fou midpoint continu, car la consistency multi-jours sans accident sera plus valorisée par n'importe quelle formule d'airdrop que le pic de volume d'une journée suivi d'une perte de capital.

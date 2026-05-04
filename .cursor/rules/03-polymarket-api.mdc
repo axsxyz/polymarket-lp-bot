@@ -1,0 +1,65 @@
+---
+description: Polymarket API ground truth — endpoints, auth, order types, contracts
+globs: core/**, config/**, scripts/**
+alwaysApply: false
+---
+
+# POLYMARKET API — GROUND TRUTH (verified May 2026)
+
+## Authentication
+- L1 = EOA signature (private key)
+- L2 = API credentials derived via `create_or_derive_api_creds`
+- Both required for order operations. Setup at startup via `client.py:164-173`
+
+## CLOB API (clob.polymarket.com)
+
+### Order types
+- `GTC` (Good Till Cancelled) — what this bot uses. Risk: zombie orders if crash before cancel.
+  Mitigation: `cancel_all_orders()` at startup (main.py:815) + MAX_ORDER_AGE_SECONDS rolling refresh
+- `GTD` (Good Till Date) — safer but NOT implemented. Do not add without testing full order lifecycle.
+- `FOK` (Fill or Kill) — for aggressive fills only. Not relevant for market making.
+- NEVER use market orders for LP — always limit orders.
+
+### Rate limits
+- Documented: ~100 req/min = **1.67 RPS MAX**
+- Current config: `API_RATE_LIMIT_RPS=5.0` → **EXCEEDS LIMIT — known bug**
+- When fixing: change to 1.5 in both `.env` and verify `config/settings.py:66`
+- Retry logic exists: `_with_retry(max_retries=3)` with exponential backoff in `client.py:93-138`
+
+### Key endpoints
+- `POST /order` — place order: {token_id, price, size, side, type, expiration}
+- `DELETE /orders/{id}` — cancel single
+- `DELETE /orders` — cancel all (used at startup/shutdown)
+- `GET /orders` — list open orders (polling in `reconcile_ghost_orders`)
+- `GET /are-orders-scoring` — LP reward scoring check
+
+## Gamma API (gamma-api.polymarket.com)
+- Market discovery: `GET /markets?active=true&closed=false&limit=200&offset=N` (paginated)
+- Parser handles both camelCase AND snake_case shapes (markets_filter.py:251-393) — preserve this
+- Rewards pool: fetched via `clobRewards/rewards.rates` field — NO per-user share endpoint exists
+
+## WebSocket
+- URL: `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+- Subscribe: `{assets_ids: [...], type: "market", custom_feature_enabled: true}`
+- Messages: `book` (snapshot), `price_change` (delta), `best_bid_ask`, `last_trade_price`
+- Bot extracts ONLY best bid/ask for mid — no local order book maintained
+- Staleness: 60s timeout → fall back to REST mid
+- Reconnect: exponential backoff `delay = min(delay*2, 30)` (ws_feed.py:113-149)
+
+## Smart contracts (Polygon mainnet — verified)
+- USDC: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`
+- CTF: `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045`
+- CTF Exchange: `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`
+- NegRisk Exchange: `0xC5d563A36AE78145C45a50134d48A1215220f80a`
+- NegRisk Adapter: `0xd91E80cF2223ef622709A2E35faB427ba77e8b0a`
+- NEVER change these addresses without verifying on-chain via Polygon explorer
+
+## neg_risk routing
+- `MarketCandidate.neg_risk` flag is parsed but NOT explicitly used for routing in order posting
+- SDK likely handles internally via token_id — do not add manual routing logic without testing
+
+## What NOT to do
+- Do not implement WS user feed (not needed for current architecture)
+- Do not switch GTC → GTD without implementing full expiry tracking
+- Do not add new Gamma endpoints without checking current docs.polymarket.com first
+- Do not remove the double-shape parser (markets_filter.py:251-393) — API shape changes are real

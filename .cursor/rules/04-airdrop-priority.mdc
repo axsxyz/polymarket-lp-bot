@@ -1,0 +1,63 @@
+---
+description: Airdrop $POLY optimization rules — profile quality over raw P&L
+globs: main.py, .env, config/**
+alwaysApply: false
+---
+
+# AIRDROP PROFILE RULES — $POLY OPTIMIZATION
+
+## Current airdrop score: 3/10 (audit May 2026)
+## Target: 7+/10
+
+## The 3 highest-impact levers (in order)
+
+### 1. Breadth — MAX_MARKETS (current: 3, target: 15-20)
+- Capital per market is capped by MAX_CAPITAL_PER_MARKET — increasing MAX_MARKETS does NOT increase risk
+- More distinct markets scored = stronger airdrop signal
+- When touching .env or market_manager.py, always check if MAX_MARKETS change is consistent with MAX_MARKETS_PER_CYCLE
+
+### 2. Anti-fingerprinting — jitter (current: ZERO)
+- main.py:977 has deterministic 10s sleep — detectable bot signature
+- Fix: `sleep_time = max(0, REBALANCE_INTERVAL_SECONDS - elapsed) + random.uniform(-2.0, 2.0)`
+- This is a 1-line change. Always include it when touching main.py cycle logic.
+
+### 3. Tag diversity — PREFERRED_TAGS (current: politics-only monoculture)
+- Current: ["politics","election","fed","geopolitics","midterms","2026","2028"]
+- Target: add "sports","crypto","ai","science","entertainment","culture"
+- Polymarket airdrop likely rewards cross-vertical LP activity
+
+## Secondary levers
+
+### Taker signal (current: 0% taker, 100% maker)
+- Pure maker = detectable bot, potentially excluded from airdrop taker volume criteria
+- Target: ~1 taker trade/month, ~$20-50, on random market
+- Implement as separate `core/taker_signal.py` — monthly cron-style trigger in main loop
+- Do NOT mix taker logic into the LP quoting loop
+
+### Volume quoted tracking (current: only filled volume tracked)
+- `rewards_tracker.py` tracks `volume_usd` (filled) but NOT notional quoted
+- Add `total_quoted_notional` counter in `order_manager.py:_post_single` (around line 617)
+- Increment by `price * size` on every successful POST /order
+- Persist in `rewards_tracker.py` alongside existing metrics
+
+### Consecutive active days (already tracked)
+- `data/airdrop_metrics.json` → `consecutive_active_days` field exists
+- Uptime matters more than single-day volume spikes — never sacrifice uptime for short-term optimization
+
+## Sybil risk — what to avoid
+- NEVER add multi-wallet logic on the same machine with same IP
+- NEVER use round-number sizes only — current size calculation is good (varies by min_size)
+- NEVER set refresh intervals to exact round numbers without jitter
+- NEVER run 2 bot instances with same wallet
+
+## Conflict resolution: airdrop vs P&L
+When a change optimizes airdrop profile but might affect P&L:
+1. If impact is config-only (MAX_MARKETS, tags) → implement, no P&L discussion needed
+2. If impact touches quoting logic → flag the tradeoff explicitly before implementing
+3. Never silently trade P&L for airdrop profile — always surface the decision to the user
+
+## Red lines — never cross
+- Do not set MAX_TOTAL_CAPITAL > $1000 without drawdown circuit breaker implemented first
+- Do not set MODE=aggressive without historical backtest data
+- Do not disable SKEW_HARD_PAUSE_THRESHOLD or raise it above 0.75
+- Do not commit .env or data/rewards_history.json (contains PnL — opsec)

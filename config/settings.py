@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     ADVERSE_FILL_RATE_THRESHOLD: int = Field(default=3, ge=1, le=20)
 
     # ── API Rate Limiting ───────────────────────────────────────────
-    API_RATE_LIMIT_RPS: float = Field(default=3.0, ge=0.1, le=10.0)
+    API_RATE_LIMIT_RPS: float = Field(default=1.5, ge=0.1, le=10.0)
     API_RATE_LIMIT_BURST: float = Field(default=20.0, ge=1.0, le=50.0)
     MAX_MARKETS_PER_CYCLE: int = Field(default=20, ge=1, le=200)
 
