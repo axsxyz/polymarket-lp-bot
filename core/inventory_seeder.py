@@ -64,12 +64,18 @@ class InventorySeeder:
         self._s = settings
         self._discord = discord
 
-    async def seed_all(self, markets: List[MarketCandidate]) -> Set[str]:
+    async def seed_all(
+        self, markets: List[MarketCandidate]
+    ) -> tuple[Set[str], Dict[str, Dict[str, float]]]:
         """Seed every active market that needs it — markets seeded in parallel.
 
-        Returns the set of condition_ids where seeding FAILED (empty books,
-        no fills).  The caller should exclude these from the quoting loop
-        because one-sided quotes don't score for LP rewards.
+        Returns (failed_cids, seed_costs) where:
+          - failed_cids: condition_ids where seeding FAILED (caller excludes
+            them from quoting — one-sided quotes don't score for LP rewards).
+          - seed_costs: {condition_id: {"yes": usd_spent, "no": usd_spent}}
+            for markets that were actively seeded this run.  Used by the
+            caller to initialise inventory cost basis with the real fill
+            price rather than a mid-price estimate.
         """
         if not markets:
             return set()
@@ -85,10 +91,10 @@ class InventorySeeder:
 
         sem = asyncio.Semaphore(3)
 
-        async def _seed_one(market: MarketCandidate) -> tuple[float, bool, str]:
+        async def _seed_one(market: MarketCandidate) -> tuple[float, bool, str, float, float]:
             async with sem:
-                spent, ok = await self._seed_market(market, per_market_budget)
-                return spent, ok, market.condition_id
+                spent, ok, yes_cost, no_cost = await self._seed_market(market, per_market_budget)
+                return spent, ok, market.condition_id, yes_cost, no_cost
 
         results = await asyncio.gather(
             *[_seed_one(m) for m in markets],
@@ -98,16 +104,18 @@ class InventorySeeder:
         total_spent = 0.0
         seeded = 0
         failed_cids: Set[str] = set()
+        seed_costs: Dict[str, Dict[str, float]] = {}
 
         for i, res in enumerate(results):
             if isinstance(res, Exception):
                 logger.error("Seed exception for {}: {}", markets[i].condition_id[:12], res)
                 failed_cids.add(markets[i].condition_id)
                 continue
-            spent, ok, cid = res
+            spent, ok, cid, yes_cost, no_cost = res
             if spent > 0:
                 total_spent += spent
                 seeded += 1
+                seed_costs[cid] = {"yes": yes_cost, "no": no_cost}
             if not ok:
                 failed_cids.add(cid)
 
@@ -134,19 +142,20 @@ class InventorySeeder:
                 ", ".join(c[:12] for c in failed_cids),
             )
 
-        return failed_cids
+        return failed_cids, seed_costs
 
     async def _seed_market(
         self, market: MarketCandidate, budget_remaining: float = float("inf"),
-    ) -> tuple[float, bool]:
+    ) -> tuple[float, bool, float, float]:
         """Seed YES + NO for one market.
 
-        Returns (total_usd_spent, success).  success=True if BOTH sides
-        either already had inventory or were seeded; False if either side
-        failed.
+        Returns (total_usd_spent, success, yes_cost, no_cost).
+        success=True if BOTH sides either already had inventory or were seeded;
+        False if either side failed.  yes_cost/no_cost are the USD actually
+        spent per side (used by the caller to initialise cost basis correctly).
         """
         if not market.token_id_yes or not market.token_id_no:
-            return 0.0, False
+            return 0.0, False, 0.0, 0.0
 
         mid = await self._fetch_mid(market.token_id_yes)
         if mid is None:
@@ -154,7 +163,7 @@ class InventorySeeder:
                 "Seed skip {} — cannot fetch midpoint",
                 market.condition_id[:12],
             )
-            return 0.0, False
+            return 0.0, False, 0.0, 0.0
 
         target = max(self._s.SEED_SHARES, market.min_size)
         est_cost = target * max(mid, 1.0 - mid) * 2
@@ -163,7 +172,7 @@ class InventorySeeder:
                 "Seed skip {} — est. ${:.0f} exceeds remaining budget ${:.0f}",
                 market.condition_id[:12], est_cost, budget_remaining,
             )
-            return 0.0, False
+            return 0.0, False, 0.0, 0.0
 
         tick = _TICK_MAP.get(market.tick_size, 0.01)
         per_side_budget = min(
@@ -192,18 +201,22 @@ class InventorySeeder:
             return_exceptions=True,
         )
 
-        spent = 0.0
+        yes_cost = 0.0
+        no_cost = 0.0
         both_ok = True
-        for res in results:
+        for i, res in enumerate(results):
             if isinstance(res, Exception):
                 logger.error("Seed side exception for {}: {}", market.condition_id[:12], res)
                 both_ok = False
             elif res is None:
                 both_ok = False
             else:
-                spent += res
+                if i == 0:
+                    yes_cost = res
+                else:
+                    no_cost = res
 
-        return spent, both_ok
+        return yes_cost + no_cost, both_ok, yes_cost, no_cost
 
     # ------------------------------------------------------------------
     # Order book depth check

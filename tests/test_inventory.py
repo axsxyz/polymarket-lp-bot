@@ -308,3 +308,52 @@ class TestDailyDrawdown:
         inv = InventoryTracker(s)
         inv._realised_pnl = -500.0
         assert inv.check_daily_drawdown() is False
+
+
+# ------------------------------------------------------------------
+# Seed cost basis (regression — main.py:959-969 fix)
+# ------------------------------------------------------------------
+
+
+class TestSeedCostBasis:
+    """pos.yes_cost / pos.no_cost must use actual seed fill price, not mid."""
+
+    def test_sell_after_seed_at_exact_price_correct_pnl(self):
+        """Seeded YES @ 0.40 → sell 10 @ 0.60 → realised_pnl = +$2.00 exactly."""
+        inv = InventoryTracker(_make_settings())
+        inv.ensure_position("cond_1", yes_token_id="tok_yes", no_token_id="tok_no")
+
+        pos = inv.positions["cond_1"]
+        pos.yes_size = 10.0
+        pos.yes_cost = 10 * 0.40  # actual seed price, as set by fixed sync block
+
+        inv.record_fills([_fill(side="ASK", price=0.60, size=10)])
+
+        assert inv.realised_pnl == pytest.approx(2.0)  # (0.60 - 0.40) * 10
+
+    def test_above_mid_seed_price_reduces_pnl(self):
+        """Seeder paid 0.42 (above mid 0.40) — PnL must be $1.80, not inflated $2.00."""
+        inv = InventoryTracker(_make_settings())
+        inv.ensure_position("cond_1", yes_token_id="tok_yes", no_token_id="tok_no")
+
+        pos = inv.positions["cond_1"]
+        pos.yes_size = 10.0
+        pos.yes_cost = 10 * 0.42  # seeder paid above mid
+
+        inv.record_fills([_fill(side="ASK", price=0.60, size=10)])
+
+        assert inv.realised_pnl == pytest.approx(1.8)   # (0.60 - 0.42) * 10
+        # With mid-based cost (0.40) the wrong answer would be 2.0
+
+    def test_mid_fallback_used_for_pre_existing_tokens(self):
+        """For tokens already held before this run, mid fallback is the only option."""
+        inv = InventoryTracker(_make_settings())
+        inv.ensure_position("cond_1", yes_token_id="tok_yes", no_token_id="tok_no")
+
+        pos = inv.positions["cond_1"]
+        pos.yes_size = 10.0
+        pos.yes_cost = 10 * 0.50  # mid fallback (no seed_costs entry)
+
+        inv.record_fills([_fill(side="ASK", price=0.60, size=10)])
+
+        assert inv.realised_pnl == pytest.approx(1.0)  # (0.60 - 0.50) * 10
