@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-04**.
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-05**.
 
 ---
 
@@ -36,7 +36,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 ### Stage produit
 
 - **Stage 1** : validation live minimale (capital réduit, 20 marchés, cycle 45s).
-- **Avant scaling > 1 000 USDC** : implémenter le drawdown daily circuit breaker **(P1 BLOCKER)**.
+- **Circuit breaker drawdown daily** : implémenté le 2026-05-05 (commit `76ec51f`) avec pause globale et alerte Discord critique.
 
 ---
 
@@ -48,14 +48,17 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 | `rewards_tracker.py:274` | `estimated_rewards_usd / 10.0` hardcodé | NON FIXÉ |
 | `config/settings.py:66` | `API_RATE_LIMIT_RPS` dépassait le plafond CLOB | **FIXÉ 2026-05-04** : 5.0 → 1.5 |
 | `main.py:977` | Sleep cycle sans jitter | **FIXÉ 2026-05-04** : `+random.uniform(-2.0, 2.0)` |
-| *(aucun fichier)* | Pas de circuit breaker drawdown journalier | NON FIXÉ — **P1 BLOCKER** |
+| `core/inventory.py` + `main.py` | Circuit breaker drawdown journalier absent | **FIXÉ 2026-05-05** : `DAILY_DRAWDOWN_LIMIT_PCT=0.05`, pause globale + alerte Discord `critical`, reset minuit UTC |
 
 ---
 
-## 3. Tous les changements du 2026-05-04
+## 3. Tous les changements récents (2026-05-05 + 2026-05-04)
 
 | Fichier | Changement |
 |---------|------------|
+| `core/inventory.py` + `main.py` | `feat(inventory)` daily drawdown circuit breaker (commit `76ec51f`) : `DAILY_DRAWDOWN_LIMIT_PCT=0.05`, gate global quote path, alert Discord `critical`, reset minuit UTC, hot path gardé (`main.py:199-200`) |
+| `tests/` | Validation `76 tests` passent : `71` baseline + `5` `TestDailyDrawdown` |
+| `config/settings.py` | `fix(settings)` (commit `f531129`) : `NoDecode` pour `PREFERRED_TAGS` + `extra="ignore"` pour variables `.env` inconnues |
 | `.env:61` + `config/settings.py:66` | `API_RATE_LIMIT_RPS` : `5.0` → `1.5` |
 | `main.py:20` | `import random` ajouté |
 | `main.py:978` | `sleep_time += random.uniform(-2.0, 2.0)` — jitter anti-fingerprint |
@@ -93,14 +96,10 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ## 6. Prochain chantier prioritaire (P1)
 
-### 🔴 BLOCKER — Drawdown daily circuit breaker
-- **Fichiers** : `core/inventory.py` + `main.py`
-- **Acceptance** : `DAILY_DRAWDOWN_LIMIT_PCT` dans `settings.py` (default `0.05`). Si `realised_pnl_today < -(pct × TOTAL_CAPITAL)` → pause globale + alerte Discord. Reset à minuit UTC.
-- **BLOQUANT pour tout scaling > 1 000 USDC.**
-
 ### Midpoint guard continu [0.18, 0.82]
 - **Fichiers** : `core/quoter.py:141`
 - **Acceptance** : pause marché si `live_mid` sort de la bande 3 cycles consécutifs. Seuils configurables (`MIDPOINT_GUARD_MIN`, `MIDPOINT_GUARD_MAX`, `MIDPOINT_GUARD_CYCLES`).
+- **Statut** : prochaine tâche immédiate après Task 1 DONE (`76ec51f` + `f531129`).
 
 ### Fix cost basis seed
 - **Fichiers** : `main.py:866-876`
