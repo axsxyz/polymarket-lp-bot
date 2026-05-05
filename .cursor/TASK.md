@@ -1,33 +1,79 @@
 # LP Bot — Active Tasks
 
-## P2 — Prochain chantier (2-3 semaines)
-- [ ] Dynamic spread basé vol réalisée → `core/quoter.py` (ref ROADMAP P5-6)
-- [ ] Taker signal mensuel → `core/taker_signal.py` (~1 trade/mois, $20-50, marché aléatoire)
+## P2a — Dynamic spread (priorité immédiate)
+- [ ] **Dynamic spread basé vol réalisée** → `core/quoter.py`
+  - Rolling vol window 15-30min sur WS price history par marché
+  - Spread élargi si vol élevée, resserré si stable
+  - Remplace le spread quasi-statique actuel (`QUOTE_OFFSET_TICKS` fixe)
+  - Paramètres configurables : `VOL_WINDOW_SECONDS`, `VOL_SPREAD_MULTIPLIER_MIN/MAX`
+  - Ref ROADMAP P5-6 — dynamic per-market tightness
 
-## P3 — Chantiers structurants
-
-### Tier 1 — Impact 2-3× sur les retours
+## P2b — Toxicity analyzer (priorité critique)
 - [ ] **`core/toxicity_analyzer.py`** — Adverse selection defense
-  - VPIN sur fenêtre glissante : buy/sell imbalance → widen spread si élevé
-  - Fill-vs-mid : comparer fill price vs mid à +5s / +30s / +5min → score de toxicité continu
-  - Corrélation marchés liés (e.g. Trump 2028 ↔ Republican 2028) → widening coordonné
-  - Remplace le `_fill_rates` blunt instrument actuel
+  - **VPIN** : buy/sell imbalance sur fenêtre glissante → widen spread si élevé
+  - **Fill-vs-mid** : comparer fill price vs mid à +5s / +30s / +5min → score de toxicité continu
+  - Remplace `_fill_rates` blunt instrument actuel dans `core/quoter.py`
+  - Seuils configurables : `TOXICITY_VPIN_THRESHOLD`, `TOXICITY_FILL_WINDOW_SECONDS`
+  - *(corrélation cross-market déplacée en P4 — complexité élevée, gain marginal)*
 
-- [ ] **`core/resolution_guard.py`** — Resolution risk manager
-  - Auto-delist si mid sort d'une bande configurable (> 15% en 24h)
-  - Max-loss calculator par marché : `max(yes_size, no_size) × 1.0` — pause si > seuil
-  - Intégration calendrier événements (elections, fed meetings) → widen avant dates clés
-
-- [ ] **`backtest/`** — Backtesting framework
-  - Replay des snapshots orderbook historiques via Gamma `/trades` API
-  - Simulation de fill probability par placement
+## P2c — Backtest framework (validation params)
+- [ ] **`backtest/`** — Backtesting framework sur données historiques Gamma
+  - Fetch historique via Gamma `/trades` API
+  - Replay fills simulés par placement d'ordre
   - Calcul Q-score réalisé vs théorique max, PnL, Sharpe
-  - Grid search sur `tightness_factor`, `offset_ticks`, `size_multiplier`
+  - Grid search : `tightness_factor`, `offset_ticks`, `size_multiplier`, `VOL_WINDOW_SECONDS`
+  - Objectif : valider empiriquement tous les paramètres actuellement arbitraires
+  - Ref ROADMAP P5-1 — levier le plus haut pour optimisation params
 
-### Tier 2 — Impact 1.5-2× sur les retours
-- [ ] **Market-specific strategy profiles** — tightness adaptée par marché
-- [ ] **Multi-level quoting** — L1 tight/small, L2 medium, L3 wide/large per token
-- [ ] **Cross-market hedging** — matrice de corrélation ; offsetter YES marché A avec NO marché B
+## P2d — Resolution guard complet
+- [ ] **`core/resolution_guard.py`** — Resolution risk manager
+  - Max-loss calculator par marché : `max(yes_size, no_size) × 1.0` → pause si > seuil
+  - Auto-delist si mid move > 15% en 24h (distinct du midpoint guard cycle-based)
+  - Paramètres : `RESOLUTION_MAX_LOSS_USD`, `RESOLUTION_MAX_MOVE_24H_PCT`
+  - *(calendrier événements déplacé en P4 — intégration externe complexe)*
+
+## P2e — Position sizing dynamique
+- [ ] **Capital reallocation basé sur scoring réel** → `core/market_manager.py`
+  - Utilise `are_orders_scoring` (déjà présent via `scoring_monitor.py`)
+  - Toutes les heures : augmente capital sur marchés scoring > 80%, réduit sur < 50%
+  - Bounds : `MIN_CAPITAL_PER_MARKET` / `MAX_CAPITAL_PER_MARKET` inchangés
+  - Objectif : concentrer le capital là où le bot performe réellement
+
+## P3a — Market-specific strategy profiles
+- [ ] **Tightness adaptée par profil de marché** → `core/quoter.py` + `config/markets_filter.py`
+  - High-volume (> $50k/jour) : spread plus large, size réduite, requote rapide
+  - Low-volume (< $5k/jour) : spread plus tight, size normale, requote lente
+  - Near-resolution (< 30 jours) : spread très large ou exit
+  - Paramètres par profil configurables via `.env`
+
+## P3b — Competition monitoring
+- [ ] **Densité carnet & ajustement tightness** → `core/ws_feed.py` + `core/quoter.py`
+  - Monitore la profondeur du carnet via WS book snapshots
+  - Si bot est seul (ou quasi) sur un marché → resserrer spread max pour capturer tout le Q-score
+  - Si carnet dense (pros présents) → élargir spread, réduire exposition
+  - Mécanisme : `book_depth_score` par marché, mise à jour à chaque snapshot WS
+
+## P3c — Adaptive taker logic
+- [ ] **Switch maker→taker quand flow est informed** → `core/taker_signal.py`
+  - Si toxicity_analyzer détecte flow informed fort (VPIN > seuil haut)
+  - ET position bot est du mauvais côté → trade taker sur le bon côté pour couper la perte
+  - Budget limité : `MAX_TAKER_USD_PER_EVENT`, max 1 par marché par heure
+  - Distinct du taker signal mensuel airdrop (objectif différent)
+
+## P3d — Multi-level quoting
+- [ ] **2-3 niveaux de quotes par token** → `core/quoter.py` + `core/order_manager.py`
+  - L1 : spread tight, size petite → score quadratique maximal
+  - L2 : spread medium, size moyenne → capture fills quand L1 picked off
+  - L3 : spread large, size grande → filet de sécurité
+  - Contrainte : batch limit Polymarket = 15 ordres → calibrer MAX_MARKETS en conséquence
+
+## P4 — Optionnel / Long terme
+- [ ] Taker signal mensuel airdrop → `core/taker_signal.py` (~$20-50, marché aléatoire, 1x/mois)
+- [ ] Corrélation cross-market → widen coordonné sur marchés liés (Trump 2028 ↔ Republican 2028)
+- [ ] Intégration calendrier événements → widen avant elections, Fed meetings, deadlines
+- [ ] Cross-market hedging → matrice corrélation, offsetter YES marché A avec NO marché B
+
+---
 
 ## Complété
 
