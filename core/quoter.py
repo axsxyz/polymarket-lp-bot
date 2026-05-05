@@ -104,6 +104,9 @@ class Quoter:
         self._s = settings
         self._scoring_rates: dict[str, float] = {}
         self._fill_rates: dict[str, float] = {}
+        # Per-market midpoint-guard state (driven by cold cycle only).
+        self._midpoint_breach_count: dict[str, int] = {}
+        self._midpoint_paused: set[str] = set()
 
     def update_scoring_rates(self, rates: dict[str, float]) -> None:
         """Update per-market scoring rates from ScoringMonitor."""
@@ -112,6 +115,36 @@ class Quoter:
     def update_fill_rates(self, rates: dict[str, float]) -> None:
         """Update per-market fills-per-hour from FillCollector (cold path)."""
         self._fill_rates = dict(rates)
+
+    def evaluate_midpoint_guard(
+        self, condition_id: str, live_mid: float
+    ) -> tuple[bool, int]:
+        """Track consecutive midpoint breaches, return (is_paused, breach_count).
+
+        Increments the per-market counter when ``live_mid`` falls outside
+        [MIDPOINT_GUARD_MIN, MIDPOINT_GUARD_MAX]; resets to 0 inside the band.
+        Once the counter reaches MIDPOINT_GUARD_CYCLES the market is flagged
+        paused; pause clears as soon as a single in-band reading is observed
+        (auto-recovery). Static MIDPOINT_MIN/MAX selection filter is untouched.
+        """
+        out_of_band = (
+            live_mid < self._s.MIDPOINT_GUARD_MIN
+            or live_mid > self._s.MIDPOINT_GUARD_MAX
+        )
+        if out_of_band:
+            count = self._midpoint_breach_count.get(condition_id, 0) + 1
+            self._midpoint_breach_count[condition_id] = count
+            if count >= self._s.MIDPOINT_GUARD_CYCLES:
+                self._midpoint_paused.add(condition_id)
+            return (condition_id in self._midpoint_paused, count)
+
+        self._midpoint_breach_count[condition_id] = 0
+        self._midpoint_paused.discard(condition_id)
+        return (False, 0)
+
+    def is_midpoint_paused(self, condition_id: str) -> bool:
+        """Cheap read-only check used by the hot WS path."""
+        return condition_id in self._midpoint_paused
 
     def compute(
         self,

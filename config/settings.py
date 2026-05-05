@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     MIN_REWARD_RATE_DAILY: float = Field(default=5.0, ge=0.0)
     MIDPOINT_MIN: float = Field(default=0.15, ge=0.0, le=1.0)
     MIDPOINT_MAX: float = Field(default=0.85, ge=0.0, le=1.0)
+    # Continuous midpoint guard — pauses an individual market when its live mid
+    # drifts outside [MIN, MAX] for MIDPOINT_GUARD_CYCLES consecutive cold cycles.
+    # Distinct from MIDPOINT_MIN/MAX which only filter at selection time.
+    MIDPOINT_GUARD_MIN: float = Field(default=0.18, ge=0.0, le=0.5)
+    MIDPOINT_GUARD_MAX: float = Field(default=0.82, ge=0.5, le=1.0)
+    MIDPOINT_GUARD_CYCLES: int = Field(default=3, ge=1, le=20)
     PREFERRED_TAGS: Annotated[List[str], NoDecode] = Field(
         default=[
             "politics",

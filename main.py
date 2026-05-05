@@ -203,6 +203,9 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
     if not market:
         return
 
+    if _hot_quoter.is_midpoint_paused(market.condition_id):
+        return
+
     now = asyncio.get_event_loop().time()
     last = _hot_requote_last.get(market.condition_id, 0)
     debounce_s = _hot_settings.HOT_REQUOTE_DEBOUNCE_MS / 1000.0
@@ -409,6 +412,60 @@ async def run_quoting_cycle(
 
     if skip_cids:
         paused_set |= skip_cids
+
+    # ── Step 4.5: Continuous midpoint guard (per market) ─────────
+    newly_paused: list[tuple[str, float]] = []
+    newly_recovered: list[str] = []
+    for m in markets_this_cycle:
+        cid = m.condition_id
+        live_mid = midpoints.get(m.token_id_yes)
+        if live_mid is None:
+            continue  # no fresh quote — don't penalise a stale read
+        was_paused = quoter.is_midpoint_paused(cid)
+        is_paused, _breach_count = quoter.evaluate_midpoint_guard(cid, live_mid)
+        if is_paused:
+            paused_set.add(cid)
+            if not was_paused:
+                newly_paused.append((cid, live_mid))
+        elif was_paused:
+            newly_recovered.append(cid)
+
+    for cid, mid_val in newly_paused:
+        logger.warning(
+            "Midpoint guard tripped: cid={} live_mid={:.4f} outside [{:.2f}, {:.2f}] "
+            "for {} cycles — pausing market, cancelling open orders",
+            cid[:12], mid_val,
+            settings.MIDPOINT_GUARD_MIN, settings.MIDPOINT_GUARD_MAX,
+            settings.MIDPOINT_GUARD_CYCLES,
+        )
+        try:
+            await order_mgr.cancel_orders_for_market(cid)
+        except Exception as exc:
+            logger.error(
+                "Midpoint guard: cancel_orders_for_market({}) failed: {}",
+                cid[:12], exc,
+            )
+        asyncio.create_task(discord.send_alert(
+            title="Midpoint Guard — Market Paused",
+            message=(
+                f"Market `{cid[:12]}…` paused: live mid **{mid_val:.4f}** outside "
+                f"[{settings.MIDPOINT_GUARD_MIN:.2f}, {settings.MIDPOINT_GUARD_MAX:.2f}] "
+                f"for {settings.MIDPOINT_GUARD_CYCLES} consecutive cycles. "
+                f"Auto-resume on first in-band reading."
+            ),
+            level="warning",
+        ))
+
+    for cid in newly_recovered:
+        logger.info(
+            "Midpoint guard cleared: cid={} — resuming quotes next cycle",
+            cid[:12],
+        )
+        asyncio.create_task(discord.send_alert(
+            title="Midpoint Guard — Market Resumed",
+            message=f"Market `{cid[:12]}…` mid back in band — quoting resumed.",
+            level="info",
+        ))
 
     # ── Step 5: Per-market quoting (parallel with semaphore) ─────
     if markets_this_cycle:
