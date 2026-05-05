@@ -12,25 +12,25 @@ Always use Context7 MCP before writing code that touches:
 - aiohttp, websockets (connection patterns)
 Never rely on training data for these libraries — fetch docs first, then code.
 
-## Memory MCP — protocole obligatoire
+## Memory protocol — source de vérité
 
-DÉBUT de chaque session :
-- Appelle memory search "lp bot polymarket" pour récupérer le contexte
-- Lis ce qui remonte avant de toucher au code
+SOURCE UNIQUE : @memory-bank/lp-bot.md
+- C'est le seul fichier qui fait foi
+- MCP Memory est un index secondaire, jamais la référence principale
 
-FIN de chaque session où du code a changé :
-- Sauvegarde dans memory : ce qui a été modifié, pourquoi, et le prochain chantier
-- Format : "[date] [fichier:ligne] [changement] → [raison]"
+DÉBUT de session :
+- Lis @memory-bank/lp-bot.md (obligatoire)
+- MCP search_nodes optionnel pour lookup rapide
 
-Ce qu'on stocke dans memory :
-- Bugs fixés et leur root cause
-- Paramètres tuned et les valeurs testées
-- Décisions d'architecture et pourquoi
-- Prochaine tâche prioritaire
+FIN de session (quand code a changé) :
+- Mets à jour @memory-bank/lp-bot.md UNIQUEMENT
+- NE PAS mettre à jour MCP Memory sauf si explicitement demandé
+- Format entrée : "YYYY-MM-DD | [fichier:ligne] | changement | raison"
 
-Ce qu'on NE stocke PAS :
-- Code complet (trop long, inutile)
-- Choses déjà dans les .mdc rules (doublon)
+RÈGLE ANTI-DOUBLON :
+- Avant d'ajouter quoi que ce soit dans MCP Memory : vérifie si l'entité existe déjà
+- Si elle existe : update_entities, jamais create_entities
+- Maximum 10 entités dans le graphe — fusionner si dépassé
 
 ## TASK.md — protocole
 - Début de session : lis @.cursor/TASK.md
