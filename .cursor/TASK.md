@@ -9,14 +9,9 @@
 - [x] pip freeze → `requirements.txt`
 
 ## P1 — Semaine prochaine
+- [x] Tous les items P1 sont terminés le 2026-05-05 (détails dans `## Complété`)
 
-### ~~Fix cost basis seed → `main.py:866-876`~~
-- [x] 2026-05-05 — done (voir Complété)
-
-### ~~Tracker volume quoted notional → `core/order_manager.py` (autour ligne 617)~~
-- [x] 2026-05-05 — done (voir Complété)
-
-## P2 — Dans 2-3 semaines
+## P2 — Prochain chantier (2-3 semaines)
 - [ ] Dynamic spread basé vol réalisée → `core/quoter.py` (ref ROADMAP P5-6 — dynamic per-market tightness)
 - [ ] Taker signal mensuel → `core/taker_signal.py` (~1 trade/mois, $20-50, marché aléatoire)
 
