@@ -49,6 +49,9 @@ _inventory_lock = asyncio.Lock()
 # Per-market debounce timestamps for hot requotes
 _hot_requote_last: Dict[str, float] = {}
 
+# Track whether the daily drawdown alert has been sent for the current paused state
+_drawdown_alert_sent: bool = False
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Quoting cycle — helpers
@@ -193,6 +196,9 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
     if not all((_hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings)):
         return
 
+    if _hot_inventory.is_drawdown_paused:
+        return
+
     market = _hot_market_mgr.get_market_by_token(token_id)
     if not market:
         return
@@ -318,6 +324,35 @@ async def run_quoting_cycle(
 
     # Compute fills-per-hour per market for adverse-selection widening
     _update_fill_rates(new_fills, quoter)
+
+    # ── Step 1b: Daily drawdown circuit breaker ──────────────────
+    global _drawdown_alert_sent
+    if inventory.check_daily_drawdown():
+        if not _drawdown_alert_sent:
+            limit_usd = settings.DAILY_DRAWDOWN_LIMIT_PCT * settings.TOTAL_CAPITAL
+            logger.error(
+                "DAILY DRAWDOWN PAUSE: realised PnL today=${:.2f} (limit=-${:.2f}) — "
+                "cancelling all orders, no new quotes until UTC midnight",
+                inventory.realised_pnl_today, limit_usd,
+            )
+            try:
+                await order_mgr.cancel_all_orders()
+            except Exception as exc:
+                logger.error("Drawdown pause: cancel_all_orders failed: {}", exc)
+            await discord.send_alert(
+                title="Daily Drawdown Circuit Breaker",
+                message=(
+                    f"Realised PnL today **${inventory.realised_pnl_today:.2f}** "
+                    f"breached limit **-${limit_usd:.2f}** "
+                    f"({settings.DAILY_DRAWDOWN_LIMIT_PCT:.0%} of ${settings.TOTAL_CAPITAL:,.0f}). "
+                    f"All orders cancelled. Quoting paused until UTC midnight."
+                ),
+                level="critical",
+            )
+            _drawdown_alert_sent = True
+        return None
+    else:
+        _drawdown_alert_sent = False
 
     # ── Step 2: Select markets for this cycle (round-robin) ──────
     markets_this_cycle = _select_cycle_markets(

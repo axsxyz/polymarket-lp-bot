@@ -114,6 +114,10 @@ class InventoryTracker:
         self._token_map: Dict[str, tuple] = {}  # token_id → (condition_id, "yes"|"no")
         self._realised_pnl: float = 0.0
         self._total_fill_count: int = 0
+        # Daily drawdown tracking (anchor + flag, reset at UTC midnight)
+        self._realised_pnl_day_anchor: float = 0.0
+        self._current_day_utc: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._drawdown_paused: bool = False
 
     @property
     def positions(self) -> Dict[str, MarketPosition]:
@@ -152,6 +156,15 @@ class InventoryTracker:
     @property
     def realised_pnl(self) -> float:
         return self._realised_pnl
+
+    @property
+    def realised_pnl_today(self) -> float:
+        """PnL realised since the start of the current UTC day."""
+        return self._realised_pnl - self._realised_pnl_day_anchor
+
+    @property
+    def is_drawdown_paused(self) -> bool:
+        return self._drawdown_paused
 
     @property
     def total_fill_count(self) -> int:
@@ -327,6 +340,50 @@ class InventoryTracker:
     ) -> bool:
         limit = self._s.GLOBAL_MAX_GROSS_EXPOSURE_PCT * self._s.TOTAL_CAPITAL
         return self.gross_exposure_usd(open_order_notional, active_cids) > limit
+
+    # ------------------------------------------------------------------
+    # Daily drawdown circuit breaker
+    # ------------------------------------------------------------------
+
+    def check_daily_drawdown(self) -> bool:
+        """
+        Evaluate the daily drawdown circuit breaker.
+
+        - At UTC midnight rollover the PnL anchor is re-snapshotted and the
+          pause flag cleared (the new day starts fresh).
+        - Triggers pause when realised_pnl_today < -(LIMIT_PCT × TOTAL_CAPITAL).
+
+        Returns True if the bot should pause new quoting for today.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._current_day_utc:
+            logger.info(
+                "UTC day rollover: resetting drawdown anchor "
+                "({} → {}, prior day PnL=${:.2f})",
+                self._current_day_utc, today, self.realised_pnl_today,
+            )
+            self._current_day_utc = today
+            self._realised_pnl_day_anchor = self._realised_pnl
+            self._drawdown_paused = False
+
+        if self._drawdown_paused:
+            return True
+
+        limit = self._s.DAILY_DRAWDOWN_LIMIT_PCT * self._s.TOTAL_CAPITAL
+        if limit <= 0:
+            return False
+
+        if self.realised_pnl_today < -limit:
+            self._drawdown_paused = True
+            logger.warning(
+                "Daily drawdown breached: realised PnL today=${:.2f} < -${:.2f} "
+                "({:.1%} of ${:.0f}) — pausing quoting until UTC midnight",
+                self.realised_pnl_today, limit,
+                self._s.DAILY_DRAWDOWN_LIMIT_PCT, self._s.TOTAL_CAPITAL,
+            )
+            return True
+
+        return False
 
     def most_imbalanced_markets(
         self, n: int = 5, active_cids: Optional[set] = None,
