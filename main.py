@@ -925,9 +925,10 @@ async def main() -> None:
 
     # ── Inventory seed (acquire minimal token positions for ASK orders) ──
     unseeded_markets: set = set()
+    seed_costs: dict = {}
     if settings.SEED_ENABLED:
         seeder = InventorySeeder(client, settings, discord)
-        unseeded_markets = await seeder.seed_all(market_mgr.markets)
+        unseeded_markets, seed_costs = await seeder.seed_all(market_mgr.markets)
 
         if unseeded_markets:
             logger.info(
@@ -957,16 +958,24 @@ async def main() -> None:
             if bal > 0 and bal > pos.yes_size:
                 pos.yes_size = bal
                 if pos.yes_cost <= 0:
-                    mid = m.midpoint if m.midpoint > 0 else 0.50
-                    pos.yes_cost = bal * mid
+                    _yes_seed = seed_costs.get(m.condition_id, {}).get("yes", 0.0)
+                    if _yes_seed > 0:
+                        pos.yes_cost = _yes_seed
+                    else:
+                        mid = m.midpoint if m.midpoint > 0 else 0.50
+                        pos.yes_cost = bal * mid
                 logger.info("Inventory sync: {} YES = {:.2f}", m.condition_id[:12], bal)
         if m.token_id_no:
             bal = await client.get_conditional_balance(m.token_id_no)
             if bal > 0 and bal > pos.no_size:
                 pos.no_size = bal
                 if pos.no_cost <= 0:
-                    no_mid = (1.0 - m.midpoint) if m.midpoint > 0 else 0.50
-                    pos.no_cost = bal * no_mid
+                    _no_seed = seed_costs.get(m.condition_id, {}).get("no", 0.0)
+                    if _no_seed > 0:
+                        pos.no_cost = _no_seed
+                    else:
+                        no_mid = (1.0 - m.midpoint) if m.midpoint > 0 else 0.50
+                        pos.no_cost = bal * no_mid
                 logger.info("Inventory sync: {} NO = {:.2f}", m.condition_id[:12], bal)
 
     # Advance fill collector watermark past any seed trades so they

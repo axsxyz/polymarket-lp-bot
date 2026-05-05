@@ -10,12 +10,8 @@
 
 ## P1 — Semaine prochaine
 
-### Fix cost basis seed → `main.py:866-876`
-**Critères d'acceptance :**
-- `pos.yes_cost` / `pos.no_cost` initialisés avec le prix réel du seed order, pas `bal * mid`
-- Test : buy YES à 0.40 → sell à 0.60 → `realised_pnl = +$0.20/share`
-- Pas de régression sur `inventory.py:248-285` (skew tiers)
-- (Ref ROADMAP P2-2)
+### ~~Fix cost basis seed → `main.py:866-876`~~
+- [x] 2026-05-05 — done (voir Complété)
 
 ### Tracker volume quoted notional → `core/order_manager.py` (autour ligne 617)
 **Critères d'acceptance :**
@@ -57,6 +53,7 @@
 - [ ] **Cross-market hedging** — matrice de corrélation ; offsetter YES marché A avec NO marché B
 
 ## Complété
+- [x] 2026-05-05 — Fix cost basis seed → `core/inventory_seeder.py:_seed_market+seed_all` + `main.py:959-972` — `seed_all` retourne maintenant `(failed_cids, seed_costs)` avec le vrai USD dépensé par side ; inventory sync utilise `seed_costs[cid]["yes/no"]` si disponible, fallback `bal * mid` uniquement pour tokens pré-existants (run précédent). 3 tests `TestSeedCostBasis` (29/29 pytest OK)
 - [x] 2026-05-05 — Midpoint guard continu `[0.18, 0.82]` → `core/quoter.py:108-145` + `main.py:201-203,413-466` + `config/settings.py:84-89` — pause par marché si `live_mid` hors bande pendant `MIDPOINT_GUARD_CYCLES=3` cold cycles, reprise auto au 1er retour in-band, alerte Discord pause+resume, gate hot path, 8 tests `TestMidpointGuard` (84/84 pytest OK), `.env` + `.env.example` mis à jour
 - [x] 2026-05-05 — Drawdown daily circuit breaker → `core/inventory.py:344` + `main.py:328` (commit `76ec51f`) — pause globale + alerte Discord si `realised_pnl_today < -DAILY_DRAWDOWN_LIMIT_PCT × TOTAL_CAPITAL` (default 5%), reset à minuit UTC, gate hot+cold path, `cancel_all_orders` au déclenchement, 5 tests unitaires (`TestDailyDrawdown`)
 - [x] 2026-05-05 — `fix(settings)` `NoDecode` + `extra="ignore"` → `config/settings.py:12,28,81` (commit `f531129`) — débloque pytest : `PREFERRED_TAGS` CSV n'était plus parsé en JSON par pydantic-settings 2.x, et les `DASHBOARD_*` legacy du `.env` ne cassent plus l'init (dashboard fantôme, cf. `.cursor/rules/02-architecture.mdc`)
