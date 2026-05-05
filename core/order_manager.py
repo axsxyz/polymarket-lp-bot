@@ -81,6 +81,7 @@ class OrderManager:
         self._usdc_balance: Optional[float] = None
         self._committed_capital: float = 0.0
         self._market_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._session_quoted_notional: float = 0.0
 
     def market_lock(self, condition_id: str) -> asyncio.Lock:
         """Return the per-market lock (creates on first access)."""
@@ -104,6 +105,15 @@ class OrderManager:
     def open_order_notional(self) -> float:
         """Sum of price * size for all tracked live orders."""
         return sum(rec.price * rec.size for rec in self._live_orders.values())
+
+    def drain_quoted_notional(self) -> float:
+        """Return accumulated quoted notional since last drain, then reset to zero.
+
+        Captures both hot-path and cold-path posts since the previous drain.
+        """
+        val = self._session_quoted_notional
+        self._session_quoted_notional = 0.0
+        return val
 
     def get_order_ids_for_condition(self, condition_id: str) -> List[str]:
         """Return all live order IDs belonging to a given market."""
@@ -574,6 +584,7 @@ class OrderManager:
                 size,
                 condition_id[:12],
             )
+            self._session_quoted_notional += notional
             return OrderRecord(
                 order_id=f"dry_{token_id[:8]}_{side_label}",
                 token_id=token_id,
@@ -615,6 +626,7 @@ class OrderManager:
             )
             self._live_orders[order_id] = rec
             self._committed_capital += notional
+            self._session_quoted_notional += notional
 
             logger.info(
                 "✅ {} {} {:.4f} × {:.0f} = ${:.2f}  [{}]  → {}",

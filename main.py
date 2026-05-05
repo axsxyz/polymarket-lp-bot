@@ -636,7 +636,8 @@ async def run_quoting_cycle(
         except Exception as exc:
             logger.error("Post-error ghost sweep failed: {}", exc)
 
-    return cycle_posted, cycle_volume
+    cycle_quoted = order_mgr.drain_quoted_notional()
+    return cycle_posted, cycle_volume, cycle_quoted
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1068,8 +1069,8 @@ async def main() -> None:
                     ws_feed=ws_feed,
                 )
                 if result:
-                    posted, volume = result
-                    rewards.record_cycle_stats(volume_usd=volume, orders_posted=posted)
+                    posted, volume, quoted = result
+                    rewards.record_cycle_stats(volume_usd=quoted, orders_posted=posted, filled_usd=volume)
             except Exception as exc:
                 logger.error("Unhandled cycle error: {}", exc)
                 await discord.send_error(f"Cycle error: {exc}")
