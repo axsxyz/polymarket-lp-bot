@@ -9,10 +9,10 @@ profile (~10 k USDC across 30-60 long-dated Polymarket markets).
 from __future__ import annotations
 
 from enum import Enum
-from typing import List
+from typing import Annotated, List
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class BotMode(str, Enum):
@@ -25,6 +25,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # ── Wallet & Auth ───────────────────────────────────────────────
@@ -77,7 +78,7 @@ class Settings(BaseSettings):
     MIN_REWARD_RATE_DAILY: float = Field(default=5.0, ge=0.0)
     MIDPOINT_MIN: float = Field(default=0.15, ge=0.0, le=1.0)
     MIDPOINT_MAX: float = Field(default=0.85, ge=0.0, le=1.0)
-    PREFERRED_TAGS: List[str] = Field(
+    PREFERRED_TAGS: Annotated[List[str], NoDecode] = Field(
         default=[
             "politics",
             "election",
