@@ -268,3 +268,68 @@ class TestQScore:
     def test_intermediate_spread(self):
         score = estimate_q_score(0.10, 0.05, 10.0)
         assert 0 < score < 10.0
+
+
+class TestMidpointGuard:
+    """Continuous midpoint guard — pauses a market after N out-of-band cycles."""
+
+    def test_in_band_does_not_increment(self):
+        q = Quoter(_make_settings())
+        is_paused, count = q.evaluate_midpoint_guard("cid_1", 0.50)
+        assert is_paused is False
+        assert count == 0
+
+    def test_below_band_increments(self):
+        q = Quoter(_make_settings(MIDPOINT_GUARD_CYCLES=3))
+        for i in range(2):
+            is_paused, count = q.evaluate_midpoint_guard("cid_1", 0.10)
+            assert is_paused is False
+            assert count == i + 1
+
+    def test_above_band_increments(self):
+        q = Quoter(_make_settings(MIDPOINT_GUARD_CYCLES=3))
+        for i in range(2):
+            is_paused, count = q.evaluate_midpoint_guard("cid_1", 0.90)
+            assert is_paused is False
+            assert count == i + 1
+
+    def test_pauses_after_n_cycles(self):
+        q = Quoter(_make_settings(MIDPOINT_GUARD_CYCLES=3))
+        for _ in range(3):
+            q.evaluate_midpoint_guard("cid_1", 0.10)
+        assert q.is_midpoint_paused("cid_1") is True
+
+    def test_in_band_resets_counter_and_unpauses(self):
+        q = Quoter(_make_settings(MIDPOINT_GUARD_CYCLES=3))
+        for _ in range(3):
+            q.evaluate_midpoint_guard("cid_1", 0.10)
+        assert q.is_midpoint_paused("cid_1") is True
+        is_paused, count = q.evaluate_midpoint_guard("cid_1", 0.50)
+        assert is_paused is False
+        assert count == 0
+        assert q.is_midpoint_paused("cid_1") is False
+
+    def test_per_market_isolation(self):
+        q = Quoter(_make_settings(MIDPOINT_GUARD_CYCLES=2))
+        q.evaluate_midpoint_guard("cid_1", 0.10)
+        q.evaluate_midpoint_guard("cid_1", 0.10)
+        assert q.is_midpoint_paused("cid_1") is True
+        assert q.is_midpoint_paused("cid_2") is False
+
+    def test_custom_thresholds(self):
+        q = Quoter(_make_settings(
+            MIDPOINT_GUARD_MIN=0.25, MIDPOINT_GUARD_MAX=0.75,
+            MIDPOINT_GUARD_CYCLES=2,
+        ))
+        is_paused, _ = q.evaluate_midpoint_guard("cid_1", 0.20)
+        assert is_paused is False
+        is_paused, _ = q.evaluate_midpoint_guard("cid_1", 0.20)
+        assert is_paused is True
+
+    def test_at_band_edge_in_band(self):
+        """Exact MIN/MAX values should be IN-band (strict <, > comparison)."""
+        q = Quoter(_make_settings(MIDPOINT_GUARD_MIN=0.18, MIDPOINT_GUARD_MAX=0.82))
+        _, count_min = q.evaluate_midpoint_guard("cid_1", 0.18)
+        assert count_min == 0
+        _, count_max = q.evaluate_midpoint_guard("cid_1", 0.82)
+        assert count_max == 0

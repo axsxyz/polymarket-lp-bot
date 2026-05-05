@@ -10,23 +10,6 @@
 
 ## P1 — Semaine prochaine
 
-### Drawdown daily circuit breaker → `core/inventory.py` + `main.py`
-**Critères d'acceptance :**
-- `DAILY_DRAWDOWN_LIMIT_PCT` ajouté à `config/settings.py` (default `0.05` = 5 % du capital)
-- Si `realised_pnl_today < -(DAILY_DRAWDOWN_LIMIT_PCT × TOTAL_CAPITAL)` → pause globale + alerte Discord
-- Compteur remis à zéro à minuit UTC (aligné sur le snapshot `RewardsTracker`)
-- Pause n'empêche pas les annulations (shutdown reste fonctionnel)
-- Setting configurable via `.env` — pas de valeur hardcodée
-- **Bloquant pour tout scaling > 1 000 USDC**
-
-### Midpoint guard continu [0.18, 0.82] → `core/quoter.py:141`
-**Critères d'acceptance :**
-- Si `live_mid < 0.18` ou `live_mid > 0.82` pendant 3 cycles consécutifs → pause du marché + alerte Discord (condition_id + mid actuel)
-- Seuils configurables (`MIDPOINT_GUARD_MIN`, `MIDPOINT_GUARD_MAX`, `MIDPOINT_GUARD_CYCLES`)
-- Reprise automatique quand le mid revient dans la bande
-- Pas de régression sur les filtres statiques de sélection (`MIDPOINT_MIN`/`MIDPOINT_MAX`)
-- (Ref ANALYSIS.md Tier 1 — Resolution Risk Manager)
-
 ### Fix cost basis seed → `main.py:866-876`
 **Critères d'acceptance :**
 - `pos.yes_cost` / `pos.no_cost` initialisés avec le prix réel du seed order, pas `bal * mid`
@@ -74,6 +57,9 @@
 - [ ] **Cross-market hedging** — matrice de corrélation ; offsetter YES marché A avec NO marché B
 
 ## Complété
+- [x] 2026-05-05 — Midpoint guard continu `[0.18, 0.82]` → `core/quoter.py:108-145` + `main.py:201-203,413-466` + `config/settings.py:84-89` — pause par marché si `live_mid` hors bande pendant `MIDPOINT_GUARD_CYCLES=3` cold cycles, reprise auto au 1er retour in-band, alerte Discord pause+resume, gate hot path, 8 tests `TestMidpointGuard` (84/84 pytest OK), `.env` + `.env.example` mis à jour
+- [x] 2026-05-05 — Drawdown daily circuit breaker → `core/inventory.py:344` + `main.py:328` (commit `76ec51f`) — pause globale + alerte Discord si `realised_pnl_today < -DAILY_DRAWDOWN_LIMIT_PCT × TOTAL_CAPITAL` (default 5%), reset à minuit UTC, gate hot+cold path, `cancel_all_orders` au déclenchement, 5 tests unitaires (`TestDailyDrawdown`)
+- [x] 2026-05-05 — `fix(settings)` `NoDecode` + `extra="ignore"` → `config/settings.py:12,28,81` (commit `f531129`) — débloque pytest : `PREFERRED_TAGS` CSV n'était plus parsé en JSON par pydantic-settings 2.x, et les `DASHBOARD_*` legacy du `.env` ne cassent plus l'init (dashboard fantôme, cf. `.cursor/rules/02-architecture.mdc`)
 - [x] 2026-05-04 — `API_RATE_LIMIT_RPS=1.5` → `.env:61` + `config/settings.py:66` (default 3.0→1.5) — aligne sur limite CLOB ~1.67 RPS
 - [x] 2026-05-04 — Jitter cycle → `main.py:978` + `import random` — anti-fingerprint ±2s
 - [x] 2026-05-04 — `MAX_MARKETS=20` → `.env:35` (était 3→15→20) — sweet spot ROADMAP Appendix A
