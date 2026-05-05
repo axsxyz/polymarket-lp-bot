@@ -256,3 +256,55 @@ class TestGrossExposure:
         inv._midpoints["y"] = 0.60
 
         assert inv.is_gross_exposure_breached(open_order_notional=0)
+
+
+# ------------------------------------------------------------------
+# Daily drawdown circuit breaker
+# ------------------------------------------------------------------
+
+
+class TestDailyDrawdown:
+    def test_no_pause_above_threshold(self):
+        s = _make_settings(TOTAL_CAPITAL=1000, DAILY_DRAWDOWN_LIMIT_PCT=0.05)
+        inv = InventoryTracker(s)
+        inv._realised_pnl = -30.0  # -3% loss, below 5% limit
+        assert inv.check_daily_drawdown() is False
+        assert inv.is_drawdown_paused is False
+        assert inv.realised_pnl_today == pytest.approx(-30.0)
+
+    def test_pause_triggered_below_threshold(self):
+        s = _make_settings(TOTAL_CAPITAL=1000, DAILY_DRAWDOWN_LIMIT_PCT=0.05)
+        inv = InventoryTracker(s)
+        inv._realised_pnl = -60.0  # -6% loss, exceeds 5% limit
+        assert inv.check_daily_drawdown() is True
+        assert inv.is_drawdown_paused is True
+
+    def test_pause_persists_until_day_rollover(self):
+        s = _make_settings(TOTAL_CAPITAL=1000, DAILY_DRAWDOWN_LIMIT_PCT=0.05)
+        inv = InventoryTracker(s)
+        inv._realised_pnl = -100.0
+        assert inv.check_daily_drawdown() is True
+
+        # PnL recovers but flag stays set until UTC midnight rollover
+        inv._realised_pnl = 0.0
+        assert inv.check_daily_drawdown() is True
+        assert inv.is_drawdown_paused is True
+
+    def test_day_rollover_resets_anchor_and_pause(self):
+        s = _make_settings(TOTAL_CAPITAL=1000, DAILY_DRAWDOWN_LIMIT_PCT=0.05)
+        inv = InventoryTracker(s)
+        inv._realised_pnl = -80.0
+        assert inv.check_daily_drawdown() is True
+
+        # Simulate UTC day rollover by clearing the cached date
+        inv._current_day_utc = "1970-01-01"
+        # Same realised PnL, but new day → anchor re-snapshots, no pause
+        assert inv.check_daily_drawdown() is False
+        assert inv.is_drawdown_paused is False
+        assert inv.realised_pnl_today == pytest.approx(0.0)
+
+    def test_zero_limit_disables_breaker(self):
+        s = _make_settings(TOTAL_CAPITAL=1000, DAILY_DRAWDOWN_LIMIT_PCT=0.0)
+        inv = InventoryTracker(s)
+        inv._realised_pnl = -500.0
+        assert inv.check_daily_drawdown() is False

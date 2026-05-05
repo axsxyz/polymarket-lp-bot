@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     MIN_CAPITAL_PER_MARKET: float = 200.0
     GLOBAL_MAX_EXPOSURE_PCT: float = Field(default=0.30, ge=0.0, le=1.0)
     GLOBAL_MAX_GROSS_EXPOSURE_PCT: float = Field(default=0.80, ge=0.0, le=5.0)
+    DAILY_DRAWDOWN_LIMIT_PCT: float = Field(default=0.05, ge=0.0, le=1.0)
 
     # ── Strategy ────────────────────────────────────────────────────
     MODE: BotMode = BotMode.SAFE
