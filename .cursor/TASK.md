@@ -13,12 +13,8 @@
 ### ~~Fix cost basis seed → `main.py:866-876`~~
 - [x] 2026-05-05 — done (voir Complété)
 
-### Tracker volume quoted notional → `core/order_manager.py` (autour ligne 617)
-**Critères d'acceptance :**
-- Compteur `total_quoted_notional` incrémenté de `price × size` à chaque `POST /order` réussi
-- Persisté dans `data/airdrop_metrics.json` via `RewardsTracker`
-- Visible dans le daily Discord summary (section "Airdrop Metrics")
-- (Ref ROADMAP P5-4)
+### ~~Tracker volume quoted notional → `core/order_manager.py` (autour ligne 617)~~
+- [x] 2026-05-05 — done (voir Complété)
 
 ## P2 — Dans 2-3 semaines
 - [ ] Dynamic spread basé vol réalisée → `core/quoter.py` (ref ROADMAP P5-6 — dynamic per-market tightness)
@@ -53,6 +49,7 @@
 - [ ] **Cross-market hedging** — matrice de corrélation ; offsetter YES marché A avec NO marché B
 
 ## Complété
+- [x] 2026-05-05 — Tracker volume quoted notional → `core/order_manager.py:_session_quoted_notional+drain_quoted_notional` + `main.py:639,1072` + `core/rewards_tracker.py:DailySnapshot+record_cycle_stats+_save/_load_airdrop_metrics+format_summary` — `_session_quoted_notional` (price×size par POST réussi, dry-run inclus), drainé à chaque cycle froid ; `record_cycle_stats` reçoit maintenant `volume_usd=quoted` + `filled_usd=volume` ; `airdrop_metrics.json` persiste `total_quoted_notional` + `total_filled_usd` cumulatifs ; Discord daily summary affiche "Volume quoted today" + "Volume filled today" séparément (87/87 pytest OK)
 - [x] 2026-05-05 — Fix cost basis seed → `core/inventory_seeder.py:_seed_market+seed_all` + `main.py:959-972` — `seed_all` retourne maintenant `(failed_cids, seed_costs)` avec le vrai USD dépensé par side ; inventory sync utilise `seed_costs[cid]["yes/no"]` si disponible, fallback `bal * mid` uniquement pour tokens pré-existants (run précédent). 3 tests `TestSeedCostBasis` (29/29 pytest OK)
 - [x] 2026-05-05 — Midpoint guard continu `[0.18, 0.82]` → `core/quoter.py:108-145` + `main.py:201-203,413-466` + `config/settings.py:84-89` — pause par marché si `live_mid` hors bande pendant `MIDPOINT_GUARD_CYCLES=3` cold cycles, reprise auto au 1er retour in-band, alerte Discord pause+resume, gate hot path, 8 tests `TestMidpointGuard` (84/84 pytest OK), `.env` + `.env.example` mis à jour
 - [x] 2026-05-05 — Drawdown daily circuit breaker → `core/inventory.py:344` + `main.py:328` (commit `76ec51f`) — pause globale + alerte Discord si `realised_pnl_today < -DAILY_DRAWDOWN_LIMIT_PCT × TOTAL_CAPITAL` (default 5%), reset à minuit UTC, gate hot+cold path, `cancel_all_orders` au déclenchement, 5 tests unitaires (`TestDailyDrawdown`)

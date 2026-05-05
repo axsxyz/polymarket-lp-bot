@@ -50,6 +50,7 @@ class DailySnapshot:
     scoring_uptime_pct: float = 0.0
     total_orders_posted: int = 0
     consecutive_active_days: int = 0
+    total_filled_usd: float = 0.0
 
 
 class RewardsTracker:
@@ -75,7 +76,10 @@ class RewardsTracker:
         self._history: List[DailySnapshot] = []
         self._consecutive_active_days: int = 0
         self._daily_volume_usd: float = 0.0
+        self._daily_filled_usd: float = 0.0
         self._daily_orders_posted: int = 0
+        self._cumulative_quoted_notional: float = 0.0
+        self._cumulative_filled_usd: float = 0.0
         self._load_history()
         self._load_airdrop_metrics()
 
@@ -83,10 +87,20 @@ class RewardsTracker:
     # Daily snapshot
     # ------------------------------------------------------------------
 
-    def record_cycle_stats(self, volume_usd: float, orders_posted: int) -> None:
-        """Accumulate per-cycle metrics for daily airdrop summary."""
+    def record_cycle_stats(
+        self, volume_usd: float, orders_posted: int, filled_usd: float = 0.0
+    ) -> None:
+        """Accumulate per-cycle metrics for daily airdrop summary.
+
+        volume_usd  — quoted notional (price × size per successful POST /order)
+        filled_usd  — fill notional  (price × filled_size from actual trades)
+        """
         self._daily_volume_usd += volume_usd
+        self._daily_filled_usd += filled_usd
         self._daily_orders_posted += orders_posted
+        self._cumulative_quoted_notional += volume_usd
+        self._cumulative_filled_usd += filled_usd
+        self._save_airdrop_metrics()
 
     async def collect_daily_snapshot(
         self,
@@ -120,6 +134,7 @@ class RewardsTracker:
             global_exposure_usd=round(self._inventory.global_exposure_usd(), 2),
             per_market=per_market_rewards,
             total_volume_usd=round(self._daily_volume_usd, 2),
+            total_filled_usd=round(self._daily_filled_usd, 2),
             distinct_markets_scored=scored_market_count,
             scoring_uptime_pct=round(scoring_pct, 2),
             total_orders_posted=self._daily_orders_posted,
@@ -131,6 +146,7 @@ class RewardsTracker:
         self._save_airdrop_metrics()
 
         self._daily_volume_usd = 0.0
+        self._daily_filled_usd = 0.0
         self._daily_orders_posted = 0
 
         logger.info(
@@ -197,6 +213,7 @@ class RewardsTracker:
                     "markets_active": s.markets_active,
                     "global_exposure_usd": s.global_exposure_usd,
                     "total_volume_usd": s.total_volume_usd,
+                    "total_filled_usd": s.total_filled_usd,
                     "distinct_markets_scored": s.distinct_markets_scored,
                     "scoring_uptime_pct": s.scoring_uptime_pct,
                     "total_orders_posted": s.total_orders_posted,
@@ -223,6 +240,7 @@ class RewardsTracker:
                         markets_active=raw.get("markets_active", 0),
                         global_exposure_usd=raw.get("global_exposure_usd", 0),
                         total_volume_usd=raw.get("total_volume_usd", 0),
+                        total_filled_usd=raw.get("total_filled_usd", 0.0),
                         distinct_markets_scored=raw.get("distinct_markets_scored", 0),
                         scoring_uptime_pct=raw.get("scoring_uptime_pct", 0),
                         total_orders_posted=raw.get("total_orders_posted", 0),
@@ -251,7 +269,11 @@ class RewardsTracker:
     def _save_airdrop_metrics(self) -> None:
         try:
             AIRDROP_METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"consecutive_active_days": self._consecutive_active_days}
+            payload = {
+                "consecutive_active_days": self._consecutive_active_days,
+                "total_quoted_notional": self._cumulative_quoted_notional,
+                "total_filled_usd": self._cumulative_filled_usd,
+            }
             AIRDROP_METRICS_PATH.write_text(json.dumps(payload, indent=2))
         except Exception as exc:
             logger.warning("Failed to save airdrop metrics: {}", exc)
@@ -262,6 +284,8 @@ class RewardsTracker:
         try:
             data = json.loads(AIRDROP_METRICS_PATH.read_text())
             self._consecutive_active_days = data.get("consecutive_active_days", 0)
+            self._cumulative_quoted_notional = data.get("total_quoted_notional", 0.0)
+            self._cumulative_filled_usd = data.get("total_filled_usd", 0.0)
         except Exception as exc:
             logger.warning("Failed to load airdrop metrics: {}", exc)
 
@@ -284,7 +308,8 @@ class RewardsTracker:
             f"Cumulative pool total: ${self.cumulative_rewards:.2f}",
             "",
             "**Airdrop Metrics**",
-            f"Volume today: ${snapshot.total_volume_usd:,.0f}",
+            f"Volume quoted today: ${snapshot.total_volume_usd:,.0f}",
+            f"Volume filled today: ${snapshot.total_filled_usd:,.0f}",
             f"Markets scored: {snapshot.distinct_markets_scored}",
             f"Scoring uptime: {snapshot.scoring_uptime_pct:.0%}",
             f"Orders posted: {snapshot.total_orders_posted}",
