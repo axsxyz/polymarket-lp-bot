@@ -44,7 +44,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 | Fichier:ligne | Problème | Statut |
 |---------------|----------|--------|
-| `main.py:866-876` | `pos.yes_cost/no_cost` initialisés avec `bal * mid` au lieu du prix seed réel → PnL biaisé | NON FIXÉ |
+| `main.py:866-876` | `pos.yes_cost/no_cost` initialisés avec `bal * mid` au lieu du prix seed réel → PnL biaisé | **FIXÉ 2026-05-05** : seed cost basis réel depuis `core/inventory_seeder.py` |
 | `rewards_tracker.py:274` | `estimated_rewards_usd / 10.0` hardcodé | NON FIXÉ |
 | `config/settings.py:66` | `API_RATE_LIMIT_RPS` dépassait le plafond CLOB | **FIXÉ 2026-05-04** : 5.0 → 1.5 |
 | `main.py:977` | Sleep cycle sans jitter | **FIXÉ 2026-05-04** : `+random.uniform(-2.0, 2.0)` |
@@ -58,7 +58,8 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 |---------|------------|
 | `core/quoter.py:108-145` | `feat(quoter)` midpoint guard continu : `evaluate_midpoint_guard()` + `is_midpoint_paused()`, pause après 3 cycles hors bande `[0.18, 0.82]`, seuils configurables via `.env` |
 | `core/inventory.py` + `main.py` | `feat(inventory)` daily drawdown circuit breaker (commit `76ec51f`) : `DAILY_DRAWDOWN_LIMIT_PCT=0.05`, gate global quote path, alert Discord `critical`, reset minuit UTC, hot path gardé (`main.py:199-200`) |
-| `tests/` | Validation `84 tests` passent après ajout midpoint guard (inclut baseline + drawdown + midpoint guard) |
+| `tests/` | Validation `87 tests` passent (inclut baseline + drawdown + midpoint guard + seed cost basis + métriques airdrop) |
+| `core/order_manager.py` + `main.py` + `core/rewards_tracker.py` | **P1 done (2026-05-05)** : tracker quoted notional (`price × size` par POST réussi) + tracking séparé du filled volume (`price × filled_size`) ; snapshot daily Discord affiche maintenant les deux lignes ("Volume quoted today" / "Volume filled today") ; persistence cumulative dans `data/airdrop_metrics.json` |
 | `config/settings.py` | `fix(settings)` (commit `f531129`) : `NoDecode` pour `PREFERRED_TAGS` + `extra="ignore"` pour variables `.env` inconnues |
 | `.env:61` + `config/settings.py:66` | `API_RATE_LIMIT_RPS` : `5.0` → `1.5` |
 | `main.py:20` | `import random` ajouté |
@@ -97,13 +98,9 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ## 6. Prochain chantier prioritaire
 
-### P1 — Fix cost basis seed
-- **Fichiers** : `main.py:866-876`
-- **Acceptance** : `pos.yes_cost/no_cost` = prix réel seed order (pas `bal * mid`). Test : buy 0.40, sell 0.60 → PnL +$0.20/share.
-
-### P1 — Tracker volume quoted notional
-- **Fichiers** : `core/order_manager.py` ~617
-- **Acceptance** : compteur `total_quoted_notional` (`price × size` par POST réussi), persisté dans `data/airdrop_metrics.json`.
+### P1 — Statut
+- **Terminé** : tous les items P1 sont complétés au 2026-05-05.
+- **Livré** : fix cost basis seed + tracker quoted notional + dual métriques Discord (quoted vs filled).
 
 ### P2 — Dynamic spread + taker signal
 - **Fichiers** : `core/quoter.py`, `core/taker_signal.py` (à créer)
