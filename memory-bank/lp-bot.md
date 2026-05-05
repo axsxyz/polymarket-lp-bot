@@ -56,8 +56,9 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 | Fichier | Changement |
 |---------|------------|
+| `core/quoter.py:108-145` | `feat(quoter)` midpoint guard continu : `evaluate_midpoint_guard()` + `is_midpoint_paused()`, pause après 3 cycles hors bande `[0.18, 0.82]`, seuils configurables via `.env` |
 | `core/inventory.py` + `main.py` | `feat(inventory)` daily drawdown circuit breaker (commit `76ec51f`) : `DAILY_DRAWDOWN_LIMIT_PCT=0.05`, gate global quote path, alert Discord `critical`, reset minuit UTC, hot path gardé (`main.py:199-200`) |
-| `tests/` | Validation `76 tests` passent : `71` baseline + `5` `TestDailyDrawdown` |
+| `tests/` | Validation `84 tests` passent après ajout midpoint guard (inclut baseline + drawdown + midpoint guard) |
 | `config/settings.py` | `fix(settings)` (commit `f531129`) : `NoDecode` pour `PREFERRED_TAGS` + `extra="ignore"` pour variables `.env` inconnues |
 | `.env:61` + `config/settings.py:66` | `API_RATE_LIMIT_RPS` : `5.0` → `1.5` |
 | `main.py:20` | `import random` ajouté |
@@ -94,20 +95,19 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 6. Prochain chantier prioritaire (P1)
+## 6. Prochain chantier prioritaire
 
-### Midpoint guard continu [0.18, 0.82]
-- **Fichiers** : `core/quoter.py:141`
-- **Acceptance** : pause marché si `live_mid` sort de la bande 3 cycles consécutifs. Seuils configurables (`MIDPOINT_GUARD_MIN`, `MIDPOINT_GUARD_MAX`, `MIDPOINT_GUARD_CYCLES`).
-- **Statut** : prochaine tâche immédiate après Task 1 DONE (`76ec51f` + `f531129`).
-
-### Fix cost basis seed
+### P1 — Fix cost basis seed
 - **Fichiers** : `main.py:866-876`
 - **Acceptance** : `pos.yes_cost/no_cost` = prix réel seed order (pas `bal * mid`). Test : buy 0.40, sell 0.60 → PnL +$0.20/share.
 
-### Tracker volume quoted notional
+### P1 — Tracker volume quoted notional
 - **Fichiers** : `core/order_manager.py` ~617
 - **Acceptance** : compteur `total_quoted_notional` (`price × size` par POST réussi), persisté dans `data/airdrop_metrics.json`.
+
+### P2 — Dynamic spread + taker signal
+- **Fichiers** : `core/quoter.py`, `core/taker_signal.py` (à créer)
+- **Acceptance** : spread dynamique basé vol réalisée + signal mensuel de pression taker intégré à la logique de quotation.
 
 ---
 
