@@ -1,13 +1,5 @@
 # LP Bot — Active Tasks
 
-## P2a — Dynamic spread (priorité immédiate)
-- [ ] **Dynamic spread basé vol réalisée** → `core/quoter.py`
-  - Rolling vol window 15-30min sur WS price history par marché
-  - Spread élargi si vol élevée, resserré si stable
-  - Remplace le spread quasi-statique actuel (`QUOTE_OFFSET_TICKS` fixe)
-  - Paramètres configurables : `VOL_WINDOW_SECONDS`, `VOL_SPREAD_MULTIPLIER_MIN/MAX`
-  - Ref ROADMAP P5-6 — dynamic per-market tightness
-
 ## P2b — Toxicity analyzer (priorité critique)
 - [ ] **`core/toxicity_analyzer.py`** — Adverse selection defense
   - **VPIN** : buy/sell imbalance sur fenêtre glissante → widen spread si élevé
@@ -76,6 +68,14 @@
 ---
 
 ## Complété
+
+### 2026-05-08
+- [x] **P2a — Dynamic spread + spike detector** → `core/quoter.py` + `main.py` + `config/settings.py` + `tests/test_quoter.py` + `.env.example`
+  - Rolling-vol window (`VOL_WINDOW_SECONDS=900`) → multiplier `[0.7, 3.0]` × `QUOTE_OFFSET_TICKS` (legacy mode intact)
+  - Spike detector range-based (`SPIKE_TICKS_THRESHOLD=5` / `SPIKE_DETECTION_WINDOW_SECONDS=30`) → cancel + pause `SPIKE_PAUSE_SECONDS=120` + Discord alert
+  - Reprise progressive automatique via vol_mult élevé post-spike (pas de logique additionnelle)
+  - 3 échelles disjointes préservées : velocity guard (5s/3 ticks → log) | spike (30s/5 ticks → pause) | vol (15min/stdev → multiplier)
+  - 100/100 tests ✅ (87 baseline + 13 nouveaux : 6 vol + 7 spike)
 
 ### 2026-05-05
 - [x] Tracker volume quoted notional → `core/order_manager.py` + `main.py` + `core/rewards_tracker.py`
