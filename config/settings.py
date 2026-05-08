@@ -132,6 +132,9 @@ class Settings(BaseSettings):
     SCORING_ALERT_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0)
     SCORING_REMEDIATION_THRESHOLD: int = Field(default=3, ge=1, le=20)
 
+    # ── Rewards Estimation ──────────────────────────────────────────
+    LP_ESTIMATED_SHARE: float = Field(default=0.10, ge=0.001, le=1.0)
+
     # ── Dynamic Reallocation ─────────────────────────────────────
     DYNAMIC_REALLOC_ENABLED: bool = True
     DYNAMIC_REALLOC_INTERVAL_SECONDS: int = Field(default=300, ge=60, le=1800)
