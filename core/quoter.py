@@ -26,8 +26,11 @@ outputs a fresh Quote every cycle.
 
 from __future__ import annotations
 
+import statistics
+import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Deque, Dict, Optional, Tuple
 
 from loguru import logger
 
@@ -68,6 +71,12 @@ _TICK_MAP = {
     "0.0001": 0.0001,
 }
 
+# P2a: rolling vol/spike detection — sized for VOL_WINDOW_SECONDS up to
+# 3600s with bursts of ~3 mids/sec from WS price_change events. Acts as
+# a safety bound; expiry by timestamp is the actual pruning mechanism.
+_VOL_HISTORY_MAX_LEN = 3000
+_VOL_MIN_SAMPLES = 5
+
 
 def _round_to_tick(price: float, tick_str: str) -> float:
     tick = _TICK_MAP.get(tick_str, 0.01)
@@ -107,6 +116,10 @@ class Quoter:
         # Per-market midpoint-guard state (driven by cold cycle only).
         self._midpoint_breach_count: dict[str, int] = {}
         self._midpoint_paused: set[str] = set()
+        # P2a: rolling mid history per market for realised-vol + spike
+        # detection. Keyed by condition_id, each entry is (monotonic_ts, mid).
+        self._price_history: Dict[str, Deque[Tuple[float, float]]] = {}
+        self._spike_paused_until: Dict[str, float] = {}
 
     def update_scoring_rates(self, rates: dict[str, float]) -> None:
         """Update per-market scoring rates from ScoringMonitor."""
@@ -145,6 +158,102 @@ class Quoter:
     def is_midpoint_paused(self, condition_id: str) -> bool:
         """Cheap read-only check used by the hot WS path."""
         return condition_id in self._midpoint_paused
+
+    # ------------------------------------------------------------------
+    # P2a — Realised-volatility + spike detection
+    # ------------------------------------------------------------------
+
+    def record_mid(self, condition_id: str, mid: float) -> None:
+        """Append a (monotonic_ts, mid) sample to the rolling history.
+
+        Called by both the hot WS path and the cold cycle so the volatility
+        window stays fresh whether or not WS is healthy. Old samples are
+        pruned lazily on read by ``_samples_in_window``; the deque maxlen
+        is a hard safety net against unbounded growth on extreme bursts.
+        """
+        if mid <= 0.0 or mid >= 1.0:
+            return
+        history = self._price_history.get(condition_id)
+        if history is None:
+            history = deque(maxlen=_VOL_HISTORY_MAX_LEN)
+            self._price_history[condition_id] = history
+        history.append((time.monotonic(), mid))
+
+    def _samples_in_window(
+        self, condition_id: str, window_seconds: float,
+    ) -> list[float]:
+        """Return mid values within the last *window_seconds* (newest last)."""
+        history = self._price_history.get(condition_id)
+        if not history:
+            return []
+        cutoff = time.monotonic() - window_seconds
+        return [mid for ts, mid in history if ts >= cutoff]
+
+    def _compute_vol_multiplier(
+        self, condition_id: str, tick: float,
+    ) -> float:
+        """Map realised stdev (in ticks) over VOL_WINDOW_SECONDS to a
+        spread multiplier in [VOL_SPREAD_MULTIPLIER_MIN, VOL_SPREAD_MULTIPLIER_MAX].
+
+        - stdev <= 1 tick  → linearly between MIN and 1.0  (calm → tighten)
+        - stdev > 1 tick   → linearly between 1.0 and MAX  (volatile → widen)
+        Insufficient history → 1.0 (neutral, no regression on cold start).
+        """
+        samples = self._samples_in_window(condition_id, self._s.VOL_WINDOW_SECONDS)
+        if len(samples) < _VOL_MIN_SAMPLES:
+            return 1.0
+        stdev_dollars = statistics.pstdev(samples)
+        stdev_ticks = stdev_dollars / max(tick, 1e-6)
+
+        lo = self._s.VOL_SPREAD_MULTIPLIER_MIN
+        hi = self._s.VOL_SPREAD_MULTIPLIER_MAX
+        if stdev_ticks <= 1.0:
+            mult = lo + (1.0 - lo) * stdev_ticks
+        else:
+            ratio = min((stdev_ticks - 1.0) / 4.0, 1.0)
+            mult = 1.0 + ratio * (hi - 1.0)
+        return max(lo, min(hi, mult))
+
+    def evaluate_spike(
+        self, condition_id: str, tick: float,
+    ) -> Tuple[bool, int]:
+        """Return ``(is_spike, ticks_moved)`` over the spike window.
+
+        Uses **range** (max - min) rather than net move so that pump-and-revert
+        patterns still trigger. Caller must invoke ``record_mid`` first to
+        keep the history fresh — both the hot and cold path do this.
+        """
+        samples = self._samples_in_window(
+            condition_id, self._s.SPIKE_DETECTION_WINDOW_SECONDS,
+        )
+        if len(samples) < 2:
+            return (False, 0)
+        rng = max(samples) - min(samples)
+        ticks_moved = int(rng / max(tick, 1e-6))
+        return (ticks_moved >= self._s.SPIKE_TICKS_THRESHOLD, ticks_moved)
+
+    def trigger_spike_pause(self, condition_id: str) -> None:
+        """Mark *condition_id* as spike-paused for SPIKE_PAUSE_SECONDS."""
+        self._spike_paused_until[condition_id] = (
+            time.monotonic() + self._s.SPIKE_PAUSE_SECONDS
+        )
+
+    def is_spike_paused(self, condition_id: str) -> bool:
+        """Cheap read-only check; auto-clears when the deadline elapses."""
+        until = self._spike_paused_until.get(condition_id)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            del self._spike_paused_until[condition_id]
+            return False
+        return True
+
+    def spike_pause_ttl(self, condition_id: str) -> float:
+        """Seconds remaining on a spike pause, or 0.0 if not paused."""
+        until = self._spike_paused_until.get(condition_id)
+        if until is None:
+            return 0.0
+        return max(0.0, until - time.monotonic())
 
     def compute(
         self,
@@ -216,7 +325,8 @@ class Quoter:
         tick = _TICK_MAP.get(market.tick_size, 0.01)
 
         if self._s.QUOTE_OFFSET_TICKS > 0:
-            base = self._s.QUOTE_OFFSET_TICKS * tick
+            vol_mult = self._compute_vol_multiplier(market.condition_id, tick)
+            base = self._s.QUOTE_OFFSET_TICKS * tick * vol_mult
 
             fph = self._fill_rates.get(market.condition_id, 0)
             adverse_widening = 0
