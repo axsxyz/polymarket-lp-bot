@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-05**.
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08**.
 
 ---
 
@@ -52,10 +52,13 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 3. Tous les changements récents (2026-05-05 + 2026-05-04)
+## 3. Tous les changements récents (2026-05-08 + 2026-05-05 + 2026-05-04)
 
 | Fichier | Changement |
 |---------|------------|
+| **2026-05-08** | |
+| `config/settings.py` + `core/quoter.py` + `main.py` + `tests/test_quoter.py` + `.env.example` | **P2a done** : dynamic spread basé vol réalisée + spike detector. `Quoter._price_history` (rolling deque par cid) alimenté par hot WS path ET cold cycle ; `_compute_vol_multiplier()` mappe stdev (en ticks) sur `[VOL_SPREAD_MULTIPLIER_MIN=0.7, MAX=3.0]` appliqué à `QUOTE_OFFSET_TICKS` (legacy mode `QUOTE_OFFSET_TICKS=0` intact). Spike detector (`evaluate_spike` range-based sur 30s/5 ticks) → `trigger_spike_pause` 120s + cancel + Discord alert `warning`. Reprise progressive automatique via vol_mult restant élevé après spike. Velocity guard `ws_feed.py:_check_velocity` préservé tel quel (3 échelles disjointes : 5s/30s/15min). 100/100 tests ✅ |
+| **2026-05-05** | |
 | `core/quoter.py:108-145` | `feat(quoter)` midpoint guard continu : `evaluate_midpoint_guard()` + `is_midpoint_paused()`, pause après 3 cycles hors bande `[0.18, 0.82]`, seuils configurables via `.env` |
 | `core/inventory.py` + `main.py` | `feat(inventory)` daily drawdown circuit breaker (commit `76ec51f`) : `DAILY_DRAWDOWN_LIMIT_PCT=0.05`, gate global quote path, alert Discord `critical`, reset minuit UTC, hot path gardé (`main.py:199-200`) |
 | `tests/` | Validation `87 tests` passent (inclut baseline + drawdown + midpoint guard + seed cost basis + métriques airdrop) |
@@ -102,9 +105,12 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 - **Terminé** : tous les items P1 sont complétés au 2026-05-05.
 - **Livré** : fix cost basis seed + tracker quoted notional + dual métriques Discord (quoted vs filled).
 
-### P2 — Dynamic spread + taker signal
-- **Fichiers** : `core/quoter.py`, `core/taker_signal.py` (à créer)
-- **Acceptance** : spread dynamique basé vol réalisée + signal mensuel de pression taker intégré à la logique de quotation.
+### P2a — Dynamic spread + spike detector
+- **Terminé** au 2026-05-08. Vol multiplier rolling 15min + spike pause 30s/5 ticks + 6 nouveaux env vars + 13 nouveaux tests.
+
+### P2b — Toxicity analyzer (prochain chantier)
+- **Fichiers** : `core/toxicity_analyzer.py` (à créer)
+- **Acceptance** : VPIN buy/sell imbalance + fill-vs-mid scoring → remplace le `_fill_rates` blunt instrument actuel dans `quoter._compute_offset`.
 
 ---
 
