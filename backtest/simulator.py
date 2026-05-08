@@ -58,6 +58,7 @@ Same input (market + yes_mid_samples + params + base_settings + interval)
 from __future__ import annotations
 
 import bisect
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -91,6 +92,39 @@ HORIZON_T5MIN_TOLERANCE_S = 60
 # Position size used for `Quoter.compute()`: a high constant so the simulator
 # never hits the inventory-cap branch that zeroes out ASK size when flat.
 _INF_POSITION = 1e9
+
+# Conservative fallbacks for markets that Gamma returned without reward
+# params (closed/stale markets). Used by both simulate_market and the
+# downstream metrics path so theoretical_max_q_score is non-zero.
+_FALLBACK_MAX_SPREAD = 0.05
+_FALLBACK_MIN_SIZE = 5.0
+
+
+def apply_market_fallbacks(
+    market: MarketCandidate, settings: Settings,
+) -> MarketCandidate:
+    """Return a market with allocated_capital + max_spread + min_size
+    populated to safe defaults when the loaded record is incomplete.
+
+    Symmetric across simulate_market and compute_metrics: applying the same
+    transform in both places keeps theoretical_max_q_score and capture_rate
+    aligned with the actual quote sizes the simulator used.
+    """
+    updates: dict = {}
+    if market.allocated_capital <= 0:
+        derived = settings.TOTAL_CAPITAL / max(settings.MAX_MARKETS, 1)
+        derived = max(
+            settings.MIN_CAPITAL_PER_MARKET,
+            min(derived, settings.MAX_CAPITAL_PER_MARKET),
+        )
+        updates["allocated_capital"] = derived
+    if market.max_spread <= 0:
+        updates["max_spread"] = _FALLBACK_MAX_SPREAD
+    if market.min_size <= 0:
+        updates["min_size"] = _FALLBACK_MIN_SIZE
+    if not updates:
+        return market
+    return replace(market, **updates)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -198,23 +232,35 @@ def _lookahead_mid(
     With /prices-history at 1m granularity, a half-interval tolerance is
     the natural floor; HORIZON_T1MIN_TOLERANCE_S=30 and
     HORIZON_T5MIN_TOLERANCE_S=60 give 1-sample slack each.
+
+    On equal distance the AFTER sample wins: this is a forward-looking
+    horizon (mid_t1min, mid_t5min) so the post-fill drift sample is the
+    semantically correct choice.
     """
     n = len(sample_ts)
     if n == 0:
         return None
     idx = bisect.bisect_left(sample_ts, target_ts)
-    candidates: List[tuple] = []  # (|ts - target|, mid)
-    if idx > 0:
-        before_dist = target_ts - sample_ts[idx - 1]
-        if 0 <= before_dist <= tolerance_s:
-            candidates.append((before_dist, sample_mid[idx - 1]))
+    candidates: List[tuple] = []  # (|ts - target|, mid); AFTER first → ties go to AFTER
     if idx < n:
         after_dist = sample_ts[idx] - target_ts
         if 0 <= after_dist <= tolerance_s:
             candidates.append((after_dist, sample_mid[idx]))
+    if idx > 0:
+        before_dist = target_ts - sample_ts[idx - 1]
+        if 0 <= before_dist <= tolerance_s:
+            candidates.append((before_dist, sample_mid[idx - 1]))
     if not candidates:
         return None
     return min(candidates, key=lambda x: x[0])[1]
+
+
+def _median_gap(sample_ts: List[int]) -> int:
+    """Median inter-sample gap in seconds; returns 0 for fewer than 2 samples."""
+    if len(sample_ts) < 2:
+        return 0
+    gaps = sorted(sample_ts[i + 1] - sample_ts[i] for i in range(len(sample_ts) - 1))
+    return gaps[len(gaps) // 2]
 
 
 def _earliest_match_ts(
@@ -237,6 +283,8 @@ def _build_fill(
     fill_price: float, fill_size: float,
     mid_at_post_yes: float, max_spread: float,
     sample_ts: List[int], sample_mid: List[float],
+    tolerance_t1min_s: int = HORIZON_T1MIN_TOLERANCE_S,
+    tolerance_t5min_s: int = HORIZON_T5MIN_TOLERANCE_S,
 ) -> SimulatedFill:
     """Construct a SimulatedFill with horizon lookups in the proper scale.
 
@@ -244,16 +292,20 @@ def _build_fill(
     convert it (and the looked-up horizon mids) to the NO scale via
     `1 - yes_mid` so `mid_at_post`, `mid_t1min`, `mid_t5min` are all
     expressed in the same scale as `fill_price`.
+
+    ``tolerance_t1min_s`` / ``tolerance_t5min_s`` allow the caller to widen
+    the lookahead window when data granularity exceeds the default
+    half-interval slack (e.g. 600s /prices-history at 1m fidelity=10).
     """
     mid_t1_yes = _lookahead_mid(
         sample_ts, sample_mid,
         target_ts=fill_ts + HORIZON_T1MIN_S,
-        tolerance_s=HORIZON_T1MIN_TOLERANCE_S,
+        tolerance_s=tolerance_t1min_s,
     )
     mid_t5_yes = _lookahead_mid(
         sample_ts, sample_mid,
         target_ts=fill_ts + HORIZON_T5MIN_S,
-        tolerance_s=HORIZON_T5MIN_TOLERANCE_S,
+        tolerance_s=tolerance_t5min_s,
     )
 
     if token_side == "NO":
@@ -319,20 +371,15 @@ def simulate_market(
     settings = build_settings_for_params(params, base_settings)
     tick = _TICK_DOLLARS_MAP.get(market.tick_size, 0.01)
 
-    # Markets loaded from SQLite do not carry an allocated_capital (the live
-    # bot's MarketManager assigns this). Derive a default from settings so
-    # the Quoter doesn't zero out all quote sizes due to half_capital==0.
-    if market.allocated_capital <= 0:
-        derived = settings.TOTAL_CAPITAL / max(settings.MAX_MARKETS, 1)
-        derived = max(
-            settings.MIN_CAPITAL_PER_MARKET,
-            min(derived, settings.MAX_CAPITAL_PER_MARKET),
-        )
-        market = replace(market, allocated_capital=derived)
+    market = apply_market_fallbacks(market, settings)
 
     quoter = Quoter(settings)
     tox = ToxicityAnalyzer(settings)
     quoter.attach_toxicity_analyzer(tox)
+    # Cap the vol window in backtest: the monotonic clock barely advances
+    # during simulation so _samples_in_window would return the full deque
+    # (up to 3000 entries). 150 samples is ample for stdev over any window.
+    quoter._vol_max_samples = 150
 
     if quiet:
         logger.disable("core.quoter")
@@ -343,10 +390,28 @@ def simulate_market(
     cycles_paused_midpoint = 0
     cycles_paused_toxicity = 0
 
+    # Adapt fill-detection window to the actual data cadence.
+    # /prices-history arrives at ~600s intervals in production; with a 45s
+    # rebalance window the fill-check window [t, t+45] is almost always empty.
+    # effective_interval = max(cycle_length, data_granularity) ensures each
+    # cycle covers at least one inter-sample gap, so quote crossings are
+    # detected.  For test data (10s samples, 30s cycle) effective_interval=30s
+    # → behaviour is identical to the original.
+    data_gran_s = _median_gap(sample_ts)
+    effective_interval = max(rebalance_interval_seconds, data_gran_s)
+
+    # Forward-horizon tolerances (mid_t1min, mid_t5min) widen when data is
+    # coarser than the natural half-interval slack. Without this, sparse
+    # tapes (gran=600s) never populate t5min → PnL & Sharpe stay at zero.
+    tolerance_t1min_s = max(HORIZON_T1MIN_TOLERANCE_S, data_gran_s)
+    tolerance_t5min_s = max(HORIZON_T5MIN_TOLERANCE_S, data_gran_s)
+
+    t0 = time.perf_counter()
     try:
         t = sample_ts[0]
         t_end = sample_ts[-1]
         cycle_idx = 0
+        last_window_hi = 0  # non-overlapping window pointer
 
         while t < t_end:
             cycles_total += 1
@@ -383,13 +448,18 @@ def simulate_market(
                 yes_position=_INF_POSITION, no_position=_INF_POSITION,
             )
 
-            window_lo = bisect.bisect_left(sample_ts, t)
-            window_hi = bisect.bisect_left(
-                sample_ts, t + rebalance_interval_seconds,
+            # Non-overlapping fill window: starts where last window ended,
+            # ends at t + effective_interval (bisect_right includes boundary
+            # samples that fall exactly on the next cycle's start — essential
+            # when data granularity equals effective_interval).
+            window_lo = last_window_hi
+            window_hi = bisect.bisect_right(
+                sample_ts, t + effective_interval,
             )
             window_ts = sample_ts[window_lo:window_hi]
             window_mid = sample_mid[window_lo:window_hi]
-            t += rebalance_interval_seconds
+            last_window_hi = window_hi
+            t += effective_interval
 
             if not window_ts or quotes is None:
                 continue
@@ -402,6 +472,8 @@ def simulate_market(
                 yes_quote=quotes.yes_quote, no_quote=quotes.no_quote,
                 mid_at_post_yes=mid_now, market=market,
                 sample_ts=sample_ts, sample_mid=sample_mid,
+                tolerance_t1min_s=tolerance_t1min_s,
+                tolerance_t5min_s=tolerance_t5min_s,
             )
 
             for f in cycle_fills:
@@ -422,6 +494,13 @@ def simulate_market(
 
             fills.extend(cycle_fills)
 
+        elapsed_s = time.perf_counter() - t0
+        logger.debug(
+            "simulate_market: {} cycles in {:.2f}s ({:.0f} cycles/s) cid={}",
+            cycles_total, elapsed_s,
+            cycles_total / max(elapsed_s, 0.001),
+            market.condition_id[:12],
+        )
         return SimResult(
             condition_id=market.condition_id,
             params=params,
@@ -451,12 +530,18 @@ def _detect_fills_in_window(
     market: MarketCandidate,
     sample_ts: List[int],
     sample_mid: List[float],
+    tolerance_t1min_s: int = HORIZON_T1MIN_TOLERANCE_S,
+    tolerance_t5min_s: int = HORIZON_T5MIN_TOLERANCE_S,
 ) -> List[SimulatedFill]:
     """Apply the naive maker fill rule on YES + NO quotes for one cycle.
 
     Both YES and NO quotes can fire in the same cycle if mid range straddles
     both sides — the model assumes both orders rest on the book throughout
     the window. Documented optimism in module docstring.
+
+    Lookahead tolerances are widened by the caller when data granularity
+    exceeds default half-interval slack (so PnL/adverse rate are populated
+    on coarse /prices-history tapes).
     """
     out: List[SimulatedFill] = []
     if not window_mid:
@@ -465,19 +550,23 @@ def _detect_fills_in_window(
     min_yes = min(window_mid)
     max_yes = max(window_mid)
 
+    def _build(ts: int, side: str, token_side: str, price: float, size: float) -> SimulatedFill:
+        return _build_fill(
+            cycle_idx, ts, side, token_side, price, size,
+            mid_at_post_yes=mid_at_post_yes,
+            max_spread=market.max_spread,
+            sample_ts=sample_ts, sample_mid=sample_mid,
+            tolerance_t1min_s=tolerance_t1min_s,
+            tolerance_t5min_s=tolerance_t5min_s,
+        )
+
     # ── YES BID: filled when YES mid drops to/below bot's bid ──
     if yes_quote and yes_quote.bid_size > 0 and min_yes <= yes_quote.bid_price:
         ts = _earliest_match_ts(
             window_ts, window_mid, lambda m: m <= yes_quote.bid_price,
         )
         if ts is not None:
-            out.append(_build_fill(
-                cycle_idx, ts, "BID", "YES",
-                yes_quote.bid_price, yes_quote.bid_size,
-                mid_at_post_yes=mid_at_post_yes,
-                max_spread=market.max_spread,
-                sample_ts=sample_ts, sample_mid=sample_mid,
-            ))
+            out.append(_build(ts, "BID", "YES", yes_quote.bid_price, yes_quote.bid_size))
 
     # ── YES ASK: filled when YES mid rises to/above bot's ask ──
     if yes_quote and yes_quote.ask_size > 0 and max_yes >= yes_quote.ask_price:
@@ -485,13 +574,7 @@ def _detect_fills_in_window(
             window_ts, window_mid, lambda m: m >= yes_quote.ask_price,
         )
         if ts is not None:
-            out.append(_build_fill(
-                cycle_idx, ts, "ASK", "YES",
-                yes_quote.ask_price, yes_quote.ask_size,
-                mid_at_post_yes=mid_at_post_yes,
-                max_spread=market.max_spread,
-                sample_ts=sample_ts, sample_mid=sample_mid,
-            ))
+            out.append(_build(ts, "ASK", "YES", yes_quote.ask_price, yes_quote.ask_size))
 
     # ── NO BID: NO mid <= bot's NO bid ⇔ yes_mid >= 1 - bot_no_bid_price ──
     if no_quote and no_quote.bid_size > 0:
@@ -501,13 +584,7 @@ def _detect_fills_in_window(
                 window_ts, window_mid, lambda m: m >= threshold_yes,
             )
             if ts is not None:
-                out.append(_build_fill(
-                    cycle_idx, ts, "BID", "NO",
-                    no_quote.bid_price, no_quote.bid_size,
-                    mid_at_post_yes=mid_at_post_yes,
-                    max_spread=market.max_spread,
-                    sample_ts=sample_ts, sample_mid=sample_mid,
-                ))
+                out.append(_build(ts, "BID", "NO", no_quote.bid_price, no_quote.bid_size))
 
     # ── NO ASK: NO mid >= bot's NO ask ⇔ yes_mid <= 1 - bot_no_ask_price ──
     if no_quote and no_quote.ask_size > 0:
@@ -517,12 +594,6 @@ def _detect_fills_in_window(
                 window_ts, window_mid, lambda m: m <= threshold_yes,
             )
             if ts is not None:
-                out.append(_build_fill(
-                    cycle_idx, ts, "ASK", "NO",
-                    no_quote.ask_price, no_quote.ask_size,
-                    mid_at_post_yes=mid_at_post_yes,
-                    max_spread=market.max_spread,
-                    sample_ts=sample_ts, sample_mid=sample_mid,
-                ))
+                out.append(_build(ts, "ASK", "NO", no_quote.ask_price, no_quote.ask_size))
 
     return out

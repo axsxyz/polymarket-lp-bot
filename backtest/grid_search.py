@@ -39,9 +39,11 @@ from __future__ import annotations
 
 import csv
 import itertools
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
@@ -58,6 +60,8 @@ from backtest.metrics import (
 from backtest.simulator import (
     BotParams,
     DEFAULT_REBALANCE_INTERVAL_S,
+    apply_market_fallbacks,
+    build_settings_for_params,
     simulate_market,
 )
 
@@ -172,11 +176,18 @@ def simulate_combo(
     """Run the full sim+metrics pipeline for one parameter combo across markets.
 
     Independent of all other combos — safe to dispatch to a worker process.
+
+    Markets with missing reward params (max_spread=0 / min_size=0 from a
+    stale Gamma fetch) are normalised via ``apply_market_fallbacks`` BEFORE
+    both simulate_market and compute_metrics so theoretical_max_q_score is
+    consistent with the simulated quotes.
     """
+    settings_for_fallback = build_settings_for_params(params, base_settings)
     per_market: List[Metrics] = []
     for market, mids in market_data:
         if not mids:
             continue
+        market = apply_market_fallbacks(market, settings_for_fallback)
         result = simulate_market(
             market, mids, params,
             base_settings=base_settings,
@@ -239,6 +250,30 @@ def append_csv_row(path: Path, row: GridRow) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────
+# ProcessPoolExecutor worker — must be module-level for pickling
+# ──────────────────────────────────────────────────────────────────
+
+def _combo_worker(
+    args: Tuple[int, BotParams, List[MarketBundle], Optional[Settings], int],
+) -> Tuple[int, AggregateMetrics]:
+    """Run one combo in a worker process. Returns (original_idx, agg).
+
+    All arguments are plain data (no SQLite connections, no locks) — safe to
+    pickle for multiprocessing "spawn" (macOS / Windows default).
+
+    On macOS/Windows spawn, the worker re-imports loguru with its default
+    stderr handler — which interleaves DEBUG/INFO logs with the parent's
+    rich Live display. ``logger.remove()`` strips all sinks in this worker
+    so only the parent's WARNING+ stderr survives.
+    """
+    logger.remove()
+    idx, params, market_data, base_settings, rebalance_interval_seconds = args
+    return idx, simulate_combo(
+        params, market_data, base_settings, rebalance_interval_seconds,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # Top-level driver
 # ──────────────────────────────────────────────────────────────────
 
@@ -248,11 +283,23 @@ def run_grid(
     out_csv_path: Path,
     base_settings: Optional[Settings] = None,
     rebalance_interval_seconds: int = DEFAULT_REBALANCE_INTERVAL_S,
+    on_combo_done: Optional[
+        Callable[[int, int, int, BotParams, GridRow], None]
+    ] = None,
+    on_combo_started: Optional[Callable[[int, BotParams], None]] = None,
 ) -> List[GridRow]:
-    """Run the grid sequentially, write one CSV row per combo as we go.
+    """Run the grid in parallel using ProcessPoolExecutor.
 
-    Crash safety: header is written first, each combo's row is flushed before
-    the next combo begins. Partial runs are recoverable manually.
+    Each combo (fresh Quoter + ToxicityAnalyzer, no shared state) is an
+    isolated unit of work — safe to dispatch to a worker process. Market data
+    is loaded into memory before this call so no SQLite handles are pickled.
+
+    CSV is written in original combo order after all futures complete.
+    ``on_combo_done(completed, original_idx, n_combos, params, row)`` fires
+    as results arrive (completion order may differ from insertion order);
+    ``original_idx`` is the combo's position in ``config.combos()`` (0-based).
+    ``on_combo_started(original_idx, params)`` fires once per combo before
+    its worker is dispatched — useful for "running…" placeholders in UIs.
     """
     if not market_data:
         logger.warning("Grid: empty market_data, nothing to simulate")
@@ -260,30 +307,53 @@ def run_grid(
         return []
 
     n_combos = config.n_combos()
+    combos_list: List[BotParams] = list(config.combos())
+    n_workers = min(os.cpu_count() or 1, n_combos)
     logger.info(
-        "Grid: starting {} combos × {} markets, output={}",
-        n_combos, len(market_data), out_csv_path,
+        "Grid: starting {} combos × {} markets, workers={}, output={}",
+        n_combos, len(market_data), n_workers, out_csv_path,
     )
 
     write_csv_header(out_csv_path)
-    rows: List[GridRow] = []
+    ordered_rows: List[Optional[GridRow]] = [None] * n_combos
+    completed = 0
 
-    for idx, params in enumerate(config.combos(), start=1):
-        agg = simulate_combo(
-            params, market_data, base_settings, rebalance_interval_seconds,
-        )
-        row = aggregate_to_row(params, agg)
+    worker_args = [
+        (i, params, market_data, base_settings, rebalance_interval_seconds)
+        for i, params in enumerate(combos_list)
+    ]
+
+    if on_combo_started is not None:
+        for i, params in enumerate(combos_list):
+            on_combo_started(i, params)
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(_combo_worker, args): args[0]
+            for args in worker_args
+        }
+        for future in as_completed(futures):
+            original_idx, agg = future.result()
+            params = combos_list[original_idx]
+            row = aggregate_to_row(params, agg)
+            ordered_rows[original_idx] = row
+            completed += 1
+            logger.info(
+                "Grid [{}/{}] offset={} vol_max={:.1f} mp=[{:.2f},{:.2f}] "
+                "→ fills={} q={:.1f} pnl={:.2f} sharpe={:.2f}",
+                completed, n_combos,
+                params.quote_offset_ticks, params.vol_spread_multiplier_max,
+                params.midpoint_guard_min, params.midpoint_guard_max,
+                agg.fills_total, agg.realized_q_score,
+                agg.net_pnl, agg.sharpe_ratio_monthly,
+            )
+            if on_combo_done is not None:
+                on_combo_done(completed, original_idx, n_combos, params, row)
+
+    # Write CSV in original combo order after all workers complete.
+    rows: List[GridRow] = [r for r in ordered_rows if r is not None]
+    for row in rows:
         append_csv_row(out_csv_path, row)
-        rows.append(row)
-        logger.info(
-            "Grid [{}/{}] offset={} vol_max={:.1f} mp=[{:.2f},{:.2f}] "
-            "→ fills={} q={:.1f} pnl={:.2f} sharpe={:.2f}",
-            idx, n_combos,
-            params.quote_offset_ticks, params.vol_spread_multiplier_max,
-            params.midpoint_guard_min, params.midpoint_guard_max,
-            agg.fills_total, agg.realized_q_score,
-            agg.net_pnl, agg.sharpe_ratio_monthly,
-        )
 
     logger.info("Grid: done, {} rows written to {}", len(rows), out_csv_path)
     return rows

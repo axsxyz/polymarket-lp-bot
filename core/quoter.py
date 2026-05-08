@@ -140,6 +140,11 @@ class Quoter:
         # detection. Keyed by condition_id, each entry is (monotonic_ts, mid).
         self._price_history: Dict[str, Deque[Tuple[float, float]]] = {}
         self._spike_paused_until: Dict[str, float] = {}
+        # Optional cap on samples returned by _samples_in_window. Set to a
+        # small value (e.g. 150) by the backtest to avoid O(N) pstdev on
+        # deques that are fully in-window (monotonic clock barely advances).
+        # None → no cap (live bot default).
+        self._vol_max_samples: Optional[int] = None
 
     def update_scoring_rates(self, rates: dict[str, float]) -> None:
         """Update per-market scoring rates from ScoringMonitor."""
@@ -204,14 +209,26 @@ class Quoter:
         history.append((time.monotonic(), mid))
 
     def _samples_in_window(
-        self, condition_id: str, window_seconds: float,
+        self,
+        condition_id: str,
+        window_seconds: float,
+        max_samples: Optional[int] = None,
     ) -> list[float]:
-        """Return mid values within the last *window_seconds* (newest last)."""
+        """Return mid values within the last *window_seconds* (newest last).
+
+        ``max_samples`` caps the returned list to the most-recent N entries.
+        Use in the backtest (default 150) to bound pstdev cost when the
+        monotonic clock doesn't advance and the full deque is always in-window.
+        Live usage leaves ``max_samples=None`` (no cap, identical behaviour).
+        """
         history = self._price_history.get(condition_id)
         if not history:
             return []
         cutoff = time.monotonic() - window_seconds
-        return [mid for ts, mid in history if ts >= cutoff]
+        samples = [mid for ts, mid in history if ts >= cutoff]
+        if max_samples is not None and len(samples) > max_samples:
+            return samples[-max_samples:]
+        return samples
 
     def _compute_vol_multiplier(
         self, samples: list[float], tick: float,
@@ -313,7 +330,11 @@ class Quoter:
         # Fetch vol window once; reused for both YES and NO quotes so
         # _samples_in_window is not called twice per cycle.
         vol_samples: list[float] = (
-            self._samples_in_window(market.condition_id, self._s.VOL_WINDOW_SECONDS)
+            self._samples_in_window(
+                market.condition_id,
+                self._s.VOL_WINDOW_SECONDS,
+                max_samples=self._vol_max_samples,
+            )
             if self._s.QUOTE_OFFSET_TICKS > 0 else []
         )
 
@@ -370,7 +391,11 @@ class Quoter:
             # fall back to a fresh fetch when called directly (e.g. tests).
             _samples = (
                 vol_samples if vol_samples is not None
-                else self._samples_in_window(market.condition_id, self._s.VOL_WINDOW_SECONDS)
+                else self._samples_in_window(
+                    market.condition_id,
+                    self._s.VOL_WINDOW_SECONDS,
+                    max_samples=self._vol_max_samples,
+                )
             )
             vol_mult = self._compute_vol_multiplier(_samples, tick)
             tox_mult = (
