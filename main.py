@@ -1001,7 +1001,7 @@ async def main() -> None:
         await discord.send_error(f"CLOB unreachable: {exc}")
         sys.exit(1)
 
-    market_mgr = MarketManager(client, settings)
+    market_mgr = MarketManager(client, settings, discord=discord)
     quoter = Quoter(settings)
     toxicity = ToxicityAnalyzer(settings)
     quoter.attach_toxicity_analyzer(toxicity)
