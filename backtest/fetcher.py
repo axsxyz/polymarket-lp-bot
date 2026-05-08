@@ -44,7 +44,7 @@ import json
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -52,7 +52,7 @@ from typing import Any, List, Optional, Tuple
 import aiohttp
 from loguru import logger
 
-from config.markets_filter import MarketCandidate, parse_gamma_market
+from config.markets_filter import MarketCandidate, parse_gamma_market, passes_hard_filters
 
 # ──────────────────────────────────────────────────────────────────
 # Constants
@@ -84,6 +84,106 @@ GAMMA_MAX_PAGES = 20  # safety bound
 FALLBACK_MAX_SPREAD = 0.05
 FALLBACK_TICK_SIZE = "0.01"
 FALLBACK_MIN_SIZE = 5.0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Fetch-time quality filter (replicates live-bot hard filters)
+# ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class _FilterSettings:
+    """Minimal duck-type for passes_hard_filters() — never touches .env.
+
+    TOTAL_CAPITAL and MAX_MARKETS are set to values that make the
+    capital-efficiency branch non-binding in a backtest context
+    (1 000 000 / 1 → budget per market = 1 000 000, i.e. never triggers).
+    """
+
+    MIN_REWARDS_MAX_SPREAD: float = 0.0   # not exposed as CLI flag
+    MIN_END_DATE_DAYS: int = 120
+    MIDPOINT_MIN: float = 0.15
+    MIDPOINT_MAX: float = 0.85
+    MAX_24H_VOLUME: float = 800_000.0
+    MIN_24H_VOLUME: float = 500.0
+    MIN_REWARD_RATE_DAILY: float = 5.0
+    TOTAL_CAPITAL: float = 1_000_000.0
+    MAX_MARKETS: int = 1
+
+
+@dataclass
+class FetchFilter:
+    """Quality filters applied after Gamma fetch, before SQLite write.
+
+    Defaults mirror the live-bot .env values so a plain
+    ``python -m backtest.fetcher --year Y --month M`` replicates the
+    same market-quality gate as the running bot.
+    """
+
+    min_reward_rate: float = 5.0
+    midpoint_min: float = 0.15
+    midpoint_max: float = 0.85
+    min_volume: float = 500.0
+    max_volume: float = 800_000.0
+    min_end_date_days: int = 120
+    exclude_tags: List[str] = field(default_factory=list)  # already lowercased
+
+
+def _market_passes_filter(
+    market: MarketCandidate,
+    ff: Optional[FetchFilter],
+) -> bool:
+    """Return True if *market* satisfies all filters in *ff*.
+
+    Delegates to ``passes_hard_filters()`` (reuses live-bot logic verbatim)
+    then applies the optional tag-exclusion list.  Returns True
+    unconditionally when *ff* is None.
+    """
+    if ff is None:
+        return True
+    fs = _FilterSettings(
+        MIN_END_DATE_DAYS=ff.min_end_date_days,
+        MIDPOINT_MIN=ff.midpoint_min,
+        MIDPOINT_MAX=ff.midpoint_max,
+        MAX_24H_VOLUME=ff.max_volume,
+        MIN_24H_VOLUME=ff.min_volume,
+        MIN_REWARD_RATE_DAILY=ff.min_reward_rate,
+    )
+    if not passes_hard_filters(market, fs):  # type: ignore[arg-type]
+        return False
+    if ff.exclude_tags:
+        market_tags = {t.lower() for t in (market.tags or [])}
+        if market_tags.intersection(set(ff.exclude_tags)):
+            return False
+    return True
+
+
+def _load_condition_ids_from_json(path: Path) -> List[str]:
+    """Extract ``condition_id`` values from a ``selected_markets.json``-style file.
+
+    Expected format: ``[{"condition_id": "0x...", ...}, ...]``
+    Returns an empty list (never raises) on any parse/IO error.
+    """
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, list):
+            logger.warning(
+                "--condition-ids-from {}: expected JSON array, got {}",
+                path, type(data).__name__,
+            )
+            return []
+        cids = [
+            item["condition_id"]
+            for item in data
+            if isinstance(item, dict) and item.get("condition_id")
+        ]
+        logger.info("Loaded {} condition_id(s) from {}", len(cids), path)
+        return cids
+    except FileNotFoundError:
+        logger.error("--condition-ids-from: file not found: {}", path)
+        return []
+    except Exception as exc:
+        logger.error("Failed to read {}: {}", path, exc)
+        return []
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -458,6 +558,7 @@ def _fallback_market(
 
 async def _fetch_gamma_markets_for_period(
     session: aiohttp.ClientSession, year: int, month: int, n_markets: int,
+    fetch_filter: Optional[FetchFilter] = None,
 ) -> List[MarketCandidate]:
     """Paginate Gamma /markets, keep those ACTIVE during {year}-{month}.
 
@@ -496,6 +597,8 @@ async def _fetch_gamma_markets_for_period(
                 continue
             start_date = _gamma_start_date(raw)
             if start_date is not None and start_date > last_day:
+                continue
+            if not _market_passes_filter(mc, fetch_filter):
                 continue
             out.append(mc)
             if len(out) >= n_markets:
@@ -590,6 +693,7 @@ async def fetch_for_condition_ids(
     condition_ids: List[str], days: int,
     db_path: Path = DB_PATH, refresh: bool = False,
     interval: str = DEFAULT_INTERVAL,
+    fetch_filter: Optional[FetchFilter] = None,
 ) -> List[MarketCandidate]:
     """Fetch metadata + mid history for each condition_id, persist to SQLite.
 
@@ -633,6 +737,9 @@ async def fetch_for_condition_ids(
                     "Cache hit (depth ok, oldest={} <= desired_start={}): {}",
                     existing_min, desired_start_ts, cid[:16],
                 )
+                if not _market_passes_filter(cached, fetch_filter):
+                    logger.debug("Market {} skipped by filter (cached)", cid[:16])
+                    continue
                 out.append(cached)
                 continue
             else:
@@ -657,6 +764,11 @@ async def fetch_for_condition_ids(
                             cid[:16],
                         )
                         continue
+
+            # Apply quality filter BEFORE fetching history to save API calls.
+            if not _market_passes_filter(market, fetch_filter):
+                logger.debug("Market {} skipped by fetch filter", cid[:16])
+                continue
 
             yes_mids, no_mids = await _fetch_market_history(
                 session, market, fetch_start_ts, fetch_end_ts, interval,
@@ -730,29 +842,49 @@ async def fetch_markets_for_period(
     year: int, month: int, n_markets: int = 50, days: int = 30,
     db_path: Path = DB_PATH, refresh: bool = False,
     interval: str = DEFAULT_INTERVAL,
+    fetch_filter: Optional[FetchFilter] = None,
 ) -> List[MarketCandidate]:
     """Discover up to n_markets via Gamma for {year}-{month} then fetch history."""
     init_db(db_path)
     async with aiohttp.ClientSession() as session:
         markets = await _fetch_gamma_markets_for_period(
-            session, year, month, n_markets,
+            session, year, month, n_markets, fetch_filter,
         )
     if not markets:
         logger.warning("No markets discovered for {}-{:02d}", year, month)
         return []
     cids = [m.condition_id for m in markets]
-    return await fetch_for_condition_ids(cids, days, db_path, refresh, interval)
+    return await fetch_for_condition_ids(cids, days, db_path, refresh, interval, fetch_filter)
 
 
 # ──────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────
 
+def _build_fetch_filter(args: argparse.Namespace) -> FetchFilter:
+    """Build a FetchFilter from parsed CLI args."""
+    exclude = [
+        t.strip().lower()
+        for t in (args.exclude_tags or "").split(",")
+        if t.strip()
+    ]
+    return FetchFilter(
+        min_reward_rate=args.min_reward_rate,
+        midpoint_min=args.midpoint_min,
+        midpoint_max=args.midpoint_max,
+        min_volume=args.min_volume,
+        max_volume=args.max_volume,
+        min_end_date_days=args.min_end_date_days,
+        exclude_tags=exclude,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="python -m backtest.fetcher",
         description="Fetch CLOB /prices-history mids + Gamma metadata into SQLite.",
     )
+    # ── Source / time range ───────────────────────────────────────
     parser.add_argument("--year", type=int,
                         help="Filter Gamma /markets by end_date year")
     parser.add_argument("--month", type=int,
@@ -763,6 +895,9 @@ def main() -> int:
                         help="History depth in days (default 30)")
     parser.add_argument("--condition-ids", type=str, dest="condition_ids",
                         help="Comma-separated cids (bypasses --year/--month)")
+    parser.add_argument("--condition-ids-from", type=Path, dest="condition_ids_from",
+                        default=None,
+                        help="JSON file with condition_ids (e.g. data/selected_markets.json)")
     parser.add_argument("--refresh", action="store_true",
                         help="Re-fetch even if rows already in DB")
     parser.add_argument("--interval", type=str, default=DEFAULT_INTERVAL,
@@ -770,23 +905,67 @@ def main() -> int:
                         help="CLOB /prices-history interval (default 1m)")
     parser.add_argument("--db", type=Path, default=DB_PATH,
                         help="SQLite path (default data/backtest.db)")
+    # ── Quality filters (mirror live-bot hard filters) ────────────
+    parser.add_argument("--min-reward-rate", type=float, default=5.0,
+                        dest="min_reward_rate",
+                        help="Min daily reward rate USD (default 5.0)")
+    parser.add_argument("--midpoint-min", type=float, default=0.15,
+                        dest="midpoint_min",
+                        help="Min midpoint (default 0.15)")
+    parser.add_argument("--midpoint-max", type=float, default=0.85,
+                        dest="midpoint_max",
+                        help="Max midpoint (default 0.85)")
+    parser.add_argument("--min-volume", type=float, default=500.0,
+                        dest="min_volume",
+                        help="Min 24h volume USD (default 500)")
+    parser.add_argument("--max-volume", type=float, default=800_000.0,
+                        dest="max_volume",
+                        help="Max 24h volume USD (default 800000)")
+    parser.add_argument("--min-end-date-days", type=int, default=120,
+                        dest="min_end_date_days",
+                        help="Min days until resolution (default 120)")
+    parser.add_argument("--exclude-tags", type=str, default="",
+                        dest="exclude_tags",
+                        help="Comma-separated tags to exclude (e.g. politics,election)")
     args = parser.parse_args()
 
-    if args.condition_ids:
-        cids = [c.strip() for c in args.condition_ids.split(",") if c.strip()]
-        if not cids:
-            parser.error("--condition-ids was empty after splitting on comma")
+    fetch_filter = _build_fetch_filter(args)
+
+    # Resolve condition_ids: --condition-ids-from takes precedence over
+    # --condition-ids; both can be combined (union, deduplicated).
+    from_file_cids: List[str] = []
+    if args.condition_ids_from is not None:
+        from_file_cids = _load_condition_ids_from_json(args.condition_ids_from)
+        if not from_file_cids:
+            parser.error(
+                f"--condition-ids-from {args.condition_ids_from}: "
+                "no valid condition_ids found"
+            )
             return 2
+
+    inline_cids = [
+        c.strip()
+        for c in (args.condition_ids or "").split(",")
+        if c.strip()
+    ]
+
+    merged_cids = list(dict.fromkeys(from_file_cids + inline_cids))
+
+    if merged_cids:
         result = asyncio.run(fetch_for_condition_ids(
-            cids, args.days, args.db, args.refresh, args.interval,
+            merged_cids, args.days, args.db, args.refresh, args.interval,
+            fetch_filter,
         ))
     elif args.year is not None and args.month is not None:
         result = asyncio.run(fetch_markets_for_period(
             args.year, args.month, args.markets, args.days,
-            args.db, args.refresh, args.interval,
+            args.db, args.refresh, args.interval, fetch_filter,
         ))
     else:
-        parser.error("must provide --condition-ids or both --year and --month")
+        parser.error(
+            "must provide --condition-ids, --condition-ids-from, "
+            "or both --year and --month"
+        )
         return 2
 
     logger.info("Fetched {} markets into {}", len(result), args.db)
