@@ -70,6 +70,12 @@
 ## Complété
 
 ### 2026-05-08
+- [x] **fix(rewards) — LP_ESTIMATED_SHARE configurable** → `core/rewards_tracker.py` + `config/settings.py` + `.env.example`
+  - Bug audit #2 CLOSED : `/ 10.0` hardcodé → `* LP_ESTIMATED_SHARE` (défaut 0.10, `ge=0.001, le=1.0`)
+  - `format_summary` accepte `q_score_ratio: Optional[float] = None` (hook point Q-score futur)
+  - Discord label : `"Est. rewards (~{share:.0%} share): ${amount:.2f}"`
+  - 100/100 tests ✅
+
 - [x] **P2a — Dynamic spread + spike detector** → `core/quoter.py` + `main.py` + `config/settings.py` + `tests/test_quoter.py` + `.env.example`
   - Rolling-vol window (`VOL_WINDOW_SECONDS=900`) → multiplier `[0.7, 3.0]` × `QUOTE_OFFSET_TICKS` (legacy mode intact)
   - Spike detector range-based (`SPIKE_TICKS_THRESHOLD=5` / `SPIKE_DETECTION_WINDOW_SECONDS=30`) → cancel + pause `SPIKE_PAUSE_SECONDS=120` + Discord alert
