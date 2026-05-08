@@ -184,6 +184,7 @@ _hot_order_mgr: Optional[OrderManager] = None
 _hot_inventory: Optional["InventoryTracker"] = None
 _hot_quoter: Optional[Quoter] = None
 _hot_settings: Optional[Settings] = None
+_hot_discord: Optional[DiscordNotifier] = None
 
 
 async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> None:
@@ -204,6 +205,35 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
         return
 
     if _hot_quoter.is_midpoint_paused(market.condition_id):
+        return
+
+    # P2a: feed the YES-side mid into rolling history first so the spike
+    # detector and vol multiplier see the latest tick before we decide.
+    yes_mid_for_history = (
+        new_mid if token_id == market.token_id_yes else (1.0 - new_mid)
+    )
+    _hot_quoter.record_mid(market.condition_id, yes_mid_for_history)
+
+    if _hot_quoter.is_spike_paused(market.condition_id):
+        return
+
+    tick_value = {"0.1": 0.1, "0.01": 0.01, "0.001": 0.001, "0.0001": 0.0001}.get(
+        market.tick_size, 0.01,
+    )
+    is_spike, ticks_moved = _hot_quoter.evaluate_spike(
+        market.condition_id, tick_value,
+    )
+    if is_spike:
+        _hot_quoter.trigger_spike_pause(market.condition_id)
+        logger.warning(
+            "SPIKE detected cid={} ticks_moved={} (>={}) within {}s — "
+            "cancelling orders, pausing {}s",
+            market.condition_id[:12], ticks_moved,
+            _hot_settings.SPIKE_TICKS_THRESHOLD,
+            _hot_settings.SPIKE_DETECTION_WINDOW_SECONDS,
+            _hot_settings.SPIKE_PAUSE_SECONDS,
+        )
+        asyncio.create_task(_hot_spike_react(market, ticks_moved))
         return
 
     now = asyncio.get_event_loop().time()
@@ -246,6 +276,40 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
                 logger.warning("Hot-path ghost sweep: cancelled {} orphaned orders", ghosts)
         except Exception:
             pass
+
+
+async def _hot_spike_react(market, ticks_moved: int) -> None:
+    """Cancel quotes + Discord alert after a spike detection.
+
+    Detached from hot_requote so the detection path returns immediately;
+    the cancel + notify happen in the background. Cold path skips the
+    market while ``is_spike_paused`` is True (set by the caller).
+    """
+    if not _hot_order_mgr or not _hot_settings:
+        return
+    try:
+        async with _hot_order_mgr.market_lock(market.condition_id):
+            await _hot_order_mgr.cancel_orders_for_market(market.condition_id)
+    except Exception as exc:
+        logger.error(
+            "Spike cancel failed for {}: {}", market.condition_id[:12], exc,
+        )
+    if _hot_discord is not None:
+        try:
+            await _hot_discord.send_alert(
+                title="Spike Detector — Market Paused",
+                message=(
+                    f"Market `{market.condition_id[:12]}…` spike: "
+                    f"**{ticks_moved} ticks** moved within "
+                    f"{_hot_settings.SPIKE_DETECTION_WINDOW_SECONDS}s "
+                    f"(threshold {_hot_settings.SPIKE_TICKS_THRESHOLD}). "
+                    f"Quotes cancelled. Pause **{_hot_settings.SPIKE_PAUSE_SECONDS}s** — "
+                    f"vol multiplier handles progressive resume."
+                ),
+                level="warning",
+            )
+        except Exception as exc:
+            logger.debug("Spike Discord alert failed: {}", exc)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -369,6 +433,15 @@ async def run_quoting_cycle(
     midpoints = await _batch_fetch_midpoints(client, markets_this_cycle, ws_feed=ws_feed)
     inventory.update_midpoints(midpoints)
 
+    # ── Step 3a': Feed mids into quoter rolling history (P2a) ────
+    # Keeps the realised-vol window fresh even if the WS hot path is
+    # not firing (e.g. WS down, low-traffic market). No-op when mids
+    # are missing — record_mid drops out-of-band values internally.
+    for m in markets_this_cycle:
+        mid = midpoints.get(m.token_id_yes)
+        if mid is not None:
+            quoter.record_mid(m.condition_id, mid)
+
     # ── Step 3b: Feed scoring rates into quoter ─────────────────
     scoring_rates = scoring_monitor.get_all_scoring_rates()
     if scoring_rates:
@@ -466,6 +539,13 @@ async def run_quoting_cycle(
             message=f"Market `{cid[:12]}…` mid back in band — quoting resumed.",
             level="info",
         ))
+
+    # ── Step 4.6: Spike-pause skip (P2a) ─────────────────────────
+    # Hot path already cancelled the orders and triggered the pause;
+    # cold path simply skips these markets until the deadline elapses.
+    for m in markets_this_cycle:
+        if quoter.is_spike_paused(m.condition_id):
+            paused_set.add(m.condition_id)
 
     # ── Step 5: Per-market quoting (parallel with semaphore) ─────
     if markets_this_cycle:
@@ -993,7 +1073,7 @@ async def main() -> None:
     )
 
     # ── WebSocket feed (event-driven quoting) ────────────────────
-    global _ws_feed, _hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings
+    global _ws_feed, _hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings, _hot_discord
     ws_feed: Optional[WebSocketFeed] = None
 
     if settings.WS_ENABLED:
@@ -1004,6 +1084,7 @@ async def main() -> None:
         _hot_inventory = inventory
         _hot_quoter = quoter
         _hot_settings = settings
+        _hot_discord = discord
 
         token_ids = []
         tick_sizes: Dict[str, float] = {}

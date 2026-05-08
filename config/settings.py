@@ -85,6 +85,20 @@ class Settings(BaseSettings):
     MIDPOINT_GUARD_MIN: float = Field(default=0.18, ge=0.0, le=0.5)
     MIDPOINT_GUARD_MAX: float = Field(default=0.82, ge=0.5, le=1.0)
     MIDPOINT_GUARD_CYCLES: int = Field(default=3, ge=1, le=20)
+
+    # ── Volatility & Spike Detection ────────────────────────────────
+    # Rolling-window realised volatility drives a multiplier on
+    # QUOTE_OFFSET_TICKS so the spread tightens in calm books and widens
+    # in volatile ones. Spike detector triggers a hard pause when the
+    # mid moves >= SPIKE_TICKS_THRESHOLD ticks inside the detection
+    # window (range, not net move — captures pumps and reversals).
+    VOL_WINDOW_SECONDS: int = Field(default=900, ge=60, le=3600)
+    VOL_SPREAD_MULTIPLIER_MIN: float = Field(default=0.7, ge=0.1, le=2.0)
+    VOL_SPREAD_MULTIPLIER_MAX: float = Field(default=3.0, ge=1.0, le=10.0)
+    SPIKE_TICKS_THRESHOLD: int = Field(default=5, ge=1, le=50)
+    SPIKE_DETECTION_WINDOW_SECONDS: int = Field(default=30, ge=5, le=300)
+    SPIKE_PAUSE_SECONDS: int = Field(default=120, ge=10, le=3600)
+
     PREFERRED_TAGS: Annotated[List[str], NoDecode] = Field(
         default=[
             "politics",
