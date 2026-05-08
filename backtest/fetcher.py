@@ -63,12 +63,16 @@ CLOB_BASE = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
 DEFAULT_INTERVAL = "1m"
-DEFAULT_FIDELITY = 1
+DEFAULT_FIDELITY = 10
 BATCH_HISTORY_MAX = 20
 
-COVERAGE_GAP_THRESHOLD_S = 300       # gaps > 5min count against coverage
+# Coverage constants are calibrated for fidelity=10 on a 1m interval:
+# expected cadence = DEFAULT_FIDELITY × 60s = 600s per sample.
+# A "gap" is anything more than 3× the normal cadence (30 min).
+# Adjust these if DEFAULT_FIDELITY or DEFAULT_INTERVAL changes.
+COVERAGE_NORMAL_INTERVAL_S = DEFAULT_FIDELITY * 60   # 600s (one per 10 min)
+COVERAGE_GAP_THRESHOLD_S = 3 * COVERAGE_NORMAL_INTERVAL_S  # 1800s (30 min)
 COVERAGE_THRESHOLD_PCT = 0.80
-COVERAGE_NORMAL_INTERVAL_S = 60      # expected sample interval (1m)
 
 # CLOB documented limit ~1.67 RPS; we stay below at ~1.4 RPS.
 HTTP_RATE_LIMIT_SLEEP_S = 0.7
@@ -533,8 +537,6 @@ async def _fetch_batch_prices_history(
             session, f"{CLOB_BASE}/batch-prices-history",
             {
                 "markets": chunk,
-                "start_ts": start_ts,
-                "end_ts": end_ts,
                 "interval": interval,
                 "fidelity": fidelity,
             },
@@ -542,6 +544,7 @@ async def _fetch_batch_prices_history(
         if not payload:
             await asyncio.sleep(HTTP_RATE_LIMIT_SLEEP_S)
             continue
+        # Response shape: {"history": {token_id: [{t: unix_ts, p: price}, ...]}}
         history = payload.get("history", {}) or {}
         for tid, points in history.items():
             if not isinstance(points, list):
@@ -551,7 +554,16 @@ async def _fetch_batch_prices_history(
                 if not isinstance(pt, dict):
                     continue
                 try:
-                    parsed.append((int(pt["t"]), float(pt["p"])))
+                    ts_raw = pt.get("t") or pt.get("ts")
+                    p_raw = pt.get("p") or pt.get("price")
+                    if ts_raw is None or p_raw is None:
+                        continue
+                    # Filter to [start_ts, end_ts] since the endpoint ignores
+                    # start/end in flat mode — we trim client-side instead.
+                    ts_int = int(ts_raw)
+                    if not (start_ts <= ts_int <= end_ts):
+                        continue
+                    parsed.append((ts_int, float(p_raw)))
                 except (KeyError, TypeError, ValueError):
                     continue
             out[str(tid)] = parsed
