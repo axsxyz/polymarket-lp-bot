@@ -9,6 +9,8 @@ data/selected_markets.json
 data/trade_watermark.json
 data/rewards_history.json
 data/airdrop_metrics.json
+data/backtest.db
+data/backtest_results.csv
 .venv/
 venv/
 *.egg-info/

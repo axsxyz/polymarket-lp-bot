@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08** (P2b toxicity analyzer — commit `678d6b5`).
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08** (P2c backtest framework).
 
 ---
 
@@ -56,7 +56,9 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 | Fichier | Changement |
 |---------|------------|
-| **2026-05-08** | |
+| **2026-05-08 (P2c)** | |
+| `backtest/__init__.py` + `backtest/fetcher.py` + `backtest/simulator.py` + `backtest/metrics.py` + `backtest/grid_search.py` + `backtest/run.py` + `tests/test_simulator.py` + `tests/test_metrics.py` + `.gitignore` | **P2c done** : framework backtest standalone (zéro import `main.py`, zéro CLOB live). **fetcher** = CLOB `/batch-prices-history` + Gamma `/markets` → SQLite (`data/backtest.db`), idempotent INSERT OR IGNORE, delta-backfill cache, filtre "active during month" `start_date <= last_day AND end_date >= first_day`, coverage flag (gap > 5min → `low_coverage=1`). **simulator** = replay Quoter+ToxicityAnalyzer+midpoint guard sur tape mid YES, modèle naïf maker (BID YES si `min_yes <= bid_price`, etc.). Fidélité documentée : Quoter.compute 1:1, midpoint guard 1:1 (cycle-counter), VPIN 1:1 (deque-count). Dégradations : fill-vs-mid neutre (monotonic n'avance pas), vol multiplier collapse (window= deque maxlen=3000), spike non-déclenché. `allocated_capital` auto-dérivé `Settings.TOTAL_CAPITAL / MAX_MARKETS` clampé `[MIN, MAX]_CAPITAL_PER_MARKET`. Lookahead horizons strict `±tolerance` (T1MIN=30s, T5MIN=60s). **metrics** = Q-score (((v−s)/v)²×size), théorique max `2 × ((v−tick)/v)² × min_size × n_quoting_cycles` (per user spec), adverse selection `mid_t5min vs fill_price` per side, signed PnL close-at-mid_t5min, daily PnLs UTC, Sharpe portfolio-level (sum daily across markets BEFORE recompute, `× sqrt(30)`). **grid** = 36 combos (4 × 3 × 3 ; `VPIN_THRESHOLD` DROPPED — modèle de fill paired BID+ASK structurellement, VPIN imbalance impossible — documenté `TestVpinSymmetry`). `--quick` mode = 4 combos. `simulate_combo` isolé prêt pour `ProcessPoolExecutor`. CSV append-mode crash-safe. **run** CLI `python -m backtest.run [--quick|--all|--year/--month|--condition-ids ...] [--days N] [--skip-low-coverage]`. **174/174 tests** ✅ (132 + 18 simulator + 24 metrics) |
+| **2026-05-08 (P2b)** | |
 | `core/toxicity_analyzer.py` (nouveau, 348 LOC) + `core/quoter.py` + `main.py` + `config/settings.py` + `tests/test_toxicity_analyzer.py` (32 tests) + `tests/test_quoter.py` + `.env.example` | **P2b done** (commit `678d6b5`) : ToxicityAnalyzer VPIN + fill-vs-mid. VPIN = `|buys−sells|/N` rolling fenêtre `VPIN_WINDOW_FILLS=50` → multiplicateur linéaire `[1.0, 2.5]` au-dessus de `VPIN_THRESHOLD=0.70` ; pause hard `TOXICITY_PAUSE_SECONDS=180` au-dessus de `VPIN_PAUSE_THRESHOLD=0.85`. Fill-vs-mid = drift adverse (en ticks, clamp ≥0) aux horizons +5s/+30s/+5min pondérés 0.2/0.3/0.5. Les deux signaux composés via `max()` → `tox_mult` multiplié par `vol_mult` dans `Quoter._compute_offset`. Cold-cycle uniquement, zéro appel API. `ADVERSE_FILL_RATE_THRESHOLD` retiré. Step 4.7 toxicity guard dans `main.py` (pause-on-transition + cancel orders + Discord `warning`). **132/132 tests** ✅ |
 | `config/settings.py` + `core/quoter.py` + `main.py` + `tests/test_quoter.py` + `.env.example` | **P2a done** : dynamic spread basé vol réalisée + spike detector. `Quoter._price_history` (rolling deque par cid) alimenté par hot WS path ET cold cycle ; `_compute_vol_multiplier()` mappe stdev (en ticks) sur `[VOL_SPREAD_MULTIPLIER_MIN=0.7, MAX=3.0]` appliqué à `QUOTE_OFFSET_TICKS` (legacy mode `QUOTE_OFFSET_TICKS=0` intact). Spike detector (`evaluate_spike` range-based sur 30s/5 ticks) → `trigger_spike_pause` 120s + cancel + Discord alert `warning`. Reprise progressive automatique via vol_mult restant élevé après spike. Velocity guard `ws_feed.py:_check_velocity` préservé tel quel (3 échelles disjointes : 5s/30s/15min). 100/100 tests ✅ |
 | **2026-05-05** | |
@@ -113,9 +115,12 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 - **Terminé** au 2026-05-08 (commit `678d6b5`).
 - `core/toxicity_analyzer.py` créé (348 LOC). VPIN + fill-vs-mid. `ADVERSE_FILL_RATE_THRESHOLD` retiré. 32 nouveaux tests. 132/132 total.
 
-### P2c — Backtest framework (prochain chantier)
-- **Fichiers** : `backtest/` (à créer)
-- **Acceptance** : fetch historique Gamma `/trades` API → replay fills simulés → calcul Q-score réalisé vs max théorique, PnL, Sharpe → grid search `tightness_factor`, `offset_ticks`, `size_multiplier`, `VOL_WINDOW_SECONDS`.
+### P2c — Backtest framework
+- **Terminé** au 2026-05-08.
+- `backtest/` créé (6 modules, 174/174 tests verts).
+- Source de données : CLOB `/prices-history` (mid 1m granularity) + Gamma `/markets` → SQLite, pas de `/trades` (data-api privé/user-scoped).
+- Limite identifiée : modèle de fill naïf produit fills BID+ASK paired → VPIN imbalance ≈ 0 → `VPIN_THRESHOLD` retiré du grid (36 combos au lieu de 108). Documenté `TestVpinSymmetry`.
+- Workflow : `python -m backtest.fetcher --year YYYY --month MM` → DB ; `python -m backtest.run [--quick|--all]` → CSV `data/backtest_results.csv`.
 
 ---
 
@@ -124,7 +129,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 ### Tier 1 — Impact 2-3× sur les retours
 1. ~~**`core/toxicity_analyzer.py`**~~ **FAIT P2b** — VPIN + fill-vs-mid scoring
 2. **`core/resolution_guard.py`** — midpoint ongoing + max-loss calculator + auto-delist >15 % en 24h
-3. **`backtest/`** — replay orderbook historique Gamma `/trades`, grid search params, Q-score réalisé vs max
+3. ~~**`backtest/`**~~ **FAIT P2c** — CLOB `/prices-history` + Gamma `/markets` → SQLite ; grid search 36 combos, Q-score réalisé vs max théorique, PnL, Sharpe portfolio-level
 
 ### Tier 2 — Impact 1.5-2× sur les retours
 4. Market-specific strategy profiles (tightness adaptée par marché)
