@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08** (LP_ESTIMATED_SHARE fix).
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08** (P2b toxicity analyzer — commit `678d6b5`).
 
 ---
 
@@ -10,7 +10,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 - **Langage** : Python 3.12, asyncio (single process).
 - **Dépendances clés** : `py-clob-client==0.34.6`, `web3==7.14.1`, `aiohttp==3.13.3`, `websockets==15.0.1`, `loguru==0.7.3`, `pydantic-settings==2.13.1`.
-- **Structure** : `main.py` (~1003 LOC orchestrateur), `core/` (client, quoter, order_manager, inventory, fill_collector, scoring_monitor, rewards_tracker, ws_feed, market_manager, inventory_seeder), `config/` (settings, markets_filter), `utils/`, `scripts/`, `tests/`.
+- **Structure** : `main.py` (~1218 LOC orchestrateur), `core/` (client, quoter, order_manager, inventory, fill_collector, scoring_monitor, rewards_tracker, ws_feed, market_manager, inventory_seeder, **toxicity_analyzer**), `config/` (settings, markets_filter), `utils/`, `scripts/`, `tests/`.
 - **Entrée** : `python main.py`.
 
 ### ⚠️ Modules qui N'EXISTENT PAS (doc stale — ne jamais référencer)
@@ -57,6 +57,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 | Fichier | Changement |
 |---------|------------|
 | **2026-05-08** | |
+| `core/toxicity_analyzer.py` (nouveau, 348 LOC) + `core/quoter.py` + `main.py` + `config/settings.py` + `tests/test_toxicity_analyzer.py` (32 tests) + `tests/test_quoter.py` + `.env.example` | **P2b done** (commit `678d6b5`) : ToxicityAnalyzer VPIN + fill-vs-mid. VPIN = `|buys−sells|/N` rolling fenêtre `VPIN_WINDOW_FILLS=50` → multiplicateur linéaire `[1.0, 2.5]` au-dessus de `VPIN_THRESHOLD=0.70` ; pause hard `TOXICITY_PAUSE_SECONDS=180` au-dessus de `VPIN_PAUSE_THRESHOLD=0.85`. Fill-vs-mid = drift adverse (en ticks, clamp ≥0) aux horizons +5s/+30s/+5min pondérés 0.2/0.3/0.5. Les deux signaux composés via `max()` → `tox_mult` multiplié par `vol_mult` dans `Quoter._compute_offset`. Cold-cycle uniquement, zéro appel API. `ADVERSE_FILL_RATE_THRESHOLD` retiré. Step 4.7 toxicity guard dans `main.py` (pause-on-transition + cancel orders + Discord `warning`). **132/132 tests** ✅ |
 | `config/settings.py` + `core/quoter.py` + `main.py` + `tests/test_quoter.py` + `.env.example` | **P2a done** : dynamic spread basé vol réalisée + spike detector. `Quoter._price_history` (rolling deque par cid) alimenté par hot WS path ET cold cycle ; `_compute_vol_multiplier()` mappe stdev (en ticks) sur `[VOL_SPREAD_MULTIPLIER_MIN=0.7, MAX=3.0]` appliqué à `QUOTE_OFFSET_TICKS` (legacy mode `QUOTE_OFFSET_TICKS=0` intact). Spike detector (`evaluate_spike` range-based sur 30s/5 ticks) → `trigger_spike_pause` 120s + cancel + Discord alert `warning`. Reprise progressive automatique via vol_mult restant élevé après spike. Velocity guard `ws_feed.py:_check_velocity` préservé tel quel (3 échelles disjointes : 5s/30s/15min). 100/100 tests ✅ |
 | **2026-05-05** | |
 | `core/quoter.py:108-145` | `feat(quoter)` midpoint guard continu : `evaluate_midpoint_guard()` + `is_midpoint_paused()`, pause après 3 cycles hors bande `[0.18, 0.82]`, seuils configurables via `.env` |
@@ -108,16 +109,20 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 ### P2a — Dynamic spread + spike detector
 - **Terminé** au 2026-05-08. Vol multiplier rolling 15min + spike pause 30s/5 ticks + 6 nouveaux env vars + 13 nouveaux tests.
 
-### P2b — Toxicity analyzer (prochain chantier)
-- **Fichiers** : `core/toxicity_analyzer.py` (à créer)
-- **Acceptance** : VPIN buy/sell imbalance + fill-vs-mid scoring → remplace le `_fill_rates` blunt instrument actuel dans `quoter._compute_offset`.
+### P2b — Toxicity analyzer
+- **Terminé** au 2026-05-08 (commit `678d6b5`).
+- `core/toxicity_analyzer.py` créé (348 LOC). VPIN + fill-vs-mid. `ADVERSE_FILL_RATE_THRESHOLD` retiré. 32 nouveaux tests. 132/132 total.
+
+### P2c — Backtest framework (prochain chantier)
+- **Fichiers** : `backtest/` (à créer)
+- **Acceptance** : fetch historique Gamma `/trades` API → replay fills simulés → calcul Q-score réalisé vs max théorique, PnL, Sharpe → grid search `tightness_factor`, `offset_ticks`, `size_multiplier`, `VOL_WINDOW_SECONDS`.
 
 ---
 
 ## 7. Roadmap P3 (chantiers structurants, ANALYSIS.md)
 
 ### Tier 1 — Impact 2-3× sur les retours
-1. **`core/toxicity_analyzer.py`** — VPIN + fill-vs-mid scoring + corrélation marchés liés
+1. ~~**`core/toxicity_analyzer.py`**~~ **FAIT P2b** — VPIN + fill-vs-mid scoring
 2. **`core/resolution_guard.py`** — midpoint ongoing + max-loss calculator + auto-delist >15 % en 24h
 3. **`backtest/`** — replay orderbook historique Gamma `/trades`, grid search params, Q-score réalisé vs max
 
