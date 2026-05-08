@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08**.
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08** (LP_ESTIMATED_SHARE fix).
 
 ---
 
@@ -45,7 +45,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 | Fichier:ligne | Problème | Statut |
 |---------------|----------|--------|
 | `main.py:866-876` | `pos.yes_cost/no_cost` initialisés avec `bal * mid` au lieu du prix seed réel → PnL biaisé | **FIXÉ 2026-05-05** : seed cost basis réel depuis `core/inventory_seeder.py` |
-| `rewards_tracker.py:274` | `estimated_rewards_usd / 10.0` hardcodé | NON FIXÉ |
+| `rewards_tracker.py:298` | `estimated_rewards_usd / 10.0` hardcodé | **FIXÉ 2026-05-08** — remplacé par `* LP_ESTIMATED_SHARE` (configurable, défaut 0.10) ; `format_summary` accepte `q_score_ratio: Optional[float]` pour override futur |
 | `config/settings.py:66` | `API_RATE_LIMIT_RPS` dépassait le plafond CLOB | **FIXÉ 2026-05-04** : 5.0 → 1.5 |
 | `main.py:977` | Sleep cycle sans jitter | **FIXÉ 2026-05-04** : `+random.uniform(-2.0, 2.0)` |
 | `core/inventory.py` + `main.py` | Circuit breaker drawdown journalier absent | **FIXÉ 2026-05-05** : `DAILY_DRAWDOWN_LIMIT_PCT=0.05`, pause globale + alerte Discord `critical`, reset minuit UTC |

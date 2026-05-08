@@ -293,14 +293,21 @@ class RewardsTracker:
     # Reporting helpers
     # ------------------------------------------------------------------
 
-    def format_summary(self, snapshot: DailySnapshot) -> str:
+    def format_summary(
+        self, snapshot: DailySnapshot, q_score_ratio: Optional[float] = None
+    ) -> str:
         """Build a human-readable summary string for Discord."""
-        estimated_share = snapshot.estimated_rewards_usd / 10.0
+        share = (
+            q_score_ratio
+            if (q_score_ratio is not None and q_score_ratio > 0)
+            else self._s.LP_ESTIMATED_SHARE
+        )
+        estimated_share = snapshot.estimated_rewards_usd * share
         lines = [
             f"**Daily LP Summary — {snapshot.date}**",
             "",
             f"Total reward pool (all LPs): **${snapshot.estimated_rewards_usd:.2f}**",
-            f"Est. your share (~1/10 of LPs): **${estimated_share:.2f}**",
+            f"Est. rewards (~{share:.0%} share): **${estimated_share:.2f}**",
             f"Realised PnL (cost-basis): **${snapshot.realised_pnl_usd:.2f}**",
             f"Total fills: {snapshot.total_fills}",
             f"Active markets: {snapshot.markets_active}",
