@@ -1,22 +1,5 @@
 # LP Bot — Active Tasks
 
-## P2b — Toxicity analyzer (priorité critique)
-- [x] **`core/toxicity_analyzer.py`** — Adverse selection defense ✅ complété (2026-05-08)
-  - **VPIN** : buy/sell imbalance sur fenêtre glissante → widen spread si élevé
-  - **Fill-vs-mid** : comparer fill price vs mid à +5s / +30s / +5min → score de toxicité continu
-  - Remplace `_fill_rates` blunt instrument actuel dans `core/quoter.py`
-  - Seuils configurables : `TOXICITY_VPIN_THRESHOLD`, `TOXICITY_FILL_WINDOW_SECONDS`
-  - *(corrélation cross-market déplacée en P4 — complexité élevée, gain marginal)*
-
-## P2c — Backtest framework (validation params)
-- [x] **`backtest/`** — Backtesting framework sur données historiques CLOB/Gamma ✅ complété (2026-05-08)
-  - Fetch historique via CLOB `/prices-history` + metadata Gamma `/markets`
-  - Replay fills simulés par placement d'ordre
-  - Calcul Q-score réalisé vs théorique max, PnL, Sharpe
-  - Grid search : `QUOTE_OFFSET_TICKS`, `VOL_SPREAD_MULTIPLIER_MAX`, `MIDPOINT_GUARD_MIN/MAX` (+ mode `--quick`)
-  - Objectif : valider empiriquement tous les paramètres actuellement arbitraires
-  - Ref ROADMAP P5-1 — levier le plus haut pour optimisation params
-
 ## P2d — Resolution guard complet
 - [ ] **`core/resolution_guard.py`** — Resolution risk manager
   - Max-loss calculator par marché : `max(yes_size, no_size) × 1.0` → pause si > seuil
