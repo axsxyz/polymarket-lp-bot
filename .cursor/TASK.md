@@ -1,7 +1,7 @@
 # LP Bot — Active Tasks
 
 ## P2b — Toxicity analyzer (priorité critique)
-- [ ] **`core/toxicity_analyzer.py`** — Adverse selection defense
+- [x] **`core/toxicity_analyzer.py`** — Adverse selection defense ✅ complété (2026-05-08)
   - **VPIN** : buy/sell imbalance sur fenêtre glissante → widen spread si élevé
   - **Fill-vs-mid** : comparer fill price vs mid à +5s / +30s / +5min → score de toxicité continu
   - Remplace `_fill_rates` blunt instrument actuel dans `core/quoter.py`
@@ -9,11 +9,11 @@
   - *(corrélation cross-market déplacée en P4 — complexité élevée, gain marginal)*
 
 ## P2c — Backtest framework (validation params)
-- [ ] **`backtest/`** — Backtesting framework sur données historiques Gamma
-  - Fetch historique via Gamma `/trades` API
+- [x] **`backtest/`** — Backtesting framework sur données historiques CLOB/Gamma ✅ complété (2026-05-08)
+  - Fetch historique via CLOB `/prices-history` + metadata Gamma `/markets`
   - Replay fills simulés par placement d'ordre
   - Calcul Q-score réalisé vs théorique max, PnL, Sharpe
-  - Grid search : `tightness_factor`, `offset_ticks`, `size_multiplier`, `VOL_WINDOW_SECONDS`
+  - Grid search : `QUOTE_OFFSET_TICKS`, `VOL_SPREAD_MULTIPLIER_MAX`, `MIDPOINT_GUARD_MIN/MAX` (+ mode `--quick`)
   - Objectif : valider empiriquement tous les paramètres actuellement arbitraires
   - Ref ROADMAP P5-1 — levier le plus haut pour optimisation params
 
@@ -70,6 +70,15 @@
 ## Complété
 
 ### 2026-05-08
+- [x] **P2c — Backtest framework standalone** → `backtest/` + `tests/test_simulator.py` + `tests/test_metrics.py`
+  - Fetcher SQLite idempotent (CLOB `/prices-history` + Gamma `/markets`) avec delta-backfill et flag `low_coverage`
+  - Simulator replay (`Quoter` + `ToxicityAnalyzer` + midpoint guard), metrics (Q-score/PnL/Sharpe), grid search (full + `--quick`) et CLI `python -m backtest.run`
+  - 174/174 tests ✅
+
+- [x] **P2b — Toxicity analyzer** → `core/toxicity_analyzer.py` + `core/quoter.py` + `main.py` + tests
+  - VPIN + fill-vs-mid score, spread multiplier défensif, pause toxicité et intégration cold-cycle
+  - 132/132 tests ✅
+
 - [x] **fix(rewards) — LP_ESTIMATED_SHARE configurable** → `core/rewards_tracker.py` + `config/settings.py` + `.env.example`
   - Bug audit #2 CLOSED : `/ 10.0` hardcodé → `* LP_ESTIMATED_SHARE` (défaut 0.10, `ge=0.001, le=1.0`)
   - `format_summary` accepte `q_score_ratio: Optional[float] = None` (hook point Q-score futur)
