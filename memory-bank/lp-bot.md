@@ -116,11 +116,14 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 - `core/toxicity_analyzer.py` créé (348 LOC). VPIN + fill-vs-mid. `ADVERSE_FILL_RATE_THRESHOLD` retiré. 32 nouveaux tests. 132/132 total.
 
 ### P2c — Backtest framework
-- **Terminé** au 2026-05-08.
+- **DONE** au 2026-05-08 (commit `72f04b1`).
 - `backtest/` créé (6 modules, 174/174 tests verts).
 - Source de données : CLOB `/prices-history` (mid 1m granularity) + Gamma `/markets` → SQLite, pas de `/trades` (data-api privé/user-scoped).
 - Limite identifiée : modèle de fill naïf produit fills BID+ASK paired → VPIN imbalance ≈ 0 → `VPIN_THRESHOLD` retiré du grid (36 combos au lieu de 108). Documenté `TestVpinSymmetry`.
 - Workflow : `python -m backtest.fetcher --year YYYY --month MM` → DB ; `python -m backtest.run [--quick|--all]` → CSV `data/backtest_results.csv`.
+
+### Prochain (P2d) — Resolution guard complet
+- `core/resolution_guard.py` : max-loss calculator + auto-delist sur move 24h.
 
 ---
 
