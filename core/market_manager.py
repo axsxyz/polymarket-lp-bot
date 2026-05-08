@@ -20,7 +20,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiohttp
 from loguru import logger
@@ -34,6 +34,9 @@ from config.markets_filter import (
 from config.settings import Settings
 from core.client import AsyncClobClient
 
+if TYPE_CHECKING:
+    from utils.discord import DiscordNotifier
+
 CACHE_PATH = Path("data/selected_markets.json")
 TOP_TIER_COUNT = 15
 TOP_TIER_BOOST = 1.25  # top markets get 25% more capital
@@ -42,9 +45,15 @@ TOP_TIER_BOOST = 1.25  # top markets get 25% more capital
 class MarketManager:
     """Owns the list of active markets and their capital allocations."""
 
-    def __init__(self, client: AsyncClobClient, settings: Settings) -> None:
+    def __init__(
+        self,
+        client: AsyncClobClient,
+        settings: Settings,
+        discord: Optional["DiscordNotifier"] = None,
+    ) -> None:
         self._client = client
         self._settings = settings
+        self._discord = discord
         self._markets: List[MarketCandidate] = []
         self._token_index: Dict[str, MarketCandidate] = {}
         self._last_refresh: Optional[datetime] = None
@@ -64,6 +73,11 @@ class MarketManager:
     async def refresh(self) -> List[MarketCandidate]:
         """Full refresh: fetch → enrich → filter → allocate → cache."""
         logger.info("Refreshing market universe …")
+
+        # Snapshot previous selection for diff (boot: empty unless cache loaded)
+        prev_selection: Dict[str, MarketCandidate] = {
+            m.condition_id: m for m in self._markets
+        }
 
         clob_markets = await self._fetch_clob_sampling_markets()
         logger.info("Fetched {} reward-eligible markets from CLOB", len(clob_markets))
@@ -93,6 +107,8 @@ class MarketManager:
         self._last_refresh = datetime.now(timezone.utc)
         self._save_cache()
 
+        self._log_selection_details(prev_selection)
+
         # Sync CONDITIONAL (ERC1155) per token so the CLOB accepts ASK orders
         token_ids = list(
             {m.token_id_yes for m in ranked if m.token_id_yes}
@@ -101,6 +117,77 @@ class MarketManager:
         await self._client.sync_conditional_allowances(token_ids)
 
         return self._markets
+
+    def _log_selection_details(
+        self, prev_selection: Dict[str, MarketCandidate]
+    ) -> None:
+        """Log each selected market in detail and emit IN/OUT diff vs the
+        previous selection.
+
+        - Always logs the full selected list (one line per market) so we can
+          tell from the logs which markets are quoted.
+        - Computes IN/OUT diff against `prev_selection` (empty on cold boot).
+        - Sends a Discord 'info' alert when the selection actually changed
+          (skipped when there's no prior state, to avoid spam at startup).
+        """
+        new_cids = {m.condition_id for m in self._markets}
+
+        logger.info("Selected markets ({}):", len(self._markets))
+        for m in self._markets:
+            q = (m.question or "")[:50]
+            logger.info(
+                "  • {} | cid={} | alloc=${:.2f} | reward=${:.1f}/day",
+                q, m.condition_id[:12], m.allocated_capital, m.reward_rate_daily,
+            )
+
+        if not prev_selection:
+            return  # No prior state — skip diff and Discord notification
+
+        went_in = [m for m in self._markets if m.condition_id not in prev_selection]
+        went_out = [
+            prev_selection[cid]
+            for cid in prev_selection
+            if cid not in new_cids
+        ]
+
+        for m in went_in:
+            q = (m.question or "")[:50]
+            logger.info("Market IN:  {} ({})", q, m.condition_id[:12])
+        for m in went_out:
+            q = (m.question or "")[:50]
+            logger.info("Market OUT: {} ({})", q, m.condition_id[:12])
+
+        if (went_in or went_out) and self._discord is not None:
+            in_lines = [
+                f"• {(m.question or '')[:60]} (`{m.condition_id[:10]}…`)"
+                for m in went_in
+            ]
+            out_lines = [
+                f"• {(m.question or '')[:60]} (`{m.condition_id[:10]}…`)"
+                for m in went_out
+            ]
+            fields: List[Dict[str, str]] = []
+            if in_lines:
+                fields.append({
+                    "name": f"IN ({len(in_lines)})",
+                    "value": "\n".join(in_lines[:10]),
+                    "inline": False,
+                })
+            if out_lines:
+                fields.append({
+                    "name": f"OUT ({len(out_lines)})",
+                    "value": "\n".join(out_lines[:10]),
+                    "inline": False,
+                })
+            asyncio.create_task(self._discord.send_alert(
+                title="Market selection changed",
+                message=(
+                    f"Active markets: {len(self._markets)} "
+                    f"(was {len(prev_selection)})"
+                ),
+                level="info",
+                fields=fields,
+            ))
 
     def get_market_by_condition(self, condition_id: str) -> Optional[MarketCandidate]:
         for m in self._markets:
