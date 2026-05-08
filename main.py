@@ -37,6 +37,7 @@ from core.quoter import Quoter, TwoSidedQuotes
 from core.rewards_tracker import RewardsTracker
 from core.inventory_seeder import InventorySeeder
 from core.scoring_monitor import ScoringMonitor
+from core.toxicity_analyzer import ToxicityAnalyzer
 from core.ws_feed import WebSocketFeed
 from utils.discord import DiscordNotifier
 from utils.helpers import seconds_until_midnight_utc
@@ -320,26 +321,6 @@ async def _hot_spike_react(market, ticks_moved: int) -> None:
 _MAX_NOTIFIED_ORDERS = 1000
 _notified_orders: collections.OrderedDict = collections.OrderedDict()
 
-# Rolling fill counter for adverse-selection detection
-_fill_timestamps: Dict[str, list] = collections.defaultdict(list)
-
-
-def _update_fill_rates(new_fills: list, quoter: Quoter) -> None:
-    """Track fills-per-hour per market and push rates to the quoter."""
-    import time as _time
-    now = _time.time()
-    one_hour_ago = now - 3600
-
-    for f in new_fills:
-        _fill_timestamps[f.condition_id].append(now)
-
-    rates: Dict[str, float] = {}
-    for cid, timestamps in list(_fill_timestamps.items()):
-        _fill_timestamps[cid] = [t for t in timestamps if t > one_hour_ago]
-        rates[cid] = float(len(_fill_timestamps[cid]))
-
-    if rates:
-        quoter.update_fill_rates(rates)
 
 async def run_quoting_cycle(
     market_mgr: MarketManager,
@@ -350,6 +331,7 @@ async def run_quoting_cycle(
     fill_collector: FillCollector,
     discord: DiscordNotifier,
     scoring_monitor: ScoringMonitor,
+    toxicity: ToxicityAnalyzer,
     settings: Settings,
     cycle_index: int = 0,
     skip_cids: set | None = None,
@@ -386,11 +368,9 @@ async def run_quoting_cycle(
             inventory.record_fills(new_fills)
         for f in new_fills:
             filled_cids.add(f.condition_id)
+            toxicity.record_fill(f)
             asyncio.create_task(discord.send_fill(f.condition_id, f.side, f.price, f.filled_size))
         logger.info("Recorded {} fills into inventory", len(new_fills))
-
-    # Compute fills-per-hour per market for adverse-selection widening
-    _update_fill_rates(new_fills, quoter)
 
     # ── Step 1b: Daily drawdown circuit breaker ──────────────────
     global _drawdown_alert_sent
@@ -433,14 +413,16 @@ async def run_quoting_cycle(
     midpoints = await _batch_fetch_midpoints(client, markets_this_cycle, ws_feed=ws_feed)
     inventory.update_midpoints(midpoints)
 
-    # ── Step 3a': Feed mids into quoter rolling history (P2a) ────
-    # Keeps the realised-vol window fresh even if the WS hot path is
-    # not firing (e.g. WS down, low-traffic market). No-op when mids
-    # are missing — record_mid drops out-of-band values internally.
+    # ── Step 3a': Feed mids into quoter + toxicity rolling histories ──
+    # Keeps the realised-vol window (P2a) and fill-vs-mid lookback (P2b)
+    # fresh even if the WS hot path is not firing (e.g. WS down, low-
+    # traffic market). No-op when mids are missing — both record_mid
+    # impls drop out-of-band values internally.
     for m in markets_this_cycle:
         mid = midpoints.get(m.token_id_yes)
         if mid is not None:
             quoter.record_mid(m.condition_id, mid)
+            toxicity.record_mid(m.condition_id, mid)
 
     # ── Step 3b: Feed scoring rates into quoter ─────────────────
     scoring_rates = scoring_monitor.get_all_scoring_rates()
@@ -546,6 +528,51 @@ async def run_quoting_cycle(
     for m in markets_this_cycle:
         if quoter.is_spike_paused(m.condition_id):
             paused_set.add(m.condition_id)
+
+    # ── Step 4.7: Toxicity guard (P2b) ───────────────────────────
+    # evaluate() resolves pending fill-vs-mid horizons, refreshes the
+    # rolling toxicity score, and may trip the VPIN pause when imbalance
+    # is extreme. Pattern mirrors Step 4.5 midpoint guard for the entry
+    # transition (cancel + Discord alert), and Step 4.6 spike pause for
+    # the silent auto-recovery (deadline-based, no Discord on resume).
+    tox_newly_paused: list[tuple[str, float]] = []
+    for m in markets_this_cycle:
+        tick = {"0.1": 0.1, "0.01": 0.01, "0.001": 0.001, "0.0001": 0.0001}.get(
+            m.tick_size, 0.01
+        )
+        was_paused = toxicity.is_toxic_paused(m.condition_id)
+        toxicity.evaluate(m.condition_id, tick)
+        if toxicity.is_toxic_paused(m.condition_id):
+            paused_set.add(m.condition_id)
+            if not was_paused:
+                tox_newly_paused.append(
+                    (m.condition_id, toxicity.vpin_imbalance(m.condition_id))
+                )
+
+    for cid, imb in tox_newly_paused:
+        logger.warning(
+            "Toxicity pause: cid={} VPIN imbalance={:.2f} ≥ pause threshold {:.2f} "
+            "— cancelling orders, pausing {}s",
+            cid[:12], imb, settings.VPIN_PAUSE_THRESHOLD,
+            settings.TOXICITY_PAUSE_SECONDS,
+        )
+        try:
+            await order_mgr.cancel_orders_for_market(cid)
+        except Exception as exc:
+            logger.error(
+                "Toxicity pause: cancel_orders_for_market({}) failed: {}",
+                cid[:12], exc,
+            )
+        asyncio.create_task(discord.send_alert(
+            title="Toxicity Pause — Adverse Flow Detected",
+            message=(
+                f"Market `{cid[:12]}…` paused: VPIN imbalance **{imb:.2f}** "
+                f"≥ threshold **{settings.VPIN_PAUSE_THRESHOLD:.2f}**. "
+                f"Quotes cancelled. Pause **{settings.TOXICITY_PAUSE_SECONDS}s** — "
+                f"auto-resume on expiry, multiplier handles progressive widening."
+            ),
+            level="warning",
+        ))
 
     # ── Step 5: Per-market quoting (parallel with semaphore) ─────
     if markets_this_cycle:
@@ -948,9 +975,10 @@ async def main() -> None:
     logger.info("Mode: {}  DRY_RUN: {}  Capital: ${:,.0f}", settings.MODE.value, settings.DRY_RUN, settings.TOTAL_CAPITAL)
     logger.info("Tightness: {:.2f}  Size mult: {:.1f}x  Interval: {}s", settings.tightness_factor, settings.SIZE_MULTIPLIER, settings.REBALANCE_INTERVAL_SECONDS)
     logger.info("API rate: {:.1f} req/s  Burst: {:.0f}  Max markets/cycle: {}", settings.API_RATE_LIMIT_RPS, settings.API_RATE_LIMIT_BURST, settings.MAX_MARKETS_PER_CYCLE)
-    logger.info("WS: {}  Offset ticks: {}  Debounce: {}ms  Adverse threshold: {} fills/hr",
+    logger.info("WS: {}  Offset ticks: {}  Debounce: {}ms  VPIN pause: {:.2f}  Tox max mult: {:.2f}x",
                 settings.WS_ENABLED, settings.QUOTE_OFFSET_TICKS,
-                settings.HOT_REQUOTE_DEBOUNCE_MS, settings.ADVERSE_FILL_RATE_THRESHOLD)
+                settings.HOT_REQUOTE_DEBOUNCE_MS, settings.VPIN_PAUSE_THRESHOLD,
+                settings.TOXICITY_SPREAD_MULTIPLIER_MAX)
     logger.info("=" * 60)
 
     # ── Init components ──────────────────────────────────────────
@@ -975,6 +1003,8 @@ async def main() -> None:
 
     market_mgr = MarketManager(client, settings)
     quoter = Quoter(settings)
+    toxicity = ToxicityAnalyzer(settings)
+    quoter.attach_toxicity_analyzer(toxicity)
     order_mgr = OrderManager(client, settings)
     inventory = InventoryTracker(settings)
     fill_collector = FillCollector(client)
@@ -1144,6 +1174,7 @@ async def main() -> None:
                     fill_collector=fill_collector,
                     discord=discord,
                     scoring_monitor=scoring_monitor,
+                    toxicity=toxicity,
                     settings=settings,
                     cycle_index=cycle_index,
                     skip_cids=unseeded_markets,

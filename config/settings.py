@@ -62,7 +62,23 @@ class Settings(BaseSettings):
     # ── WebSocket / Event-Driven Quoting ─────────────────────────────
     WS_ENABLED: bool = True
     HOT_REQUOTE_DEBOUNCE_MS: int = Field(default=1000, ge=200, le=5000)
-    ADVERSE_FILL_RATE_THRESHOLD: int = Field(default=3, ge=1, le=20)
+
+    # ── Toxicity / Adverse-selection (P2b) ──────────────────────────
+    # Replaces the legacy ADVERSE_FILL_RATE_THRESHOLD widening.
+    # VPIN: buy/sell imbalance over a rolling window of bot fills drives
+    # a spread multiplier; breaching the pause threshold cancels quotes
+    # for TOXICITY_PAUSE_SECONDS. Fill-vs-mid scoring adds a continuous
+    # adverse-drift signal evaluated at +5s/+30s/+5min after each fill.
+    # Inside ToxicityAnalyzer the two signals combine via max(); the
+    # resulting multiplier (∈ [1.0, TOXICITY_SPREAD_MULTIPLIER_MAX]) is
+    # then multiplied by the volatility multiplier in Quoter._compute_offset.
+    # Final offset stays bounded by max_spread * 0.499 (existing clamp).
+    VPIN_WINDOW_FILLS: int = Field(default=50, ge=5, le=500)
+    VPIN_THRESHOLD: float = Field(default=0.7, ge=0.0, le=1.0)
+    VPIN_PAUSE_THRESHOLD: float = Field(default=0.85, ge=0.0, le=1.0)
+    TOXICITY_FILL_WINDOW_SECONDS: int = Field(default=300, ge=60, le=3600)
+    TOXICITY_PAUSE_SECONDS: int = Field(default=180, ge=30, le=3600)
+    TOXICITY_SPREAD_MULTIPLIER_MAX: float = Field(default=2.5, ge=1.0, le=10.0)
 
     # ── API Rate Limiting ───────────────────────────────────────────
     API_RATE_LIMIT_RPS: float = Field(default=1.5, ge=0.1, le=10.0)

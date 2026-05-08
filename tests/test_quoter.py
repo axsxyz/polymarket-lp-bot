@@ -152,21 +152,44 @@ class TestComputeOffset:
         offset = q._compute_offset(m, 0.50)
         assert offset >= 0.01
 
-    def test_adverse_fill_rate_widens(self):
-        """High fill rate should add extra ticks of widening."""
-        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=1, ADVERSE_FILL_RATE_THRESHOLD=3))
-        q.update_fill_rates({"cond_test": 5.0})
-        m = _market(max_spread=0.10)
-        offset = q._compute_offset(m, 0.50)
-        assert offset == pytest.approx(0.02)
+    def test_offset_uses_toxicity_multiplier(self):
+        """When an analyzer is attached, its multiplier scales the offset."""
+        from datetime import datetime, timezone
+        from core.order_manager import FillEvent
+        from core.toxicity_analyzer import ToxicityAnalyzer
 
-    def test_extreme_adverse_fills_double_widen(self):
-        """Very high fill rate (>3x threshold) should add +2 ticks."""
-        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=1, ADVERSE_FILL_RATE_THRESHOLD=3))
-        q.update_fill_rates({"cond_test": 12.0})
+        s = _make_settings(QUOTE_OFFSET_TICKS=2)
+        analyzer = ToxicityAnalyzer(s)
+        # 35 BID + 5 ASK fills → imb = 30/40 = 0.75 (between THRESHOLD 0.7
+        # and PAUSE 0.85, ratio = (0.75-0.7)/(0.85-0.7) = 1/3)
+        # → vpin_mult = 1.0 + 1/3 * (2.5 - 1.0) = 1.5
+        ts = datetime.now(timezone.utc)
+        for _ in range(35):
+            analyzer.record_fill(FillEvent(
+                token_id="tok_yes", condition_id="cond_test", side="BID",
+                price=0.50, filled_size=1.0, timestamp=ts,
+            ))
+        for _ in range(5):
+            analyzer.record_fill(FillEvent(
+                token_id="tok_yes", condition_id="cond_test", side="ASK",
+                price=0.50, filled_size=1.0, timestamp=ts,
+            ))
+
+        q = Quoter(s)
+        q.attach_toxicity_analyzer(analyzer)
         m = _market(max_spread=0.10)
         offset = q._compute_offset(m, 0.50)
-        assert offset == pytest.approx(0.03)
+        # base = QUOTE_OFFSET_TICKS * tick * vol_mult * tox_mult
+        #      = 2 * 0.01 * 1.0 * 1.5 = 0.030
+        assert offset == pytest.approx(0.03, rel=1e-3)
+
+    def test_offset_no_analyzer_neutral(self):
+        """Without an analyzer attached, tox_mult = 1.0 (cold-start safe)."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=2))
+        m = _market(max_spread=0.10)
+        offset = q._compute_offset(m, 0.50)
+        # base = 2 * 0.01 * 1.0 (vol_mult) * 1.0 (tox_mult) = 0.02
+        assert offset == pytest.approx(0.02)
 
     def test_fallback_to_tightness_factor(self):
         """With QUOTE_OFFSET_TICKS=0, should fall back to legacy tightness."""

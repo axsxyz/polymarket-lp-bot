@@ -30,12 +30,15 @@ import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Deque, Dict, Optional, Tuple
 
 from loguru import logger
 
 from config.markets_filter import MarketCandidate
 from config.settings import Settings
+
+if TYPE_CHECKING:
+    from core.toxicity_analyzer import ToxicityAnalyzer
 
 
 @dataclass(frozen=True)
@@ -112,7 +115,9 @@ class Quoter:
     def __init__(self, settings: Settings) -> None:
         self._s = settings
         self._scoring_rates: dict[str, float] = {}
-        self._fill_rates: dict[str, float] = {}
+        # Optional dependency, attached at startup. None → neutral 1.0
+        # multiplier in _compute_offset (cold-start / DI-less safe).
+        self._toxicity: Optional["ToxicityAnalyzer"] = None
         # Per-market midpoint-guard state (driven by cold cycle only).
         self._midpoint_breach_count: dict[str, int] = {}
         self._midpoint_paused: set[str] = set()
@@ -125,9 +130,13 @@ class Quoter:
         """Update per-market scoring rates from ScoringMonitor."""
         self._scoring_rates = dict(rates)
 
-    def update_fill_rates(self, rates: dict[str, float]) -> None:
-        """Update per-market fills-per-hour from FillCollector (cold path)."""
-        self._fill_rates = dict(rates)
+    def attach_toxicity_analyzer(self, analyzer: "ToxicityAnalyzer") -> None:
+        """Wire the toxicity analyzer; called once at startup from main.py.
+
+        Optional dependency — when None, _compute_offset uses a neutral
+        multiplier of 1.0 so legacy code paths and tests work unchanged.
+        """
+        self._toxicity = analyzer
 
     def evaluate_midpoint_guard(
         self, condition_id: str, live_mid: float
@@ -317,8 +326,9 @@ class Quoter:
         """Per-market quote offset from mid in dollars.
 
         When QUOTE_OFFSET_TICKS > 0, computes the offset directly in dollar
-        terms (ticks * tick_size), incorporating adverse-selection auto-widening.
-        Falls back to the legacy tightness-factor approach when QUOTE_OFFSET_TICKS=0.
+        terms (ticks * tick_size), incorporating realised-vol and toxicity
+        multipliers. Falls back to the legacy tightness-factor approach
+        when QUOTE_OFFSET_TICKS=0.
 
         Returns a clamped offset: at least 1 tick, at most max_spread * 0.499.
         """
@@ -326,16 +336,11 @@ class Quoter:
 
         if self._s.QUOTE_OFFSET_TICKS > 0:
             vol_mult = self._compute_vol_multiplier(market.condition_id, tick)
-            base = self._s.QUOTE_OFFSET_TICKS * tick * vol_mult
-
-            fph = self._fill_rates.get(market.condition_id, 0)
-            adverse_widening = 0
-            if fph > self._s.ADVERSE_FILL_RATE_THRESHOLD:
-                adverse_widening += 1
-            if fph > self._s.ADVERSE_FILL_RATE_THRESHOLD * 3:
-                adverse_widening += 1
-
-            offset = base + adverse_widening * tick
+            tox_mult = (
+                self._toxicity.get_spread_multiplier(market.condition_id, tick)
+                if self._toxicity is not None else 1.0
+            )
+            offset = self._s.QUOTE_OFFSET_TICKS * tick * vol_mult * tox_mult
         else:
             offset = market.max_spread * self._s.tightness_factor
 
