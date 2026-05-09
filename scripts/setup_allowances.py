@@ -37,6 +37,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from eth_account import Account
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants — Polygon Mainnet (V2)
@@ -796,6 +797,7 @@ def main() -> None:
     owner = funder if funder else account.address
 
     w3 = Web3(Web3.HTTPProvider(args.rpc))
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     if not w3.is_connected():
         print(f"ERROR: Cannot connect to {args.rpc}")
         sys.exit(1)
