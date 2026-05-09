@@ -8,7 +8,8 @@ Before the LP bot can trade on CLOB V2, your wallet must:
     Conditional Tokens (ERC1155) on Polygon.
 
 This script:
-  1. Optionally wraps USDC (native or bridged) → pUSD (CollateralOnramp.wrap)
+  1. Optionally converts USDC natif → USDC.e via Uniswap V3, then wraps USDC.e → pUSD
+     (CollateralOnramp; native USDC is not wrapped directly).
   2. Checks current on-chain allowances for pUSD + Conditional Tokens
   3. Sends approve / setApprovalForAll for any that are insufficient
   4. Calls the CLOB API update_balance_allowance (V2 SDK) to sync server state
@@ -49,8 +50,6 @@ USDC_E = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 # Native USDC on Polygon — CollateralOnramp wrap input
 USDC_NATIVE = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
 
-WRAP_ASSETS_ORDER: tuple[str, ...] = (USDC_NATIVE, USDC_E)
-
 ASSET_LABELS: dict[str, str] = {
     USDC_NATIVE: "USDC (native Polygon)",
     USDC_E: "USDC.e (bridged)",
@@ -59,6 +58,16 @@ ASSET_LABELS: dict[str, str] = {
 COLLATERAL_ONRAMP = Web3.to_checksum_address(
     "0x93070a847efEf7F70739046A929D47a521F5B8ee"
 )
+
+# Uniswap V3 — Polygon (USDC natif → USDC.e before OnRamp)
+UNISWAP_V3_SWAP_ROUTER = Web3.to_checksum_address(
+    "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+)
+UNISWAP_POOL_FEE_USDC_NATIVE_USDCE = 100  # 0.01%
+# Slippage cap 0.1% on ~1:1 stable output: amountOutMinimum = amountIn * 999 / 1000
+SWAP_AMOUNT_OUT_MIN_NUM = 999
+SWAP_AMOUNT_OUT_MIN_DEN = 1000
+SWAP_DEADLINE_SECONDS = 300
 
 # Fallback if py_clob_client_v2 is unavailable (matches docs + SDK 1.0.0)
 _FALLBACK_SPENDERS: dict[str, str] = {
@@ -171,6 +180,31 @@ ONRAMP_WRAP_ABI = [
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function",
+    },
+]
+
+SWAP_ROUTER_EXACT_INPUT_SINGLE_ABI = [
+    {
+        "name": "exactInputSingle",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {
+                "name": "params",
+                "type": "tuple",
+                "components": [
+                    {"name": "tokenIn", "type": "address"},
+                    {"name": "tokenOut", "type": "address"},
+                    {"name": "fee", "type": "uint24"},
+                    {"name": "recipient", "type": "address"},
+                    {"name": "deadline", "type": "uint256"},
+                    {"name": "amountIn", "type": "uint256"},
+                    {"name": "amountOutMinimum", "type": "uint256"},
+                    {"name": "sqrtPriceLimitX96", "type": "uint160"},
+                ],
+            }
+        ],
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
     },
 ]
 
@@ -319,6 +353,13 @@ def print_status(w3: Web3, owner: str) -> list[dict]:
             f"  USDC.e → OnRamp:     {_format_allowance(onramp_allow_e)} "
             f"(spender {COLLATERAL_ONRAMP})"
         )
+        swap_router_allow = nat_ct.functions.allowance(
+            owner, UNISWAP_V3_SWAP_ROUTER
+        ).call()
+        print(
+            f"  USDC natif → SwapRouter: {_format_allowance(swap_router_allow)} "
+            f"(spender {UNISWAP_V3_SWAP_ROUTER})"
+        )
         print()
 
     except Exception as exc:
@@ -418,6 +459,107 @@ def send_onramp_wrap(
     return approve_hex, wrap_hex
 
 
+def swap_native_usdc_to_usdce(
+    w3: Web3,
+    account,
+    owner: str,
+    amount_in: int,
+    nonce: int,
+) -> None:
+    """
+    Uniswap V3: USDC natif → USDC.e (fee 0.01%). Approves SwapRouter for exact amount_in if needed.
+    deadline = latest block timestamp + 300s; amountOutMinimum = amount_in * 999 // 1000.
+    """
+    if amount_in <= 0:
+        return
+    owner = Web3.to_checksum_address(owner)
+    token_in = w3.eth.contract(address=USDC_NATIVE, abi=ERC20_ABI)
+    router = w3.eth.contract(
+        address=UNISWAP_V3_SWAP_ROUTER, abi=SWAP_ROUTER_EXACT_INPUT_SINGLE_ABI
+    )
+    current = token_in.functions.allowance(
+        account.address, UNISWAP_V3_SWAP_ROUTER
+    ).call()
+    tx_nonce = nonce
+    if current < amount_in:
+        print(
+            f"  Approving Uniswap SwapRouter for {amount_in} USDC natif base units "
+            f"(nonce {tx_nonce})..."
+        )
+        approve_hex = send_erc20_approve(
+            w3, account, USDC_NATIVE, UNISWAP_V3_SWAP_ROUTER, amount_in, tx_nonce,
+        )
+        print(f"    approve tx: {approve_hex}")
+        print(f"    https://polygonscan.com/tx/{approve_hex}")
+        receipt = w3.eth.wait_for_transaction_receipt(approve_hex, timeout=180)
+        if receipt["status"] != 1:
+            raise RuntimeError("USDC natif → SwapRouter approve reverted")
+        tx_nonce = w3.eth.get_transaction_count(account.address)
+        print(f"    Confirmed in block {receipt['blockNumber']}")
+
+    latest = w3.eth.get_block("latest")
+    deadline = int(latest["timestamp"]) + SWAP_DEADLINE_SECONDS
+    amount_out_min = amount_in * SWAP_AMOUNT_OUT_MIN_NUM // SWAP_AMOUNT_OUT_MIN_DEN
+
+    params = (
+        USDC_NATIVE,
+        USDC_E,
+        UNISWAP_POOL_FEE_USDC_NATIVE_USDCE,
+        owner,
+        deadline,
+        amount_in,
+        amount_out_min,
+        0,
+    )
+    print(
+        f"  Uniswap V3 exactInputSingle(USDC natif → USDC.e, fee="
+        f"{UNISWAP_POOL_FEE_USDC_NATIVE_USDCE}, amountIn={amount_in}, "
+        f"amountOutMin={amount_out_min}) (nonce {tx_nonce})..."
+    )
+    tx = router.functions.exactInputSingle(params).build_transaction({
+        "from": account.address,
+        "nonce": tx_nonce,
+        "gas": 500_000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId": CHAIN_ID,
+    })
+    signed = account.sign_transaction(tx)
+    swap_hex = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+    print(f"    swap tx: {swap_hex}")
+    print(f"    https://polygonscan.com/tx/{swap_hex}")
+    receipt = w3.eth.wait_for_transaction_receipt(swap_hex, timeout=180)
+    if receipt["status"] != 1:
+        raise RuntimeError("Uniswap exactInputSingle reverted")
+    print(f"    Confirmed in block {receipt['blockNumber']}")
+
+
+def swap_then_wrap_usdce_only(
+    w3: Web3,
+    account,
+    owner: str,
+    native_amount_to_swap: int,
+) -> None:
+    """If native_amount_to_swap > 0: swap native→USDC.e; then wrap full USDC.e balance."""
+    owner = Web3.to_checksum_address(owner)
+    nonce = w3.eth.get_transaction_count(account.address)
+    if native_amount_to_swap > 0:
+        print("\n" + "-" * 72)
+        print("  Uniswap V3 — USDC natif → USDC.e")
+        print("-" * 72)
+        try:
+            swap_native_usdc_to_usdce(
+                w3, account, owner, native_amount_to_swap, nonce,
+            )
+        except Exception as exc:
+            print(f"  Swap FAILED: {exc}")
+            return
+    e_raw, _d = read_erc20_balance(w3, USDC_E, owner)
+    if e_raw <= 0:
+        print("  No USDC.e to wrap after swap.\n")
+        return
+    wrap_assets_sequence(w3, account, owner, [(USDC_E, e_raw)])
+
+
 def log_pusd_after(w3: Web3, owner: str) -> None:
     owner = Web3.to_checksum_address(owner)
     raw, dec = pusd_balance(w3, owner)
@@ -450,17 +592,14 @@ def wrap_assets_sequence(
 
 
 def maybe_wrap_all_collateral(w3: Web3, account, owner: str) -> None:
-    """Non-interactive: wrap full balance of each supported asset (native, then USDC.e)."""
+    """Non-interactive: swap all native USDC → USDC.e if needed, then wrap USDC.e only."""
     owner = Web3.to_checksum_address(owner)
-    to_wrap: list[tuple[str, int]] = []
-    for asset in WRAP_ASSETS_ORDER:
-        raw, _dec = read_erc20_balance(w3, asset, owner)
-        if raw > 0:
-            to_wrap.append((asset, raw))
-    if not to_wrap:
+    nat_raw, _ = read_erc20_balance(w3, USDC_NATIVE, owner)
+    e_before, _ = read_erc20_balance(w3, USDC_E, owner)
+    if nat_raw == 0 and e_before == 0:
         print("  Wrap skipped: no USDC native or USDC.e balance on wallet.")
         return
-    wrap_assets_sequence(w3, account, owner, to_wrap)
+    swap_then_wrap_usdce_only(w3, account, owner, nat_raw)
 
 
 def run_wrap_interactive(w3: Web3, account, owner: str) -> None:
@@ -468,33 +607,31 @@ def run_wrap_interactive(w3: Web3, account, owner: str) -> None:
     while True:
         print_wrap_balances_header(w3, owner)
         print("  What do you want to convert?")
-        print("    [1] Convert all (USDC natif + USDC.e → pUSD, each if balance > 0)")
-        print("    [2] Convert only USDC natif → pUSD")
+        print("    [1] Convert all (swap natif→USDC.e if needed, then USDC.e → pUSD)")
+        print("    [2] Convert only USDC natif → pUSD (swap natif→USDC.e, then wrap)")
         print("    [3] Convert only USDC.e → pUSD")
         print("    [4] Custom amount (pick token + amount)")
+        print("    [5] Swap USDC natif → USDC.e only (Uniswap V3, no wrap)")
         print("    [0] Cancel")
-        choice = input("  Enter choice [0-4]: ").strip()
+        choice = input("  Enter choice [0-5]: ").strip()
 
         if choice == "0":
             print("  Cancelled.\n")
             return
         if choice == "1":
-            pairs: list[tuple[str, int]] = []
-            for asset in WRAP_ASSETS_ORDER:
-                raw, _d = read_erc20_balance(w3, asset, owner)
-                if raw > 0:
-                    pairs.append((asset, raw))
-            if not pairs:
-                print("  Nothing to wrap (both balances are 0).\n")
+            nat_raw, _d = read_erc20_balance(w3, USDC_NATIVE, owner)
+            e_raw, _de = read_erc20_balance(w3, USDC_E, owner)
+            if nat_raw == 0 and e_raw == 0:
+                print("  Nothing to wrap (native and USDC.e are 0).\n")
                 continue
-            wrap_assets_sequence(w3, account, owner, pairs)
+            swap_then_wrap_usdce_only(w3, account, owner, nat_raw)
             continue
         if choice == "2":
             raw, _d = read_erc20_balance(w3, USDC_NATIVE, owner)
             if raw == 0:
                 print("  USDC natif balance is 0.\n")
                 continue
-            wrap_assets_sequence(w3, account, owner, [(USDC_NATIVE, raw)])
+            swap_then_wrap_usdce_only(w3, account, owner, raw)
             continue
         if choice == "3":
             raw, _d = read_erc20_balance(w3, USDC_E, owner)
@@ -502,6 +639,23 @@ def run_wrap_interactive(w3: Web3, account, owner: str) -> None:
                 print("  USDC.e balance is 0.\n")
                 continue
             wrap_assets_sequence(w3, account, owner, [(USDC_E, raw)])
+            continue
+        if choice == "5":
+            raw, _d = read_erc20_balance(w3, USDC_NATIVE, owner)
+            if raw == 0:
+                print("  USDC natif balance is 0.\n")
+                continue
+            nonce = w3.eth.get_transaction_count(account.address)
+            print("\n" + "-" * 72)
+            print("  Uniswap V3 — USDC natif → USDC.e (no wrap)")
+            print("-" * 72)
+            try:
+                swap_native_usdc_to_usdce(w3, account, owner, raw, nonce)
+            except Exception as exc:
+                print(f"  Swap FAILED: {exc}")
+            else:
+                e_after, de = read_erc20_balance(w3, USDC_E, owner)
+                print(f"  USDC.e balance now: {e_after / 10**de:,.6f}\n")
             continue
         if choice == "4":
             tok = input("  Token: [1] USDC natif  [2] USDC.e : ").strip()
@@ -523,7 +677,27 @@ def run_wrap_interactive(w3: Web3, account, owner: str) -> None:
             if parsed is None:
                 print("  Invalid amount or exceeds balance.\n")
                 continue
-            wrap_assets_sequence(w3, account, owner, [(asset, parsed)])
+            if asset == USDC_NATIVE:
+                e_before, _de = read_erc20_balance(w3, USDC_E, owner)
+                nonce0 = w3.eth.get_transaction_count(account.address)
+                print("\n" + "-" * 72)
+                print("  Uniswap V3 — partial USDC natif → USDC.e")
+                print("-" * 72)
+                try:
+                    swap_native_usdc_to_usdce(
+                        w3, account, owner, parsed, nonce0,
+                    )
+                except Exception as exc:
+                    print(f"  Swap FAILED: {exc}")
+                    continue
+                e_after, _de = read_erc20_balance(w3, USDC_E, owner)
+                delta = e_after - e_before
+                if delta <= 0:
+                    print("  No USDC.e received from swap.\n")
+                    continue
+                wrap_assets_sequence(w3, account, owner, [(USDC_E, delta)])
+            else:
+                wrap_assets_sequence(w3, account, owner, [(asset, parsed)])
             continue
 
         print("  Invalid choice.\n")

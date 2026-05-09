@@ -13,7 +13,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 - **Structure** : `main.py` (~1218 LOC orchestrateur), `core/` (client, quoter, order_manager, inventory, fill_collector, scoring_monitor, rewards_tracker, ws_feed, market_manager, inventory_seeder, **toxicity_analyzer**), `config/` (settings, markets_filter), `utils/`, `scripts/`, `tests/`.
 - **Entrée** : `python main.py`.
 
-**Changelog agent :** 2026-05-08 \| `scripts/setup_allowances.py` \| CLOB V2 — wrap CollateralOnramp (USDC natif + USDC.e → pUSD), allowances pUSD + contrats V2, CLI `--wrap` / `--wrap-interactive` / défaut sans args = interactif, `--wrap-only` / `--approve-only` / `--all`, sync `py_clob_client_v2` \| alignement migration officielle.
+**Changelog agent :** 2026-05-08 \| `scripts/setup_allowances.py` \| CLOB V2 — Uniswap V3 `exactInputSingle` (USDC natif→USDC.e, fee 100) avant wrap OnRamp USDC.e→pUSD ; menu `[5]` swap seul ; CLI inchangé \| alignement migration + docs Polymarket.
 
 ### ⚠️ Modules qui N'EXISTENT PAS (doc stale — ne jamais référencer)
 - `dashboard/` — absent. `ENABLE_DASHBOARD=true` sans effet.
