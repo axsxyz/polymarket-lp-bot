@@ -31,8 +31,9 @@ import math
 from typing import Dict, List, Optional, Set
 
 from loguru import logger
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client_v2 import OrderArgs, OrderType
+
+BUY = "BUY"
 
 from config.markets_filter import MarketCandidate
 from config.settings import Settings
@@ -468,7 +469,7 @@ class InventorySeeder:
                 side=BUY,
             )
             resp = await self._client.create_and_post_order(
-                order_args, OrderType.GTC
+                order_args, order_type=OrderType.GTC
             )
 
             if isinstance(resp, dict):

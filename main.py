@@ -119,7 +119,7 @@ async def _batch_fetch_midpoints(
         return result
 
     try:
-        from py_clob_client.clob_types import BookParams
+        from py_clob_client_v2 import BookParams
         params = [BookParams(token_id=tid) for tid in missing]
         batch_resp = await client.get_midpoints(params)
 

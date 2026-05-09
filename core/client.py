@@ -18,22 +18,22 @@ from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2 import (
     ApiCreds,
+    BalanceAllowanceParams,
     BookParams,
+    ClobClient,
     MarketOrderArgs,
     OpenOrderParams,
     OrderArgs,
+    OrderMarketCancelParams,
+    OrderPayload,
     OrdersScoringParams,
     OrderType,
+    TradeParams,
 )
-from py_clob_client.order_builder.constants import BUY, SELL
 
-try:
-    from py_clob_client.clob_types import TradeParams as _TradeParams
-except ImportError:
-    _TradeParams = None  # type: ignore[assignment,misc]
+BUY, SELL = "BUY", "SELL"
 
 from config.settings import Settings
 
@@ -144,7 +144,7 @@ def _with_retry(max_retries: int = 3, base_delay: float = 1.0):
 
 class AsyncClobClient:
     """
-    Async facade over `py_clob_client.ClobClient`.
+    Async facade over `py_clob_client_v2.ClobClient`.
 
     Usage::
 
@@ -166,7 +166,7 @@ class AsyncClobClient:
         self._client = await asyncio.to_thread(self._build_client)
         logger.info("ClobClient initialised (signature_type={})", self._settings.SIGNATURE_TYPE)
 
-        creds = await asyncio.to_thread(self._client.create_or_derive_api_creds)
+        creds = await asyncio.to_thread(self._client.create_or_derive_api_key)
         self._client.set_api_creds(creds)
         logger.info("API credentials derived successfully")
 
@@ -178,8 +178,6 @@ class AsyncClobClient:
         Required for the server to accept BID orders. CONDITIONAL (ERC1155) sync
         is done per token_id after markets are loaded — see sync_conditional_allowances().
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams
-
         sig_type = self._settings.SIGNATURE_TYPE
         try:
             await asyncio.to_thread(
@@ -194,8 +192,6 @@ class AsyncClobClient:
         """Re-sync USDC (COLLATERAL) with the CLOB. Call before posting orders so the server
         has fresh balance/allowance (e.g. for collateralized ASKs if supported).
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams
-
         sig_type = self._settings.SIGNATURE_TYPE
         try:
             await asyncio.to_thread(
@@ -217,8 +213,6 @@ class AsyncClobClient:
         """
         if not token_ids:
             return
-        from py_clob_client.clob_types import BalanceAllowanceParams
-
         sig_type = self._settings.SIGNATURE_TYPE
         synced = 0
         for token_id in token_ids:
@@ -367,7 +361,7 @@ class AsyncClobClient:
 
     @_with_retry()
     async def get_orders(self, params: Optional[OpenOrderParams] = None) -> List[Dict]:
-        return await self._call("get_orders", params or OpenOrderParams())
+        return await self._call("get_open_orders", params or OpenOrderParams())
 
     @_with_retry()
     async def get_trades(self, **kwargs) -> List[Dict]:
@@ -376,17 +370,7 @@ class AsyncClobClient:
     @_with_retry(max_retries=2)
     async def get_trades_since(self, after_ts: int) -> List[Dict]:
         """Fetch user's own trades since the given Unix timestamp."""
-        if _TradeParams is not None:
-            params = _TradeParams(after=after_ts)
-            return await self._call("get_trades", params)
-        all_trades = await self._call("get_trades")
-        if not isinstance(all_trades, list):
-            return []
-        return [
-            t for t in all_trades
-            if isinstance(t, dict)
-            and int(float(t.get("match_time", 0) or 0)) >= after_ts
-        ]
+        return await self._call("get_trades", TradeParams(after=after_ts))
 
     async def create_order(self, order_args: OrderArgs) -> Any:
         """Sign a limit order (EIP-712) — local crypto, no network call."""
@@ -413,7 +397,7 @@ class AsyncClobClient:
 
     @_with_retry(max_retries=2)
     async def cancel(self, order_id: str) -> Any:
-        return await self._call("cancel", order_id)
+        return await self._call("cancel_order", OrderPayload(orderID=order_id))
 
     @_with_retry(max_retries=2)
     async def cancel_all(self) -> Any:
@@ -422,7 +406,9 @@ class AsyncClobClient:
     @_with_retry(max_retries=2)
     async def cancel_market_orders(self, market: str) -> Any:
         """Cancel all orders for a specific market condition_id."""
-        return await self._call("cancel_market_orders", market)
+        return await self._call(
+            "cancel_market_orders", OrderMarketCancelParams(market=market)
+        )
 
     async def get_balance_allowance(self, params: Optional[Dict] = None) -> Any:
         """Fetch user's conditional token balances for reconciliation."""
@@ -440,8 +426,6 @@ class AsyncClobClient:
         The CLOB API returns raw units with 6 decimals (like USDC),
         so 6000000 raw = 6.0 shares.  Returns 0.0 on any error.
         """
-        from py_clob_client.clob_types import BalanceAllowanceParams
-
         try:
             resp = await self._call(
                 "get_balance_allowance",

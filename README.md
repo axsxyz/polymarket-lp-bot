@@ -25,7 +25,7 @@ cp .env.example .env
 # Edit .env with your private key, funder address, and Discord webhook
 
 # 5. Set up token allowances (required once per wallet for EOA/MetaMask)
-python scripts/setup_allowances.py          # check + approve
+python scripts/setup_allowances.py --all    # wrap USDC→pUSD if needed + approve spenders
 python scripts/setup_allowances.py --check-only  # just check status
 
 # 6. Run (dry-run mode by default — no real orders)
@@ -38,15 +38,15 @@ python main.py
 
 ## Token Allowances (EOA / MetaMask Wallets)
 
-Before the bot can trade, your wallet must approve the Polymarket exchange contracts to spend your USDC and Conditional Tokens on Polygon. This is a **one-time setup** per wallet.
+Before the bot can trade, your wallet must approve the Polymarket exchange contracts to spend **pUSD** (collateral) and Conditional Tokens on Polygon. Wrap USDC / USDC.e → pUSD via the script if needed. This is a **one-time setup** per wallet.
 
 **What gets approved:**
 
 | Token | Spender | Purpose |
 |-------|---------|---------|
-| USDC | CTF Exchange | Main order execution |
-| USDC | Neg Risk Exchange | Neg-risk market orders |
-| USDC | Neg Risk Adapter | Neg-risk position management |
+| pUSD | CTF Exchange | Main order execution |
+| pUSD | Neg Risk CTF Exchange | Neg-risk market orders |
+| pUSD | Neg Risk Adapter | Neg-risk position management |
 | Conditional Tokens | (same 3 contracts) | Trading outcome tokens |
 
 **Setup:**
@@ -55,8 +55,11 @@ Before the bot can trade, your wallet must approve the Polymarket exchange contr
 # Check current allowance status
 python scripts/setup_allowances.py --check-only
 
-# Approve all (sends on-chain transactions — needs MATIC for gas)
-python scripts/setup_allowances.py
+# Full setup: auto-wrap native USDC + USDC.e balances, then approve (needs MATIC for gas)
+python scripts/setup_allowances.py --all
+
+# Interactive wrap only (same as running `python scripts/setup_allowances.py` with no arguments)
+python scripts/setup_allowances.py --wrap
 
 # Revoke all approvals (if needed)
 python scripts/setup_allowances.py --revoke
@@ -250,7 +253,7 @@ Uses GTC limit orders with escalating price aggressiveness to sell positions acr
 ### Setup Allowances
 
 ```bash
-python scripts/setup_allowances.py            # approve all
+python scripts/setup_allowances.py --all      # wrap + approve spenders
 python scripts/setup_allowances.py --check-only  # just check
 python scripts/setup_allowances.py --revoke      # revoke all
 ```

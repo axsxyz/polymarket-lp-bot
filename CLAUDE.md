@@ -26,7 +26,7 @@ pytest tests/test_quoter.py
 pytest tests/test_quoter.py::TestComputeOffset::test_offset_is_tick_based
 
 # Scripts
-python scripts/setup_allowances.py          # one-time token approvals
+python scripts/setup_allowances.py --all    # one-time wrap + token approvals (see script docstring)
 python scripts/sell_positions.py             # liquidate positions
 ```
 
