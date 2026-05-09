@@ -8,11 +8,11 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
-# Polygon mainnet — same as setup_allowances.py
+# Polygon mainnet — V2 contracts (matches scripts/setup_allowances.py post CLOB V2 cutover Apr 28 2026).
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 SPENDERS = {
-    "CTF Exchange": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
-    "Neg Risk Exchange": "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+    "CTF Exchange V2": "0xE111180000d2663C0091e4f400237545B87B996B",
+    "Neg Risk CTF Exchange V2": "0xe2222d279d744050d28e00520010520000310F59",
     "Neg Risk Adapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",
 }
 

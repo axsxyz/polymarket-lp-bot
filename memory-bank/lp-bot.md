@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08** (P2c complet + fetcher quality filters).
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-08** (setup_allowances CLOB V2).
 
 ---
 
@@ -9,9 +9,11 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 ### Stack
 
 - **Langage** : Python 3.12, asyncio (single process).
-- **Dépendances clés** : `py-clob-client==0.34.6`, `web3==7.14.1`, `aiohttp==3.13.3`, `websockets==15.0.1`, `loguru==0.7.3`, `pydantic-settings==2.13.1`.
+- **Dépendances clés** : `py-clob-client==0.34.6`, **`py-clob-client-v2>=1.0.0`** (script allowances + futur client V2), `web3==7.14.1`, `aiohttp==3.13.3`, `websockets==15.0.1`, `loguru==0.7.3`, `pydantic-settings==2.13.1`.
 - **Structure** : `main.py` (~1218 LOC orchestrateur), `core/` (client, quoter, order_manager, inventory, fill_collector, scoring_monitor, rewards_tracker, ws_feed, market_manager, inventory_seeder, **toxicity_analyzer**), `config/` (settings, markets_filter), `utils/`, `scripts/`, `tests/`.
 - **Entrée** : `python main.py`.
+
+**Changelog agent :** 2026-05-08 \| `scripts/setup_allowances.py` \| CLOB V2 — wrap CollateralOnramp (USDC natif + USDC.e → pUSD), allowances pUSD + contrats V2, CLI `--wrap` / `--wrap-interactive` / défaut sans args = interactif, `--wrap-only` / `--approve-only` / `--all`, sync `py_clob_client_v2` \| alignement migration officielle.
 
 ### ⚠️ Modules qui N'EXISTENT PAS (doc stale — ne jamais référencer)
 - `dashboard/` — absent. `ENABLE_DASHBOARD=true` sans effet.

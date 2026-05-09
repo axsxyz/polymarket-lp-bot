@@ -24,8 +24,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from loguru import logger
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2 import OrderArgs, OrderType
+
+BUY, SELL = "BUY", "SELL"
 
 from config.settings import Settings
 from core.client import AsyncClobClient
@@ -125,7 +126,7 @@ class OrderManager:
     async def refresh_usdc_balance(self) -> None:
         """Fetch current USDC balance once per cycle for collateral pre-checks."""
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams
+            from py_clob_client_v2 import BalanceAllowanceParams
             resp = await self._client._call(
                 "get_balance_allowance",
                 BalanceAllowanceParams(

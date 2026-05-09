@@ -4,12 +4,25 @@ globs: core/**, config/**, scripts/**
 alwaysApply: false
 ---
 
-# POLYMARKET API — GROUND TRUTH (verified May 2026)
+# POLYMARKET API — GROUND TRUTH (verified May 2026, post CLOB V2 cutover)
 
-## Authentication
+## SDK — py-clob-client-v2 == 1.0.0 (V1 SDK is dead since Apr 28 2026)
+
+### Authentication
 - L1 = EOA signature (private key)
-- L2 = API credentials derived via `create_or_derive_api_creds`
-- Both required for order operations. Setup at startup via `client.py:164-173`
+- L2 = API credentials derived via `client.create_or_derive_api_key()` — **V2 renamed from V1's `create_or_derive_api_creds`**
+- Both required for order operations. Setup at startup via `client.py:initialize`
+
+### V1 → V2 method renames already applied in `core/client.py`
+- `create_or_derive_api_creds()` → **`create_or_derive_api_key()`**
+- `get_orders(params)` → **`get_open_orders(params)`** (wrapper `AsyncClobClient.get_orders` keeps the V1-style external name)
+- `cancel(order_id_str)` → **`cancel_order(OrderPayload(orderID=order_id))`** (wrapped internally)
+- `cancel_market_orders(market_str)` → **`cancel_market_orders(OrderMarketCancelParams(market=cid))`** (wrapped internally)
+- `create_order` / `create_and_post_order` now accept `options: PartialCreateOrderOptions = None` as 2nd positional arg → **`order_type=` MUST be passed as kwarg**, never positionally (silent break: GTC enum would land in the `options` slot and corrupt tick_size resolution).
+
+### V2 SDK exports (from `py_clob_client_v2`)
+- `ClobClient`, `OrderArgs (=OrderArgsV2)`, `MarketOrderArgs`, `OrderType`, `Side`, `BookParams`, `BalanceAllowanceParams`, `OpenOrderParams`, `OrdersScoringParams`, `TradeParams`, `OrderPayload`, `OrderMarketCancelParams`, `PartialCreateOrderOptions`
+- `order_builder.constants.{BUY,SELL}` is **gone in V2**. Define `BUY, SELL = "BUY", "SELL"` locally; `OrderArgs.side` accepts plain strings.
 
 ## CLOB API (clob.polymarket.com)
 
@@ -17,21 +30,26 @@ alwaysApply: false
 - `GTC` (Good Till Cancelled) — what this bot uses. Risk: zombie orders if crash before cancel.
   Mitigation: `cancel_all_orders()` at startup (main.py:815) + MAX_ORDER_AGE_SECONDS rolling refresh
 - `GTD` (Good Till Date) — safer but NOT implemented. Do not add without testing full order lifecycle.
-- `FOK` (Fill or Kill) — for aggressive fills only. Not relevant for market making.
+- `FOK` / `FAK` — for aggressive fills only. Not relevant for market making.
 - NEVER use market orders for LP — always limit orders.
 
 ### Rate limits
 - Documented: ~100 req/min = **1.67 RPS MAX**
-- Current config: `API_RATE_LIMIT_RPS=5.0` → **EXCEEDS LIMIT — known bug**
-- When fixing: change to 1.5 in both `.env` and verify `config/settings.py:66`
-- Retry logic exists: `_with_retry(max_retries=3)` with exponential backoff in `client.py:93-138`
+- Current config: `API_RATE_LIMIT_RPS=1.5` (already fixed)
+- Retry logic: `_with_retry(max_retries=3)` with exponential backoff in `client.py`
+
+### Fees (V2 protocol-set)
+- Fees are protocol-set per market, NO LONGER embedded in the signed order — `feeRateBps` is gone from `OrderArgs`.
+- Makers pay zero fees; only takers pay. The bot is a pure maker → fee impact = 0.
+- Query per-market fee params via `client.get_clob_market_info(condition_id)` — returns `mts` (min tick), `mos` (min size), `fd` (fee details), `t` (tokens), `nr` (neg risk).
 
 ### Key endpoints
-- `POST /order` — place order: {token_id, price, size, side, type, expiration}
-- `DELETE /orders/{id}` — cancel single
-- `DELETE /orders` — cancel all (used at startup/shutdown)
-- `GET /orders` — list open orders (polling in `reconcile_ghost_orders`)
-- `GET /are-orders-scoring` — LP reward scoring check
+- `POST /order` — place order
+- `DELETE /order` — cancel single (body: `{orderID}`)
+- `DELETE /cancel-all` — cancel all (used at startup/shutdown)
+- `DELETE /cancel-market-orders` — cancel all orders for one market
+- `GET /data/orders` — list open orders (paginated, used for ghost reconciliation)
+- `POST /are-orders-scoring` — LP reward scoring check (V2 is POST, not GET)
 
 ## Gamma API (gamma-api.polymarket.com)
 - Market discovery: `GET /markets?active=true&closed=false&limit=200&offset=N` (paginated)
@@ -46,13 +64,16 @@ alwaysApply: false
 - Staleness: 60s timeout → fall back to REST mid
 - Reconnect: exponential backoff `delay = min(delay*2, 30)` (ws_feed.py:113-149)
 
-## Smart contracts (Polygon mainnet — verified)
-- USDC: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`
-- CTF: `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045`
-- CTF Exchange: `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`
-- NegRisk Exchange: `0xC5d563A36AE78145C45a50134d48A1215220f80a`
-- NegRisk Adapter: `0xd91E80cF2223ef622709A2E35faB427ba77e8b0a`
-- NEVER change these addresses without verifying on-chain via Polygon explorer
+## Smart contracts (Polygon mainnet — V2, verified May 2026)
+- **pUSD (collateral)**: `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` (replaces V1 USDC.e)
+- USDC.e (legacy, wrap-input only): `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`
+- CollateralOnramp (USDC.e → pUSD wrap): `0x93070a847efEf7F70739046A929D47a521F5B8ee`
+- CTF (ERC1155, conditional tokens): `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` (unchanged)
+- **CTF Exchange V2**: `0xE111180000d2663C0091e4f400237545B87B996B` (replaces V1 `0x4bFb…`)
+- **Neg Risk CTF Exchange V2**: `0xe2222d279d744050d28e00520010520000310F59` (replaces V1 `0xC5d5…`)
+- Neg Risk Adapter: `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296` (unchanged; supersedes the typo `0xd91E80cF2223…` in the previous rule version)
+- Source of truth: `py_clob_client_v2.config.get_contract_config(137)` returns these dynamically — `setup_allowances.py` uses it with a hardcoded fallback.
+- NEVER hardcode V1 exchange addresses anywhere — they are dead.
 
 ## neg_risk routing
 - `MarketCandidate.neg_risk` flag is parsed but NOT explicitly used for routing in order posting

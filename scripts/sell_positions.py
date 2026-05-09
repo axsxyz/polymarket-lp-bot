@@ -28,8 +28,9 @@ load_dotenv(ROOT / ".env")
 import aiohttp
 from eth_account import Account
 from loguru import logger
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import SELL
+from py_clob_client_v2 import OrderArgs, OrderType
+
+SELL = "SELL"
 
 from config.settings import Settings
 from core.client import AsyncClobClient
@@ -235,7 +236,7 @@ async def _sell_with_gtc(
                 size=remaining,
                 side=SELL,
             )
-            resp = await client.create_and_post_order(order_args, OrderType.GTC)
+            resp = await client.create_and_post_order(order_args, order_type=OrderType.GTC)
 
             if isinstance(resp, dict):
                 order_id = resp.get("orderID", "") or resp.get("id", "")
