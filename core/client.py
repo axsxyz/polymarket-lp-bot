@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import asdict, is_dataclass
 from functools import wraps
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
 from py_clob_client_v2 import (
@@ -36,6 +37,21 @@ from py_clob_client_v2 import (
 BUY, SELL = "BUY", "SELL"
 
 from config.settings import Settings
+
+
+def _book_params_to_json(params: List[Any]) -> List[dict]:
+    """Convert BookParams dataclass instances to dicts for httpx JSON encoding."""
+    out: List[dict] = []
+    for p in params:
+        if is_dataclass(p):
+            out.append(asdict(p))
+        elif isinstance(p, dict):
+            out.append(p)
+        else:
+            raise TypeError(
+                f"get_midpoints/get_order_books expect BookParams or dict, got {type(p)}"
+            )
+    return out
 
 # ---------------------------------------------------------------------------
 # Rate limiter
@@ -288,8 +304,8 @@ class AsyncClobClient:
         return await self._call("get_order_book", token_id)
 
     @_with_retry()
-    async def get_order_books(self, params: List[BookParams]) -> Any:
-        return await self._call("get_order_books", params)
+    async def get_order_books(self, params: List[Union[BookParams, dict]]) -> Any:
+        return await self._call("get_order_books", _book_params_to_json(params))
 
     async def get_midpoint(self, token_id: str) -> Any:
         """Silent on invalid token id to reduce log spam."""
@@ -302,9 +318,9 @@ class AsyncClobClient:
             raise
 
     @_with_retry(max_retries=2)
-    async def get_midpoints(self, params: List) -> Any:
+    async def get_midpoints(self, params: List[Union[BookParams, dict]]) -> Any:
         """Batch midpoint fetch for multiple tokens at once."""
-        return await self._call("get_midpoints", params)
+        return await self._call("get_midpoints", _book_params_to_json(params))
 
     @_with_retry()
     async def get_price(self, token_id: str, side: str) -> Any:
