@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-19** (P2d resolution guard : max-loss + 24h move + extreme-mid net, +31 tests, 279/279 ✅).
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-19** (Hotfix pagination Gamma — bot ne démarrait plus, +8 tests, 287/287 ✅).
 
 ---
 
@@ -63,6 +63,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 | `core/market_manager.py` (`reallocate_capital`) | `non_scoring` mélangeait seed-failed et one-sided | **FIXÉ 2026-05-10** : `MarketState` enum + donor-set `{SEED_FAILED, INACTIVE}` (Issue 4) |
 | `core/inventory.py` + `main.py` | Exposure guard global trop permissif (~120 % du capital), pas de gate per-market | **FIXÉ 2026-05-10** : `MAX_EXPOSURE_RATIO=0.80` (deployed) + `MAX_MARKET_EXPOSURE_RATIO=0.40` (per-market gate AVANT global) (Issue 5) |
 | `main.py` (hot path) + `core/scoring_monitor.py` | Hot path log INFO toutes les 1-3 s même si smart-diff kept ; "0 markets checked" sans HTTP error | **FIXÉ 2026-05-10** : INFO seulement si `posted`, sinon DEBUG ; `last_error` capturé + log `{!r}` ; table cycle ASCII INFO ; table startup (Issue 6) |
+| `core/market_manager.py:_fetch_gamma_markets` | `limit=200` + `if len(items) < limit: break` → exit dès page 1 (Gamma plafonne à 100), bot voyait ~100 marchés sur 5458 et démarrait avec 0 marché après filtering | **FIXÉ 2026-05-19** : `limit=100`, exit `if not items: break`, `MAX_GAMMA_PAGES=50`, `asyncio.sleep(0.7)` entre pages, +8 tests |
 
 ---
 
@@ -70,6 +71,9 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 | Fichier | Changement |
 |---------|------------|
+| **2026-05-19 (Hotfix pagination Gamma)** | |
+| `core/market_manager.py:41-55` (nouvelles constantes module) + `:362-435` (`_fetch_gamma_markets`) | **Bug critique fixé** : bot live échouait au boot avec "After filtering: 0 markets" → "No markets available — exiting". Cause = `_fetch_gamma_markets` demandait `limit=200` mais Gamma plafonne à 100 items/réponse ; la condition `if len(items) < limit: break` sortait dès la 1re page (100 < 200), laissant les 3 marchés actifs (Becerra, Fed, Netanyahu) hors du lookup. Fix : (a) `GAMMA_PAGE_LIMIT=100` (= plafond réel API) ; (b) exit sur `if not items: break` (vraie fin de pagination) ; (c) `MAX_GAMMA_PAGES=50` safety bound (5000 marchés max) + log WARNING si bound atteint ; (d) `asyncio.sleep(0.7)` entre pages — ~1.4 RPS aligné `backtest/fetcher.py:HTTP_RATE_LIMIT_SLEEP_S`, jamais avant la 1re requête ; (e) log final enrichi `pages {}` count. |
+| `tests/test_gamma_pagination.py` (nouveau, 8 tests) | Mock manuel `aiohttp.ClientSession` via `_FakeSession`/`_FakeResp` (pas de dépendance `aioresponses`) + patch `core.market_manager.asyncio.sleep` pour vitesse. Couvre : sub-ceiling page (80 items → lookup 80, terminaison propre) ; multi-page (100+100+50 → 250 entries) ; full pages + empty probe (300) ; safety bound (queue infinie stoppée à MAX_GAMMA_PAGES) ; empty page #2 (1 page collected) ; HTTP 500 (warning + lookup partiel sans crash) ; sleep entre pages (3 sleeps pour 4 requêtes) ; no-sleep-before-first (probe immédiat). **287/287 ✅** (279 baseline + 8 nouveaux). |
 | **2026-05-19 (P2d resolution guard)** | |
 | `core/resolution_guard.py` (nouveau, ~280 LOC) | `ResolutionGuard(settings)` : `record_midpoint(cid, mid, ts_utc)` (deque/cid, rétention 25h, auto-prune, mids hors `(0,1)` droppés, naive datetimes traités UTC) ; `max_loss_check(cid, yes, no) → (breached, max_loss, limit)` (strict `>`) ; `evaluate_move_24h(cid) → (breached, move_pct, limit)` (≥20 min d'historique, ±30 min de tolérance sur anchor `now-24h`, picks closest sample) ; `should_delist(cid, yes, no, mid)` agrège avec priorité `extreme_mid > max_loss > move_24h > None`. Module pur — zéro `main.py` import, zéro API call. Helper `_utcnow()` indirecté pour monkeypatch tests. |
 | `config/settings.py` (bloc "Resolution Guard") | `RESOLUTION_MAX_LOSS_USD: float = Field(default=25.0, ge=1.0)` + `RESOLUTION_MAX_MOVE_24H_PCT: float = Field(default=15.0, ge=1.0, le=100.0)`. Filet extrême `mid < 0.05 || > 0.95` reste hard-coded module-level (sécurité non-débrayable). |
