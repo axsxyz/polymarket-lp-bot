@@ -1,12 +1,5 @@
 # LP Bot — Active Tasks
 
-## P2d — Resolution guard complet
-- [ ] **`core/resolution_guard.py`** — Resolution risk manager
-  - Max-loss calculator par marché : `max(yes_size, no_size) × 1.0` → pause si > seuil
-  - Auto-delist si mid move > 15% en 24h (distinct du midpoint guard cycle-based)
-  - Paramètres : `RESOLUTION_MAX_LOSS_USD`, `RESOLUTION_MAX_MOVE_24H_PCT`
-  - *(calendrier événements déplacé en P4 — intégration externe complexe)*
-
 ## P2e — Position sizing dynamique
 - [ ] **Capital reallocation basé sur scoring réel** → `core/market_manager.py`
   - Utilise `are_orders_scoring` (déjà présent via `scoring_monitor.py`)
@@ -51,6 +44,19 @@
 ---
 
 ## Complété
+
+### 2026-05-19
+- [x] **P2d — Resolution guard** → `core/resolution_guard.py` + `config/settings.py` + `main.py` + `tests/test_resolution_guard.py`
+  - `max_loss_check` (worst-case `max(yes,no)×$1` vs `RESOLUTION_MAX_LOSS_USD=25.0`, strict `>`)
+  - `evaluate_move_24h` (`|mid_now−mid_24h| / ref × 100` vs `RESOLUTION_MAX_MOVE_24H_PCT=15.0`, ≥20 min history, ±30 min tolerance, closest sample)
+  - `should_delist` : priorité `extreme_mid > max_loss > move_24h` ; filet hard-coded `mid<0.05 || >0.95`
+  - Intégration : **Step 3c** cold path (AVANT exposure gate) + hot WS path `record_midpoint` ; Discord `warning` + `cancel_orders` + `set_state(INACTIVE)` sur delist
+  - 248 → 279 tests ✅ (+31 : 7+6+8+8+2)
+
+- [x] **scripts/sell_positions.py — filtre dust CLI** (mineur)
+  - Prompt interactif `[y/N]` (default N) si positions estimées < $1.00 détectées
+  - `_is_dust` / `_current_value` : valeur inconnue (`cur_price=0`) conservée par défaut
+  - `EOFError` géré pour usage non-interactif (pipe → N)
 
 ### 2026-05-08
 - [x] **P2c — Backtest framework standalone** → `backtest/` + `tests/test_simulator.py` + `tests/test_metrics.py`

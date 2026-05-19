@@ -286,6 +286,34 @@ async def _sell_with_gtc(
     return total_sold_value
 
 
+# ── Dust helpers ─────────────────────────────────────────────────────
+
+DUST_THRESHOLD_USD = 1.0  # strict < 1.00
+
+
+def _current_value(p: dict) -> float | None:
+    """Estimated position value in USD from Data API fields.
+
+    Returns ``None`` when the price is unknown (``cur_price == 0``) so
+    the caller can decide whether to keep the position or not.
+    Cache-fallback positions always return ``None``.
+    """
+    cur_price = float(p.get("cur_price", 0) or 0)
+    if cur_price <= 0:
+        return None
+    return float(p.get("size", 0) or 0) * cur_price
+
+
+def _is_dust(p: dict) -> bool:
+    """True only when the estimated value is known AND < $1.00.
+
+    Positions with unknown price (cur_price == 0, e.g. cache-fallback)
+    are conservatively kept — we cannot rule them out.
+    """
+    value = _current_value(p)
+    return value is not None and value < DUST_THRESHOLD_USD
+
+
 # ── Display and sell ─────────────────────────────────────────────────
 
 async def show_and_sell(
@@ -421,6 +449,39 @@ async def main() -> None:
         logger.info("Fetching all positions…")
         positions = await discover_all_positions(client, address)
         logger.info("Found {} position(s) with balance > 0", len(positions))
+
+        dust = [p for p in positions if _is_dust(p)]
+        if dust:
+            logger.info("")
+            logger.info(
+                "  {} dust position(s) detected (estimated value < ${:.2f} each, "
+                "based on Data API price — live mid may differ):",
+                len(dust), DUST_THRESHOLD_USD,
+            )
+            for p in dust:
+                val = _current_value(p)
+                logger.info(
+                    "    • {:<55}  ~${:.3f}",
+                    p["display"][:55],
+                    val if val is not None else 0.0,
+                )
+            logger.info("")
+            try:
+                answer = input(
+                    f"  Include dust in display/sell? [y/N]: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            include_dust = answer in ("y", "yes")
+            if not include_dust:
+                positions = [p for p in positions if not _is_dust(p)]
+                logger.info(
+                    "  Dust excluded — {} position(s) remaining.",
+                    len(positions),
+                )
+            else:
+                logger.info("  Dust included — processing all {} position(s).", len(positions))
+            logger.info("")
 
     await show_and_sell(
         client,
