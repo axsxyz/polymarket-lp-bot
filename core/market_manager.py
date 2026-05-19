@@ -42,6 +42,18 @@ CACHE_PATH = Path("data/selected_markets.json")
 TOP_TIER_COUNT = 15
 TOP_TIER_BOOST = 1.25  # top markets get 25% more capital
 
+# Gamma /markets caps each response at 100 items regardless of the requested
+# `limit` query parameter — empirically verified May 2026.  We therefore page
+# in 100-item chunks and continue until the API returns an empty list.
+GAMMA_PAGE_LIMIT = 100
+# Safety bound: 50 × 100 = 5_000 markets ceiling so a stuck/looping API can
+# never spin forever.  If we ever hit this we log a WARNING because real
+# universes that large would indicate the bot is missing trailing markets.
+MAX_GAMMA_PAGES = 50
+# Inter-page delay (~1.4 RPS) aligned with `backtest/fetcher.py:HTTP_RATE_LIMIT_SLEEP_S`
+# and well below the documented CLOB/Gamma ~1.67 RPS plafond.
+GAMMA_PAGE_SLEEP_S = 0.7
+
 
 class MarketState(str, Enum):
     """Per-market operational state (Issue 4).
@@ -344,17 +356,33 @@ class MarketManager:
         return candidates
 
     async def _fetch_gamma_markets(self) -> Dict[str, MarketCandidate]:
-        """Fetch Gamma /markets pages, parse each item, build a condition_id lookup."""
+        """Fetch Gamma /markets pages, parse each item, build a condition_id lookup.
+
+        The Gamma API caps each response at ``GAMMA_PAGE_LIMIT`` (100) items
+        regardless of the requested ``limit`` query param.  Previously this
+        function requested 200 and exited as soon as ``len(items) < limit``,
+        which meant the first page (capped at 100) always triggered the early
+        exit and the bot only ever saw the first ~100 markets.  We now page
+        until the API returns an empty list, with a ``MAX_GAMMA_PAGES`` safety
+        bound and an inter-page sleep to respect rate limits.
+        """
         lookup: Dict[str, MarketCandidate] = {}
         base = self._settings.GAMMA_API_URL.rstrip("/")
         offset = 0
-        limit = 200
+        limit = GAMMA_PAGE_LIMIT
         total_items = 0
         parse_failures = 0
+        pages = 0
 
         try:
             async with aiohttp.ClientSession() as session:
-                while True:
+                while pages < MAX_GAMMA_PAGES:
+                    if pages > 0:
+                        # Throttle between pages only — never before the first
+                        # request — to keep cycle startup latency low while
+                        # respecting Gamma's rate limit on bulk pagination.
+                        await asyncio.sleep(GAMMA_PAGE_SLEEP_S)
+
                     url = f"{base}/markets?active=true&closed=false&limit={limit}&offset={offset}"
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=40)) as resp:
                         if resp.status != 200:
@@ -385,14 +413,22 @@ class MarketManager:
                             len(items),
                         )
 
-                    if len(items) < limit:
-                        break
+                    pages += 1
                     offset += limit
 
+            if pages >= MAX_GAMMA_PAGES:
+                logger.warning(
+                    "Gamma pagination hit safety bound MAX_GAMMA_PAGES={} "
+                    "({} entries fetched, {} items scanned) — some markets "
+                    "may have been missed.",
+                    MAX_GAMMA_PAGES, len(lookup), total_items,
+                )
+
             logger.info(
-                "Gamma lookup built with {} entries (fetched {}, parse failures {})",
+                "Gamma lookup built with {} entries (fetched {}, pages {}, parse failures {})",
                 len(lookup),
                 total_items,
+                pages,
                 parse_failures,
             )
 
