@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-10** (6 fixes opérationnels post-migration V2 : seed atomique, skew continu, table cycle, MarketState, exposure ratios, logs).
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-19** (P2d resolution guard : max-loss + 24h move + extreme-mid net, +31 tests, 279/279 ✅).
 
 ---
 
@@ -13,7 +13,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 - **Structure** : `main.py` (~1218 LOC orchestrateur), `core/` (client, quoter, order_manager, inventory, fill_collector, scoring_monitor, rewards_tracker, ws_feed, market_manager, inventory_seeder, **toxicity_analyzer**), `config/` (settings, markets_filter), `utils/`, `scripts/`, `tests/`.
 - **Entrée** : `python main.py`.
 
-**Changelog agent :** 2026-05-10 \| **6 fixes opérationnels post-V2** (issues 1–6 du runbook) : (1) seeder atomique YES+NO (pre-check coût worst-case + book depth), (2) skew penalty continu `delta = signed × SKEW_PENALTY × base_offset` + Q-score forcé à 0 sur quote one-sided, (3) compteurs cycle `selected/active/scoring` distincts + skip reasons, (4) `MarketState` enum (`UNKNOWN/SEED_FAILED/ONE_SIDED/SCORING/INACTIVE`) + realloc tire de `{SEED_FAILED, INACTIVE}` jamais de `ONE_SIDED`, (5) `MAX_EXPOSURE_RATIO=0.80` + `MAX_MARKET_EXPOSURE_RATIO=0.40` (per-market gate AVANT global), (6) hot-path log INFO seulement si modifié (sinon DEBUG) + `scoring_monitor` log `repr(exc)` quand `checked==0` + table cycle ASCII INFO + table startup. **248/248 tests** ✅ (+25 nouveaux). 2026-05-09 \| Migration **CLOB V2 complète** (commit **`34aa08a`**) : stack runtime `py_clob_client_v2`, fix `get_midpoints`/`get_order_books` sérialisation `BookParams` → dict (`core/client.py`), allowances/wrap `scripts/setup_allowances.py` (pUSD, Uniswap natif→USDC.e, POA middleware Polygon). **Live mainnet** depuis 2026-05-09 : `DRY_RUN=false`, `TOTAL_CAPITAL=350`, `MAX_MARKETS=3` ; marchés actifs *Becerra CA Gov*, *Fed rate cuts 2026* ; ~8 ordres, Q-score ~96 %. **Prochain :** P2d `resolution_guard`.
+**Changelog agent :** 2026-05-19 \| **P2d Resolution guard livré** : `core/resolution_guard.py` (nouveau, 280 LOC, pure logic — zéro API, zéro import `main.py`). Trois checks : (a) `max_loss_check(cid, yes_size, no_size)` worst-case `max(yes_size, no_size) × $1` vs `RESOLUTION_MAX_LOSS_USD=25.0` ; (b) `evaluate_move_24h(cid)` drift `|mid_now − mid_24h_ago| / mid_24h_ago × 100` vs `RESOLUTION_MAX_MOVE_24H_PCT=15.0` — requiert ≥20 min d'historique, ±30 min de tolérance autour de l'anchor `now-24h` ; (c) filet extrême hard-coded `mid < 0.05 || mid > 0.95` → delist quel que soit (a) et (b). Priorité reasons : `extreme_mid > max_loss > move_24h > None`. Rétention 25h via deque ; pruning amortised à chaque `record_midpoint`. Helper `_utcnow` indirecté pour tests. **Intégration `main.py`** : (i) `ResolutionGuard(settings)` instancié au startup (juste après `ToxicityAnalyzer`) ; (ii) **Step 3c** dans `run_quoting_cycle` AVANT le per-market exposure gate — appelle `record_midpoint` + `should_delist` puis `set_state(INACTIVE)` + `cancel_orders_for_market` + Discord `warning` ; (iii) hot WS path : `record_midpoint` appelé après `_hot_quoter.record_mid` ; (iv) signature `run_quoting_cycle` étendue d'un paramètre `resolution_guard: ResolutionGuard` ; (v) module-level `_hot_resolution_guard` pour le hot path. **+31 nouveaux tests** dans `tests/test_resolution_guard.py` (7 max_loss + 6 record_midpoint + 8 evaluate_move_24h + 8 should_delist + 2 integration). **279/279 tests** ✅. 2026-05-10 \| **6 fixes opérationnels post-V2** (issues 1–6 du runbook) : (1) seeder atomique YES+NO (pre-check coût worst-case + book depth), (2) skew penalty continu `delta = signed × SKEW_PENALTY × base_offset` + Q-score forcé à 0 sur quote one-sided, (3) compteurs cycle `selected/active/scoring` distincts + skip reasons, (4) `MarketState` enum (`UNKNOWN/SEED_FAILED/ONE_SIDED/SCORING/INACTIVE`) + realloc tire de `{SEED_FAILED, INACTIVE}` jamais de `ONE_SIDED`, (5) `MAX_EXPOSURE_RATIO=0.80` + `MAX_MARKET_EXPOSURE_RATIO=0.40` (per-market gate AVANT global), (6) hot-path log INFO seulement si modifié (sinon DEBUG) + `scoring_monitor` log `repr(exc)` quand `checked==0` + table cycle ASCII INFO + table startup. **248/248 tests** ✅ (+25 nouveaux). 2026-05-09 \| Migration **CLOB V2 complète** (commit **`34aa08a`**) : stack runtime `py_clob_client_v2`, fix `get_midpoints`/`get_order_books` sérialisation `BookParams` → dict (`core/client.py`), allowances/wrap `scripts/setup_allowances.py` (pUSD, Uniswap natif→USDC.e, POA middleware Polygon). **Live mainnet** depuis 2026-05-09 : `DRY_RUN=false`, `TOTAL_CAPITAL=350`, `MAX_MARKETS=3` ; marchés actifs *Becerra CA Gov*, *Fed rate cuts 2026* ; ~8 ordres, Q-score ~96 %. **Prochain :** P2d `resolution_guard`.
 
 ### ⚠️ Modules qui N'EXISTENT PAS (doc stale — ne jamais référencer)
 - `dashboard/` — absent. `ENABLE_DASHBOARD=true` sans effet.
@@ -66,10 +66,16 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 3. Tous les changements récents (2026-05-10 + 2026-05-08 + 2026-05-05 + 2026-05-04)
+## 3. Tous les changements récents (2026-05-19 + 2026-05-10 + 2026-05-08 + 2026-05-05 + 2026-05-04)
 
 | Fichier | Changement |
 |---------|------------|
+| **2026-05-19 (P2d resolution guard)** | |
+| `core/resolution_guard.py` (nouveau, ~280 LOC) | `ResolutionGuard(settings)` : `record_midpoint(cid, mid, ts_utc)` (deque/cid, rétention 25h, auto-prune, mids hors `(0,1)` droppés, naive datetimes traités UTC) ; `max_loss_check(cid, yes, no) → (breached, max_loss, limit)` (strict `>`) ; `evaluate_move_24h(cid) → (breached, move_pct, limit)` (≥20 min d'historique, ±30 min de tolérance sur anchor `now-24h`, picks closest sample) ; `should_delist(cid, yes, no, mid)` agrège avec priorité `extreme_mid > max_loss > move_24h > None`. Module pur — zéro `main.py` import, zéro API call. Helper `_utcnow()` indirecté pour monkeypatch tests. |
+| `config/settings.py` (bloc "Resolution Guard") | `RESOLUTION_MAX_LOSS_USD: float = Field(default=25.0, ge=1.0)` + `RESOLUTION_MAX_MOVE_24H_PCT: float = Field(default=15.0, ge=1.0, le=100.0)`. Filet extrême `mid < 0.05 || > 0.95` reste hard-coded module-level (sécurité non-débrayable). |
+| `.env.example` (bloc "Resolution Guard (P2d)") | Vars `RESOLUTION_MAX_LOSS_USD=25.0` + `RESOLUTION_MAX_MOVE_24H_PCT=15.0` avec commentaires (algo + tolérance + safety net). |
+| `main.py` (import L37, refs L188-191, hot path L218-224, signature `run_quoting_cycle` L348, Step 3c L451-505, instanciation L1170, hot globals L1287, call L1349) | (a) Import `ResolutionGuard` ; (b) module-level `_hot_resolution_guard: Optional[ResolutionGuard] = None` ; (c) hot `record_midpoint(cid, yes_mid_for_history, datetime.now(timezone.utc))` après `_hot_quoter.record_mid` ; (d) **Step 3c** dans `run_quoting_cycle` AVANT le per-market exposure gate (Step 4) : append cold mid → `should_delist` → si delist : `set_state(INACTIVE)` + `paused_set.add(cid)` + `skip_reasons[cid] = f"resolution_{reason}"` + `cancel_orders_for_market` + log `WARNING \| resolution_guard \| {cid[:10]} delisted — {reason} (max_loss=$X, move=Y%)` + Discord `warning` ; (e) init de `active_cids`/`paused_set`/`skip_reasons` remonté de Step 4 vers Step 3c (single init, lecture/append en Step 4) ; (f) `resolution_guard=resolution_guard` ajouté à l'appel `run_quoting_cycle` dans la boucle principale. |
+| `tests/test_resolution_guard.py` (nouveau, 31 tests) | `TestMaxLossCheck` (7) : not breached / heavy_yes / heavy_no / strict `>` at threshold / yes==no (max≠sum) / zero / configurable limit. `TestRecordMidpoint` (6) : order / purge >25h / keep ≤25h / drop out-of-band / drop empty cid / naive datetime as UTC. `TestEvaluateMove24h` (8) : no data / <20 min / no point in tolerance (22 min data) / below threshold / above threshold / 29 min in tolerance / 31 min out / picks closest. `TestShouldDelist` (8) : extreme low/high / 0.05+0.95 boundary in-band / max_loss reason / move_24h reason / priority extreme>max_loss / priority max_loss>move_24h / no trigger. `TestIntegration` (2) : timeline 25h synthétique + per-market isolation. **279/279 ✅** (248 baseline + 31 nouveaux). |
 | **2026-05-10 (post-V2 ops fixes — 6 issues runbook)** | |
 | `config/settings.py:142,150-151` | **Issue 5** : `SKEW_PENALTY: float = 0.5` (range `[0,2]`) + `MAX_EXPOSURE_RATIO: float = 0.80` + `MAX_MARKET_EXPOSURE_RATIO: float = 0.40` |
 | `core/inventory_seeder.py:179-320` | **Issue 1** : seed atomique YES+NO. Pre-check sur les 2 côtés AVANT tout `create_and_post_order` : (a) `worst_extra_ticks = SEED_AGGRESSIVE_TICKS + 2×(SEED_MAX_ATTEMPTS−1)` pour estimer le prix de la dernière retry — sinon le runtime cost-check ré-introduisait le bug ; (b) `_check_book_depth` sur YES ET NO (asks ou bids opposés via mint complément) ; (c) exécution séquentielle YES→NO, abort NO si YES = 0 shares acquise. Log `WARNING | seeder | Market {cid} skipped — atomic seed failed (...). No position taken.` |
@@ -154,11 +160,11 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 ### Ops post-V2 (2026-05-10) — Stabilité opérationnelle
 - **DONE 2026-05-10** : 6 issues du runbook fixées en un pass (seed atomique, skew continu, table cycle, `MarketState`, `MAX_EXPOSURE_RATIO` + per-market sublimit, logs hot-path/scoring/startup). 25 tests ajoutés, 248/248 ✅. Pas de changement de stratégie (spread/gamma/ranking inchangés). Voir section 3 pour le diff exact.
 
-### Prochain (P2d) — Resolution guard complet *(priorité engineering post–migration V2, 2026-05-09)*
-- **`core/resolution_guard.py`** à créer.
-- Max-loss calculator par marché : `max(yes_size, no_size) × 1.0` → pause si > `RESOLUTION_MAX_LOSS_USD`.
-- Auto-delist si mid move > 15% en 24h → paramètre `RESOLUTION_MAX_MOVE_24H_PCT`.
-- Nouveaux env vars dans `config/settings.py` : `RESOLUTION_MAX_LOSS_USD`, `RESOLUTION_MAX_MOVE_24H_PCT`.
+### P2d — Resolution guard
+- **DONE 2026-05-19.** `core/resolution_guard.py` (~280 LOC) : `max_loss_check` (worst-case `max(yes,no)×$1`), `evaluate_move_24h` (≥20 min history, ±30 min tolerance, closest sample), `should_delist` (priorité `extreme_mid > max_loss > move_24h`), filet extrême hard-coded `mid<0.05 || >0.95`.
+- Env vars : `RESOLUTION_MAX_LOSS_USD=25.0`, `RESOLUTION_MAX_MOVE_24H_PCT=15.0`.
+- Intégration `main.py` : instanciation startup, Step 3c cold path AVANT exposure gate, hot WS path `record_midpoint` après `_hot_quoter.record_mid`. Discord `warning` + `cancel_orders_for_market` + `set_state(INACTIVE)` sur delist.
+- **+31 tests** (`tests/test_resolution_guard.py`). **279/279 ✅**.
 
 ---
 
@@ -166,7 +172,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ### Tier 1 — Impact 2-3× sur les retours
 1. ~~**`core/toxicity_analyzer.py`**~~ **FAIT P2b** — VPIN + fill-vs-mid scoring
-2. **`core/resolution_guard.py`** — midpoint ongoing + max-loss calculator + auto-delist >15 % en 24h
+2. ~~**`core/resolution_guard.py`**~~ **FAIT P2d (2026-05-19)** — max-loss + 24h move + extreme-mid net
 3. ~~**`backtest/`**~~ **FAIT P2c** — CLOB `/prices-history` + Gamma `/markets` → SQLite ; grid search 36 combos, Q-score réalisé vs max théorique, PnL, Sharpe portfolio-level
 
 ### Tier 2 — Impact 1.5-2× sur les retours
