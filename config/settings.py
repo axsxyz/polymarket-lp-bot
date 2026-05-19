@@ -150,6 +150,22 @@ class Settings(BaseSettings):
     MAX_EXPOSURE_RATIO: float = Field(default=0.80, ge=0.0, le=2.0)
     MAX_MARKET_EXPOSURE_RATIO: float = Field(default=0.40, ge=0.0, le=2.0)
 
+    # ── Resolution Guard (P2d) ──────────────────────────────────────
+    # Pre-resolution risk + 24h drift delisting (core/resolution_guard.py).
+    # Independent of the skew / spike / toxicity guards: those protect against
+    # bad fills, this protects against terminal binary-payoff risk as a
+    # market approaches its resolution event.
+    #
+    #  - RESOLUTION_MAX_LOSS_USD:    worst-case USD loss tolerated per market,
+    #    computed as max(yes_size, no_size) * 1.0 (heavy side → 0 payout).
+    #  - RESOLUTION_MAX_MOVE_24H_PCT: max permitted relative midpoint move
+    #    over the last 24h (|now − 24h_ago| / 24h_ago * 100). Requires
+    #    ≥ 20 min of recorded history; lookup tolerance ±30 min around the
+    #    24h anchor. Hard-coded module-level safety net (mid < 0.05 or > 0.95
+    #    forces delist regardless of the two values above).
+    RESOLUTION_MAX_LOSS_USD: float = Field(default=25.0, ge=1.0)
+    RESOLUTION_MAX_MOVE_24H_PCT: float = Field(default=15.0, ge=1.0, le=100.0)
+
     # ── Inventory Seeding ─────────────────────────────────────────────
     SEED_ENABLED: bool = True
     SEED_SHARES: float = Field(default=1.0, ge=1.0, le=100.0)

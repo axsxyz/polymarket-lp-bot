@@ -34,6 +34,7 @@ from core.market_manager import MarketManager, MarketState
 from core.order_manager import OrderManager, QuoteUpdateResult
 from core.fill_collector import FillCollector
 from core.quoter import Quoter, TwoSidedQuotes
+from core.resolution_guard import ResolutionGuard
 from core.rewards_tracker import RewardsTracker
 from core.inventory_seeder import InventorySeeder
 from core.scoring_monitor import ScoringMonitor
@@ -186,6 +187,7 @@ _hot_inventory: Optional["InventoryTracker"] = None
 _hot_quoter: Optional[Quoter] = None
 _hot_settings: Optional[Settings] = None
 _hot_discord: Optional[DiscordNotifier] = None
+_hot_resolution_guard: Optional[ResolutionGuard] = None
 
 
 async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> None:
@@ -214,6 +216,12 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
         new_mid if token_id == market.token_id_yes else (1.0 - new_mid)
     )
     _hot_quoter.record_mid(market.condition_id, yes_mid_for_history)
+    if _hot_resolution_guard is not None:
+        _hot_resolution_guard.record_midpoint(
+            market.condition_id,
+            yes_mid_for_history,
+            datetime.now(timezone.utc),
+        )
 
     if _hot_quoter.is_spike_paused(market.condition_id):
         return
@@ -342,6 +350,7 @@ async def run_quoting_cycle(
     discord: DiscordNotifier,
     scoring_monitor: ScoringMonitor,
     toxicity: ToxicityAnalyzer,
+    resolution_guard: ResolutionGuard,
     settings: Settings,
     cycle_index: int = 0,
     skip_cids: set | None = None,
@@ -439,13 +448,64 @@ async def run_quoting_cycle(
     if scoring_rates:
         quoter.update_scoring_rates(scoring_rates)
 
+    # ── Step 3c: Resolution guard (P2d) ─────────────────────────
+    # Pre-resolution risk gate: max-loss + 24h drift + extreme-mid net.
+    # Trips BEFORE the exposure gate so a market headed to resolution
+    # is exited even when it sits under its exposure cap. Independent of
+    # the skew / spike / toxicity guards — those protect against bad
+    # fills; this protects against terminal binary-payoff risk.
+    # Pruned history is fed continuously by the hot WS path; here we
+    # also append the latest cold-cycle mid before evaluating.
+    active_cids = {m.condition_id for m in markets}
+    paused_set: set[str] = set()
+    skip_reasons: Dict[str, str] = {}
+    now_utc = datetime.now(timezone.utc)
+    for m in markets_this_cycle:
+        cid = m.condition_id
+        live_mid = midpoints.get(m.token_id_yes)
+        if live_mid is None:
+            continue
+        resolution_guard.record_midpoint(cid, live_mid, now_utc)
+        pos = inventory.get_position(cid)
+        yes_sz = pos.yes_size if pos else 0.0
+        no_sz = pos.no_size if pos else 0.0
+        delist, reason = resolution_guard.should_delist(cid, yes_sz, no_sz, live_mid)
+        if not delist:
+            continue
+        _, max_loss, _ = resolution_guard.max_loss_check(cid, yes_sz, no_sz)
+        _, move_pct, _ = resolution_guard.evaluate_move_24h(cid)
+        logger.warning(
+            "WARNING | resolution_guard | {} delisted — {} "
+            "(max_loss=${:.2f}, move={:.1f}%)",
+            cid[:10], reason, max_loss, move_pct,
+        )
+        market_mgr.set_state(cid, MarketState.INACTIVE)
+        paused_set.add(cid)
+        skip_reasons[cid] = f"resolution_{reason}"
+        try:
+            await order_mgr.cancel_orders_for_market(cid)
+        except Exception as exc:
+            logger.error(
+                "Resolution guard: cancel_orders_for_market({}) failed: {}",
+                cid[:10], exc,
+            )
+        asyncio.create_task(discord.send_alert(
+            title="Resolution Guard — Market Delisted",
+            message=(
+                f"Market `{cid[:12]}…` delisted by resolution guard.\n"
+                f"Reason: **{reason}** — max_loss=**${max_loss:.2f}** "
+                f"(limit ${settings.RESOLUTION_MAX_LOSS_USD:.2f}), "
+                f"24h_move=**{move_pct:.1f}%** "
+                f"(limit {settings.RESOLUTION_MAX_MOVE_24H_PCT:.1f}%), "
+                f"live_mid=**{live_mid:.3f}**. Orders cancelled."
+            ),
+            level="warning",
+        ))
+
     # ── Step 4: Per-market exposure gate (Issue 5) ──────────────
     # Pause individual markets that breach MAX_MARKET_EXPOSURE_RATIO
     # BEFORE the global gross check so a runaway market is contained
     # without dragging the whole bot to the global limit.
-    active_cids = {m.condition_id for m in markets}
-    paused_set: set[str] = set()
-    skip_reasons: Dict[str, str] = {}
     for m in markets_this_cycle:
         breached, exposure_val, limit_val = inventory.is_market_exposure_breached(
             m.condition_id,
@@ -1166,6 +1226,7 @@ async def main() -> None:
     quoter = Quoter(settings)
     toxicity = ToxicityAnalyzer(settings)
     quoter.attach_toxicity_analyzer(toxicity)
+    resolution_guard = ResolutionGuard(settings)
     order_mgr = OrderManager(client, settings)
     inventory = InventoryTracker(settings)
     fill_collector = FillCollector(client)
@@ -1273,7 +1334,7 @@ async def main() -> None:
     )
 
     # ── WebSocket feed (event-driven quoting) ────────────────────
-    global _ws_feed, _hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings, _hot_discord
+    global _ws_feed, _hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings, _hot_discord, _hot_resolution_guard
     ws_feed: Optional[WebSocketFeed] = None
 
     if settings.WS_ENABLED:
@@ -1285,6 +1346,7 @@ async def main() -> None:
         _hot_quoter = quoter
         _hot_settings = settings
         _hot_discord = discord
+        _hot_resolution_guard = resolution_guard
 
         token_ids = []
         tick_sizes: Dict[str, float] = {}
@@ -1345,6 +1407,7 @@ async def main() -> None:
                     discord=discord,
                     scoring_monitor=scoring_monitor,
                     toxicity=toxicity,
+                    resolution_guard=resolution_guard,
                     settings=settings,
                     cycle_index=cycle_index,
                     skip_cids=unseeded_markets,
