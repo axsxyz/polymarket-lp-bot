@@ -62,6 +62,20 @@ class TwoSidedQuotes:
     yes_quote: Optional[Quote]
     no_quote: Optional[Quote]
 
+    @property
+    def is_two_sided(self) -> bool:
+        """True iff at least one book has BOTH a non-zero BID and ASK.
+
+        LP rewards are paid on `min(Q_bid_side, Q_ask_side)` — a quote
+        with zero size on either side scores zero.  Used by main.py to
+        classify the market as TWO_SIDED (scoring-eligible) vs ONE_SIDED
+        (active but excluded from Q-score) per Issues 2 & 4.
+        """
+        for q in (self.yes_quote, self.no_quote):
+            if q is not None and q.bid_size > 0 and q.ask_size > 0:
+                return True
+        return False
+
 
 # --------------------------------------------------------------------------
 # Tick rounding
@@ -440,15 +454,20 @@ class Quoter:
         bid_offset = base_offset
         ask_offset = base_offset
 
+        # ── Continuous skew penalty (Issue 2) ───────────────────────
+        # Linear price shift driven by the *signed* skew on this book:
+        #   delta = signed * SKEW_PENALTY * base_offset
+        # Heavy side (signed > 0)  → BID price ↓, ASK price ↓ → encourages
+        # liquidating the over-weight token.
+        # Light side (signed < 0)  → BID price ↑, ASK price ↑ → encourages
+        # buying the under-weight token.
+        # Replaces the previous hard-coded 1.4× / 0.85× coefficients with a
+        # configurable, sign-symmetric formulation.
         if skew_ratio > 0.08:
-            skew_widen = base_offset * skew_ratio * 1.4
-            skew_tighten = base_offset * skew_ratio * 0.85
-            if is_heavy_side:
-                bid_offset = min(base_offset + skew_widen, max_sp * 0.92)
-                ask_offset = max(base_offset - skew_tighten, tick)
-            else:
-                bid_offset = max(base_offset - skew_tighten, tick)
-                ask_offset = min(base_offset + skew_widen, max_sp * 0.92)
+            signed = skew_ratio if is_heavy_side else -skew_ratio
+            delta = signed * self._s.SKEW_PENALTY * base_offset
+            bid_offset = max(min(base_offset + delta, max_sp * 0.92), tick)
+            ask_offset = max(min(base_offset - delta, max_sp * 0.92), tick)
 
         if is_recovery and is_heavy_side:
             bid_offset = min(bid_offset * 2.0, max_sp * 0.95)
@@ -507,13 +526,32 @@ class Quoter:
         if bid_size == 0 and ask_size == 0:
             return None
 
+        # Q-score reporting (Issue 2): Polymarket pays
+        #   reward ∝ min(Q_bid_side, Q_ask_side)
+        # so a one-sided quote (BID only OR ASK only) earns ZERO LP rewards.
+        # Reporting q_pct > 0 in that case is misleading — the protocol's
+        # min() collapses the contribution to 0.  Force q_est/q_pct to 0
+        # on one-sided books so logs and downstream consumers see the truth.
+        is_one_sided = (bid_size == 0) or (ask_size == 0)
         avg_spread = (bid_offset + ask_offset) / 2.0
-        q_est = estimate_q_score(max_sp, avg_spread, (bid_size + ask_size) / 2.0)
-        q_pct = ((max_sp - avg_spread) / max_sp) ** 2 * 100 if max_sp > 0 else 0
+        if is_one_sided:
+            q_est = 0.0
+            q_pct = 0.0
+            tag = "ONE_SIDED"
+        else:
+            q_est = estimate_q_score(
+                max_sp, avg_spread, (bid_size + ask_size) / 2.0,
+            )
+            q_pct = ((max_sp - avg_spread) / max_sp) ** 2 * 100 if max_sp > 0 else 0
+            tag = "TWO_SIDED"
 
-        logger.info(
-            "Quote {}  bid={:.4f}x{:.1f}  ask={:.4f}x{:.1f}  offset={:.4f}  Q≈{:.2f} ({:.0f}%)  skew={:.1%}",
-            token_id[:12], bid_price, bid_size, ask_price, ask_size,
+        # Demoted to DEBUG (Issue 6) — the WS hot path was emitting one of
+        # these per token every 1-3s even when smart-diff kept the orders.
+        # The cycle summary block in main.py is the canonical INFO surface.
+        logger.debug(
+            "Quote[{}] {} bid={:.4f}x{:.1f}  ask={:.4f}x{:.1f}  offset={:.4f}  "
+            "Q≈{:.2f} ({:.0f}%)  skew={:.1%}",
+            tag, token_id[:12], bid_price, bid_size, ask_price, ask_size,
             avg_spread, q_est, q_pct, skew_ratio,
         )
 

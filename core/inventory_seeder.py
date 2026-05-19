@@ -77,9 +77,18 @@ class InventorySeeder:
             for markets that were actively seeded this run.  Used by the
             caller to initialise inventory cost basis with the real fill
             price rather than a mid-price estimate.
+
+        Atomicity invariant (Issue 1): YES and NO are treated as an atomic
+        pair.  ``_seed_market`` enforces a strict pre-check on BOTH sides
+        (cost estimate vs cap, order-book depth) before posting anything;
+        if either side fails the pre-check, NEITHER side is posted and
+        the market is reported in ``failed_cids`` with cost basis 0/0.
+        At runtime, sides are seeded sequentially: if the first side
+        acquires zero shares, the second side is skipped to avoid
+        creating a unilateral directional position.
         """
         if not markets:
-            return set()
+            return set(), {}
 
         budget = self._s.TOTAL_CAPITAL * self._s.SEED_BUDGET_PCT
         budget = min(budget, self._s.SEED_MAX_USD_PER_SIDE * len(markets) * 2)
@@ -148,30 +157,47 @@ class InventorySeeder:
     async def _seed_market(
         self, market: MarketCandidate, budget_remaining: float = float("inf"),
     ) -> tuple[float, bool, float, float]:
-        """Seed YES + NO for one market.
+        """Seed YES + NO for one market — ATOMIC pair.
 
         Returns (total_usd_spent, success, yes_cost, no_cost).
-        success=True if BOTH sides either already had inventory or were seeded;
-        False if either side failed.  yes_cost/no_cost are the USD actually
-        spent per side (used by the caller to initialise cost basis correctly).
+        success=True iff BOTH sides either already had inventory or were
+        seeded; False otherwise.  yes_cost/no_cost are the USD actually
+        spent per side (used by the caller to initialise cost basis).
+
+        Atomicity (Issue 1):
+          1. Pre-check BOTH sides up front (token IDs, mid, per-side cost
+             estimate vs cap, order-book depth).  If either side cannot
+             be seeded, NEITHER side is posted: returns (0, False, 0, 0)
+             with a clear warning log — no unilateral position is taken.
+          2. Sides are seeded SEQUENTIALLY (YES first, then NO).  If YES
+             acquires zero shares, NO is skipped entirely so we never
+             enter a one-sided directional position from the seeder.
+          3. If YES partially fills and NO fails at runtime the partial
+             YES position is still tracked (cost basis recorded) and the
+             market is reported in failed_cids; quoting is excluded so
+             the residual is liquidated by the next maintenance cycle.
         """
         if not market.token_id_yes or not market.token_id_no:
             return 0.0, False, 0.0, 0.0
 
+        # Already-seeded short-circuit: if both sides already hold ≥ target
+        # we simply return (success, no spend) — no need for a price probe.
+        target = max(self._s.SEED_SHARES, market.min_size)
+        bal_yes = await self._client.get_conditional_balance(market.token_id_yes)
+        bal_no = await self._client.get_conditional_balance(market.token_id_no)
+        if bal_yes >= target and bal_no >= target:
+            logger.debug(
+                "Seed skip {} — both sides already hold ≥ {} shares",
+                market.condition_id[:12], target,
+            )
+            return 0.0, True, 0.0, 0.0
+
         mid = await self._fetch_mid(market.token_id_yes)
         if mid is None:
             logger.warning(
-                "Seed skip {} — cannot fetch midpoint",
+                "WARNING | seeder | Market {} skipped — atomic seed failed "
+                "(midpoint unavailable). No position taken.",
                 market.condition_id[:12],
-            )
-            return 0.0, False, 0.0, 0.0
-
-        target = max(self._s.SEED_SHARES, market.min_size)
-        est_cost = target * max(mid, 1.0 - mid) * 2
-        if est_cost > budget_remaining:
-            logger.info(
-                "Seed skip {} — est. ${:.0f} exceeds remaining budget ${:.0f}",
-                market.condition_id[:12], est_cost, budget_remaining,
             )
             return 0.0, False, 0.0, 0.0
 
@@ -181,43 +207,117 @@ class InventorySeeder:
             budget_remaining / 2,
         )
 
-        sides = [
-            ("YES", market.token_id_yes, mid),
-            ("NO", market.token_id_no, round(1.0 - mid, 4)),
-        ]
+        # ── Atomic pre-check (Issue 1): cost + book depth on BOTH sides ──
+        yes_mid = mid
+        no_mid = round(1.0 - mid, 4)
 
-        async def _do_side(label: str, token_id: str, token_mid: float):
-            return await self._seed_one_side(
+        # Per-side estimate uses the WORST-CASE attempt price (final retry
+        # in `_seed_one_side`: extra_ticks = SEED_AGGRESSIVE_TICKS +
+        # 2 × (SEED_MAX_ATTEMPTS - 1)).  Using attempt-1 alone would let
+        # the runtime cost-check abort the NO side AFTER YES already filled,
+        # re-creating the unilateral-position bug this function exists to
+        # prevent.  Probing the worst case ensures every retry fits the cap.
+        worst_extra_ticks = (
+            self._s.SEED_AGGRESSIVE_TICKS + 2 * (SEED_MAX_ATTEMPTS - 1)
+        )
+        yes_est_price = max(0.01, min(0.99,
+            round(yes_mid + worst_extra_ticks * tick, 4)))
+        no_est_price = max(0.01, min(0.99,
+            round(no_mid + worst_extra_ticks * tick, 4)))
+
+        yes_deficit = max(0.0, math.ceil(target - bal_yes))
+        no_deficit = max(0.0, math.ceil(target - bal_no))
+
+        yes_est_cost = yes_est_price * yes_deficit
+        no_est_cost = no_est_price * no_deficit
+
+        cost_ok = (yes_est_cost <= per_side_budget) and (no_est_cost <= per_side_budget)
+        if not cost_ok:
+            logger.warning(
+                "WARNING | seeder | Market {} skipped — atomic seed failed "
+                "(YES_cost=${:.2f}, NO_cost=${:.2f}, cap=${:.2f}). No position taken.",
+                market.condition_id[:12], yes_est_cost, no_est_cost, per_side_budget,
+            )
+            return 0.0, False, 0.0, 0.0
+
+        # Probe books for both sides BEFORE posting anything.
+        yes_has_liq, _yba = await self._check_book_depth(
+            market.token_id_yes, "asks", target,
+        )
+        no_has_liq, _nba = await self._check_book_depth(
+            market.token_id_no, "asks", target,
+        )
+        if not (yes_has_liq and no_has_liq):
+            missing = []
+            if not yes_has_liq:
+                missing.append("YES")
+            if not no_has_liq:
+                missing.append("NO")
+            logger.warning(
+                "WARNING | seeder | Market {} skipped — atomic seed failed "
+                "(orderbook empty on side(s): {}). No position taken.",
+                market.condition_id[:12], "+".join(missing),
+            )
+            return 0.0, False, 0.0, 0.0
+
+        # ── Sequential execution (atomicity at runtime) ──
+        # YES first.  If it acquires zero shares NO is skipped to keep the
+        # invariant intact.  If YES partially fills, we still try NO so the
+        # imbalance is at most one side's partial — better than full one-sided.
+        try:
+            yes_cost = await self._seed_one_side(
                 market=market,
-                label=label,
-                token_id=token_id,
-                token_mid=token_mid,
+                label="YES",
+                token_id=market.token_id_yes,
+                token_mid=yes_mid,
                 tick=tick,
                 max_cost=per_side_budget,
             )
+        except Exception as exc:
+            logger.error(
+                "WARNING | seeder | Market {} — YES side runtime error ({}). "
+                "Aborting NO side, no position taken.",
+                market.condition_id[:12], exc,
+            )
+            return 0.0, False, 0.0, 0.0
 
-        results = await asyncio.gather(
-            _do_side(*sides[0]),
-            _do_side(*sides[1]),
-            return_exceptions=True,
-        )
+        if yes_cost is None:
+            logger.warning(
+                "WARNING | seeder | Market {} skipped — atomic seed failed "
+                "(YES side runtime failure: 0 shares acquired). NO side aborted.",
+                market.condition_id[:12],
+            )
+            return 0.0, False, 0.0, 0.0
 
-        yes_cost = 0.0
-        no_cost = 0.0
-        both_ok = True
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                logger.error("Seed side exception for {}: {}", market.condition_id[:12], res)
-                both_ok = False
-            elif res is None:
-                both_ok = False
-            else:
-                if i == 0:
-                    yes_cost = res
-                else:
-                    no_cost = res
+        try:
+            no_cost = await self._seed_one_side(
+                market=market,
+                label="NO",
+                token_id=market.token_id_no,
+                token_mid=no_mid,
+                tick=tick,
+                max_cost=per_side_budget,
+            )
+        except Exception as exc:
+            logger.error(
+                "WARNING | seeder | Market {} — NO side runtime error after YES "
+                "was seeded (${:.2f}). Partial position retained, market excluded "
+                "from quoting: {}",
+                market.condition_id[:12], yes_cost, exc,
+            )
+            return yes_cost, False, yes_cost, 0.0
 
-        return yes_cost + no_cost, both_ok, yes_cost, no_cost
+        if no_cost is None:
+            logger.warning(
+                "WARNING | seeder | Market {} — atomic seed FAILED at runtime "
+                "(YES_cost=${:.2f} acquired, NO=0 shares). Market excluded from "
+                "quoting; the partial YES position will be liquidated by the next "
+                "maintenance cycle.",
+                market.condition_id[:12], yes_cost,
+            )
+            return yes_cost, False, yes_cost, 0.0
+
+        return yes_cost + no_cost, True, yes_cost, no_cost
 
     # ------------------------------------------------------------------
     # Order book depth check

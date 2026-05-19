@@ -135,6 +135,20 @@ class Settings(BaseSettings):
     SKEW_PAUSE_DURATION_SECONDS: int = Field(default=600, ge=0)
     SKEW_ALERT_COOLDOWN_SECONDS: int = Field(default=900, ge=0)
     SKEW_RECOVERY_ASK_SIZE_PCT: float = Field(default=0.50, ge=0.05, le=1.0)
+    # Continuous skew penalty (Issue 2): linear price shift on the heavy
+    # side — `delta_price = signed_skew * SKEW_PENALTY * base_offset`.
+    # Larger value → more aggressive rebalancing through the quote prices.
+    # Replaces the previous hard-coded 1.4×widen / 0.85×tighten coefficients.
+    SKEW_PENALTY: float = Field(default=0.5, ge=0.0, le=2.0)
+
+    # ── Exposure (deployed-capital-relative) ────────────────────────
+    # Issue 5: gross exposure must stay below MAX_EXPOSURE_RATIO of the
+    # *deployed* capital (sum of per-market allocations, falling back
+    # to TOTAL_CAPITAL when no markets are loaded). Per-market sub-cap
+    # via MAX_MARKET_EXPOSURE_RATIO triggers cancel-and-pause for that
+    # single market BEFORE the global limit can be reached.
+    MAX_EXPOSURE_RATIO: float = Field(default=0.80, ge=0.0, le=2.0)
+    MAX_MARKET_EXPOSURE_RATIO: float = Field(default=0.40, ge=0.0, le=2.0)
 
     # ── Inventory Seeding ─────────────────────────────────────────────
     SEED_ENABLED: bool = True

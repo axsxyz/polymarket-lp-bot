@@ -336,10 +336,60 @@ class InventoryTracker:
         return filled + open_order_notional
 
     def is_gross_exposure_breached(
-        self, open_order_notional: float = 0.0, active_cids: Optional[set] = None,
+        self,
+        open_order_notional: float = 0.0,
+        active_cids: Optional[set] = None,
+        deployed_capital: Optional[float] = None,
     ) -> bool:
-        limit = self._s.GLOBAL_MAX_GROSS_EXPOSURE_PCT * self._s.TOTAL_CAPITAL
+        """Gross exposure breach (Issue 5).
+
+        When *deployed_capital* is provided the limit is
+        ``deployed_capital × MAX_EXPOSURE_RATIO`` (a ratio of the actually
+        deployed capital, per the Issue 5 spec).  Otherwise it falls back
+        to the legacy ``GLOBAL_MAX_GROSS_EXPOSURE_PCT × TOTAL_CAPITAL``
+        check so existing tests/callers keep working unchanged.
+        """
+        if deployed_capital is not None and deployed_capital > 0:
+            limit = deployed_capital * self._s.MAX_EXPOSURE_RATIO
+        else:
+            limit = self._s.GLOBAL_MAX_GROSS_EXPOSURE_PCT * self._s.TOTAL_CAPITAL
         return self.gross_exposure_usd(open_order_notional, active_cids) > limit
+
+    # ------------------------------------------------------------------
+    # Per-market exposure (Issue 5)
+    # ------------------------------------------------------------------
+
+    def market_exposure_usd(
+        self, condition_id: str, open_order_notional_for_market: float = 0.0,
+    ) -> float:
+        """Gross exposure for a single market: filled (mark-to-mid) + open orders."""
+        pos = self._positions.get(condition_id)
+        if pos is None:
+            return open_order_notional_for_market
+        yes_mid = self._midpoints.get(pos.yes_token_id, 0.5)
+        return pos.gross_exposure_at_mid(yes_mid) + open_order_notional_for_market
+
+    def is_market_exposure_breached(
+        self,
+        condition_id: str,
+        allocated_capital: float,
+        open_order_notional_for_market: float = 0.0,
+    ) -> tuple[bool, float, float]:
+        """Per-market exposure check (Issue 5).
+
+        Triggers BEFORE the global gross check so a single runaway market
+        is paused without dragging the whole bot into the global limit.
+
+        Returns ``(breached, exposure_usd, limit_usd)`` so the caller can
+        log the actual numbers without recomputing them.
+        """
+        if allocated_capital <= 0:
+            return False, 0.0, 0.0
+        limit = allocated_capital * self._s.MAX_MARKET_EXPOSURE_RATIO
+        exposure = self.market_exposure_usd(
+            condition_id, open_order_notional_for_market,
+        )
+        return (exposure > limit, exposure, limit)
 
     # ------------------------------------------------------------------
     # Daily drawdown circuit breaker
