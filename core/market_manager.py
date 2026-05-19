@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -42,6 +43,32 @@ TOP_TIER_COUNT = 15
 TOP_TIER_BOOST = 1.25  # top markets get 25% more capital
 
 
+class MarketState(str, Enum):
+    """Per-market operational state (Issue 4).
+
+    Distinguishes WHY a market is or isn't producing scoring quotes so the
+    cycle log, Discord alerts, and dynamic-realloc can react appropriately:
+
+      - SEED_FAILED: never entered, no position acquired (atomic seed
+        aborted). Capital is freely reallocated AWAY from this market.
+      - ONE_SIDED:   actively quoting but only one side of the book
+        (e.g. skew hard-pause). Excluded from Q-score and from realloc
+        donations — the bot is mid-rebalance, do not pull its capital.
+      - SCORING:     two-sided quotes posted, scoring confirmed.
+        Realloc may BOOST allocation toward these markets.
+      - INACTIVE:    selected but didn't post quotes this cycle (errors,
+        midpoint-guard pause, spike pause, exposure gate, etc.). Capital
+        can be reclaimed for re-allocation to scoring markets.
+      - UNKNOWN:     default state before first cycle classification.
+    """
+
+    UNKNOWN = "UNKNOWN"
+    SEED_FAILED = "SEED_FAILED"
+    ONE_SIDED = "ONE_SIDED"
+    SCORING = "SCORING"
+    INACTIVE = "INACTIVE"
+
+
 class MarketManager:
     """Owns the list of active markets and their capital allocations."""
 
@@ -57,6 +84,9 @@ class MarketManager:
         self._markets: List[MarketCandidate] = []
         self._token_index: Dict[str, MarketCandidate] = {}
         self._last_refresh: Optional[datetime] = None
+        # Per-market operational state (Issue 4) — survives across cycles
+        # so realloc can read it without recomputing from scratch.
+        self._states: Dict[str, MarketState] = {}
 
     @property
     def markets(self) -> List[MarketCandidate]:
@@ -65,6 +95,35 @@ class MarketManager:
     @property
     def market_count(self) -> int:
         return len(self._markets)
+
+    # ------------------------------------------------------------------
+    # Market state (Issue 4)
+    # ------------------------------------------------------------------
+
+    def set_state(self, condition_id: str, state: MarketState) -> None:
+        """Record the latest operational state for a market.
+
+        SEED_FAILED is sticky: once set by the seeder it remains until the
+        next ``refresh()`` rebuilds the universe (the unseeded cid leaves
+        the candidate list).  Other states overwrite freely — they reflect
+        the most recent cycle outcome.
+        """
+        if (
+            self._states.get(condition_id) == MarketState.SEED_FAILED
+            and state != MarketState.SEED_FAILED
+        ):
+            return
+        self._states[condition_id] = state
+
+    def get_state(self, condition_id: str) -> MarketState:
+        return self._states.get(condition_id, MarketState.UNKNOWN)
+
+    def get_states_snapshot(self) -> Dict[str, MarketState]:
+        """Read-only copy of the current state map (for logging/realloc)."""
+        return dict(self._states)
+
+    def cids_in_state(self, state: MarketState) -> List[str]:
+        return [cid for cid, st in self._states.items() if st == state]
 
     # ------------------------------------------------------------------
     # Public API
@@ -124,8 +183,9 @@ class MarketManager:
         """Log each selected market in detail and emit IN/OUT diff vs the
         previous selection.
 
-        - Always logs the full selected list (one line per market) so we can
-          tell from the logs which markets are quoted.
+        - Always logs the full selected list as a clean fixed-width table
+          (Issue 6) so the daily logs show selections at a glance instead
+          of long key-value lines.
         - Computes IN/OUT diff against `prev_selection` (empty on cold boot).
         - Sends a Discord 'info' alert when the selection actually changed
           (skipped when there's no prior state, to avoid spam at startup).
@@ -133,12 +193,23 @@ class MarketManager:
         new_cids = {m.condition_id for m in self._markets}
 
         logger.info("Selected markets ({}):", len(self._markets))
+        # Header — widths chosen to keep typical market lines under 120 cols.
+        header = (
+            f"  {'Question':<40}  {'cid':<10}  "
+            f"{'mid':>6}  {'spread':>7}  {'alloc':>8}  {'reward/day':>10}"
+        )
+        sep = "  " + "─" * (len(header) - 2)
+        logger.info(header)
+        logger.info(sep)
         for m in self._markets:
-            q = (m.question or "")[:50]
+            q = (m.question or m.condition_id[:16])
+            q = (q[:37] + "…") if len(q) > 40 else q
             logger.info(
-                "  • {} | cid={} | alloc=${:.2f} | reward=${:.1f}/day",
-                q, m.condition_id[:12], m.allocated_capital, m.reward_rate_daily,
+                "  {:<40}  {:<10}  {:>6.3f}  {:>7.4f}  {:>7.2f}$  {:>9.2f}$",
+                q, m.condition_id[:10], m.midpoint, m.max_spread,
+                m.allocated_capital, m.reward_rate_daily,
             )
+        logger.info(sep)
 
         if not prev_selection:
             return  # No prior state — skip diff and Discord notification
@@ -398,36 +469,67 @@ class MarketManager:
     # ------------------------------------------------------------------
 
     def reallocate_capital(self, scoring_rates: dict[str, float]) -> int:
-        """Shift capital from non-scoring markets to scoring ones.
+        """Shift capital toward SCORING markets, away from SEED_FAILED / INACTIVE.
 
         Returns number of markets whose allocation changed by > 5%.
         Caps total shift at DYNAMIC_REALLOC_MAX_SHIFT_PCT per cycle.
+
+        Donor selection (Issue 4):
+          - SEED_FAILED: pulled from — capital was never deployed there.
+          - INACTIVE:   pulled from — selected but not currently quoting.
+          - ONE_SIDED:  PRESERVED — the bot is actively rebalancing on one
+                        side and needs its capital to recover; pulling
+                        capital here would freeze the recovery.
+          - SCORING:    BOOSTED — proven-effective markets receive the
+                        redistributed capital.
         """
-        if not self._markets or not scoring_rates:
+        if not self._markets:
             return 0
 
         max_shift = self._settings.DYNAMIC_REALLOC_MAX_SHIFT_PCT
         budget = self._settings.TOTAL_CAPITAL
         adjusted = 0
 
-        scoring_markets = [m for m in self._markets if scoring_rates.get(m.condition_id, 0) > 0.5]
-        non_scoring = [m for m in self._markets if scoring_rates.get(m.condition_id, 0) <= 0.5]
+        # Recipients: SCORING markets (preferred) or, if none classified
+        # yet, fall back to scoring_rates >= 0.5 to keep the realloc
+        # functional during the first few cycles.
+        scoring_set: set[str] = {
+            cid for cid, st in self._states.items()
+            if st == MarketState.SCORING
+        }
+        if not scoring_set and scoring_rates:
+            scoring_set = {
+                cid for cid, rate in scoring_rates.items() if rate >= 0.5
+            }
+        scoring_markets = [m for m in self._markets if m.condition_id in scoring_set]
 
-        if not scoring_markets or not non_scoring:
+        # Donors: SEED_FAILED ∪ INACTIVE.  ONE_SIDED is intentionally
+        # excluded so we don't strip capital from a market that's
+        # mid-rebalance.
+        donor_states = {MarketState.SEED_FAILED, MarketState.INACTIVE}
+        donors = [
+            m for m in self._markets
+            if self._states.get(m.condition_id) in donor_states
+        ]
+
+        if not scoring_markets or not donors:
             return 0
 
-        # Calculate how much to redistribute
-        total_from_non_scoring = sum(m.allocated_capital for m in non_scoring)
-        shift_amount = min(total_from_non_scoring * max_shift, budget * max_shift)
+        # Calculate how much to redistribute (cap at MAX_SHIFT_PCT of both
+        # the donor pool and the total budget).
+        total_from_donors = sum(m.allocated_capital for m in donors)
+        shift_amount = min(total_from_donors * max_shift, budget * max_shift)
+        if shift_amount <= 0:
+            return 0
 
-        per_non_scoring_cut = shift_amount / len(non_scoring) if non_scoring else 0
-        per_scoring_boost = shift_amount / len(scoring_markets) if scoring_markets else 0
+        per_donor_cut = shift_amount / len(donors)
+        per_scoring_boost = shift_amount / len(scoring_markets)
 
-        for m in non_scoring:
+        for m in donors:
             old = m.allocated_capital
             m.allocated_capital = max(
                 self._settings.MIN_CAPITAL_PER_MARKET,
-                m.allocated_capital - per_non_scoring_cut,
+                m.allocated_capital - per_donor_cut,
             )
             if abs(m.allocated_capital - old) / max(old, 1) > 0.05:
                 adjusted += 1
@@ -449,9 +551,30 @@ class MarketManager:
                 m.allocated_capital *= scale
 
         if adjusted:
+            seed_failed_donors = [
+                m for m in donors
+                if self._states.get(m.condition_id) == MarketState.SEED_FAILED
+            ]
+            inactive_donors = [
+                m for m in donors
+                if self._states.get(m.condition_id) == MarketState.INACTIVE
+            ]
+            donor_summary_parts = []
+            if seed_failed_donors:
+                donor_summary_parts.append(
+                    f"SEED_FAILED: {', '.join(m.condition_id[:10] for m in seed_failed_donors[:3])}"
+                    + (f" +{len(seed_failed_donors) - 3} more" if len(seed_failed_donors) > 3 else "")
+                )
+            if inactive_donors:
+                donor_summary_parts.append(
+                    f"INACTIVE: {', '.join(m.condition_id[:10] for m in inactive_donors[:3])}"
+                    + (f" +{len(inactive_donors) - 3} more" if len(inactive_donors) > 3 else "")
+                )
             logger.info(
-                "Dynamic realloc: shifted ${:.0f} from {} non-scoring to {} scoring markets ({} adjusted)",
-                shift_amount, len(non_scoring), len(scoring_markets), adjusted,
+                "Dynamic realloc: shifted ${:.0f} from [{}] to [SCORING: {} markets] ({} adjusted)",
+                shift_amount,
+                " | ".join(donor_summary_parts) if donor_summary_parts else "n/a",
+                len(scoring_markets), adjusted,
             )
 
         return adjusted

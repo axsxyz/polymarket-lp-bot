@@ -30,7 +30,7 @@ from loguru import logger
 from config.settings import Settings
 from core.client import AsyncClobClient
 from core.inventory import InventoryTracker
-from core.market_manager import MarketManager
+from core.market_manager import MarketManager, MarketState
 from core.order_manager import OrderManager, QuoteUpdateResult
 from core.fill_collector import FillCollector
 from core.quoter import Quoter, TwoSidedQuotes
@@ -265,9 +265,19 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
         if result.posted and _ws_feed:
             _ws_feed.update_order_center(market.token_id_yes, yes_mid)
             _ws_feed.update_order_center(market.token_id_no, 1.0 - yes_mid)
-            logger.debug(
+            # INFO only when an order is actually modified/cancelled
+            # (Issue 6).  Smart-diff "kept" paths emit nothing here — the
+            # underlying order_manager.cancel_and_replace() already logs
+            # at DEBUG when it keeps an order within the tick threshold.
+            logger.info(
                 "Hot requote {} — {} orders posted (fast={})",
                 market.condition_id[:12], len(result.posted), is_fast,
+            )
+        elif result.kept and not result.posted:
+            # All sides within tick threshold; nothing modified — DEBUG only.
+            logger.debug(
+                "Hot requote {} — kept {} orders unchanged (fast={})",
+                market.condition_id[:12], result.kept, is_fast,
             )
     except Exception as exc:
         logger.error("Hot requote failed for {}: {}", market.condition_id[:12], exc)
@@ -336,7 +346,7 @@ async def run_quoting_cycle(
     cycle_index: int = 0,
     skip_cids: set | None = None,
     ws_feed: Optional[WebSocketFeed] = None,
-) -> Optional[Tuple[int, float]]:
+) -> Optional[Tuple[int, float, float]]:
     """
     One full cycle: collect fills, fetch midpoints, iterate active markets,
     evaluate skew, compute fresh quotes, post them.
@@ -429,12 +439,43 @@ async def run_quoting_cycle(
     if scoring_rates:
         quoter.update_scoring_rates(scoring_rates)
 
-    # ── Step 4: Check global exposure guard (net + gross) ─────────
-    # Only consider active markets — stale positions from orphaned fills
-    # must not trigger the global limit (they are unmanageable).
+    # ── Step 4: Per-market exposure gate (Issue 5) ──────────────
+    # Pause individual markets that breach MAX_MARKET_EXPOSURE_RATIO
+    # BEFORE the global gross check so a runaway market is contained
+    # without dragging the whole bot to the global limit.
     active_cids = {m.condition_id for m in markets}
+    paused_set: set[str] = set()
+    skip_reasons: Dict[str, str] = {}
+    for m in markets_this_cycle:
+        breached, exposure_val, limit_val = inventory.is_market_exposure_breached(
+            m.condition_id,
+            allocated_capital=m.allocated_capital,
+            open_order_notional_for_market=order_mgr.open_order_notional_for_market(m.condition_id),
+        )
+        if breached:
+            logger.warning(
+                "WARNING | exposure | Market {} — per-market limit breached "
+                "(net=${:.2f}, limit=${:.2f}) — pausing quotes",
+                m.condition_id[:12], exposure_val, limit_val,
+            )
+            paused_set.add(m.condition_id)
+            skip_reasons[m.condition_id] = "exposure_per_market"
+            try:
+                await order_mgr.cancel_orders_for_market(m.condition_id)
+            except Exception as exc:
+                logger.error(
+                    "Per-market exposure pause: cancel_orders_for_market({}) failed: {}",
+                    m.condition_id[:12], exc,
+                )
+
+    # ── Step 4b: Global gross exposure (deployed-capital-relative) ──
+    # Limit = sum(allocated_capital across active markets) × MAX_EXPOSURE_RATIO
+    # This is *deployed* capital, not the static TOTAL_CAPITAL ceiling — so
+    # the gate scales with what the bot actually has out on the book.
+    deployed_capital = sum(m.allocated_capital for m in markets) or settings.TOTAL_CAPITAL
     gross_breached = inventory.is_gross_exposure_breached(
         order_mgr.open_order_notional, active_cids,
+        deployed_capital=deployed_capital,
     )
     net_breached = inventory.is_global_exposure_breached(active_cids)
     if net_breached or gross_breached:
@@ -457,16 +498,18 @@ async def run_quoting_cycle(
                 message=f"{exposure_type.title()} exposure ${exposure_val:.0f} exceeds limit. Pausing {len(paused)}/{len(active_cids)} markets.",
                 level="warning",
             )
-        paused_set = set(paused)
+        for cid in paused:
+            paused_set.add(cid)
+            skip_reasons.setdefault(cid, "exposure_global")
 
         # Cancel open orders on paused markets to stop further fills
-        for cid in paused_set:
+        for cid in paused:
             await order_mgr.cancel_orders_for_market(cid)
-    else:
-        paused_set = set()
 
     if skip_cids:
-        paused_set |= skip_cids
+        for cid in skip_cids:
+            paused_set.add(cid)
+            skip_reasons.setdefault(cid, "seed_failed")
 
     # ── Step 4.5: Continuous midpoint guard (per market) ─────────
     newly_paused: list[tuple[str, float]] = []
@@ -480,6 +523,7 @@ async def run_quoting_cycle(
         is_paused, _breach_count = quoter.evaluate_midpoint_guard(cid, live_mid)
         if is_paused:
             paused_set.add(cid)
+            skip_reasons.setdefault(cid, "midpoint_guard")
             if not was_paused:
                 newly_paused.append((cid, live_mid))
         elif was_paused:
@@ -528,6 +572,7 @@ async def run_quoting_cycle(
     for m in markets_this_cycle:
         if quoter.is_spike_paused(m.condition_id):
             paused_set.add(m.condition_id)
+            skip_reasons.setdefault(m.condition_id, "spike_paused")
 
     # ── Step 4.7: Toxicity guard (P2b) ───────────────────────────
     # evaluate() resolves pending fill-vs-mid horizons, refreshes the
@@ -544,6 +589,7 @@ async def run_quoting_cycle(
         toxicity.evaluate(m.condition_id, tick)
         if toxicity.is_toxic_paused(m.condition_id):
             paused_set.add(m.condition_id)
+            skip_reasons.setdefault(m.condition_id, "toxicity_paused")
             if not was_paused:
                 tox_newly_paused.append(
                     (m.condition_id, toxicity.vpin_imbalance(m.condition_id))
@@ -578,19 +624,22 @@ async def run_quoting_cycle(
     if markets_this_cycle:
         m0 = markets_this_cycle[0]
         mid0 = midpoints.get(m0.token_id_yes, m0.midpoint)
-        logger.info(
+        logger.debug(
             "Sample market: cid={}… max_spread={} min_size={} gamma_mid={} live_mid={} alloc=${}",
             m0.condition_id[:12], m0.max_spread, m0.min_size, m0.midpoint, mid0, m0.allocated_capital,
         )
 
     _sem = asyncio.Semaphore(4)
-    cycle_results: list[tuple[int, int, int]] = []  # (posted, kept, errors)
+    # Per-market classification (Issue 3 / 4) — every entry is keyed by
+    # condition_id so the cycle-summary table can be rebuilt deterministically.
+    market_results: Dict[str, Dict[str, Any]] = {}
 
     async def _process_market(market):
         async with _sem:
             posted = kept = errors = 0
+            two_sided = False
             if market.condition_id in paused_set:
-                return (0, 0, 0)
+                return (market.condition_id, 0, 0, 0, False)
             try:
                 async with order_mgr.market_lock(market.condition_id):
                     async with _inventory_lock:
@@ -629,6 +678,7 @@ async def run_quoting_cycle(
                         yes_position=pos.yes_size if pos else 0.0,
                         no_position=pos.no_size if pos else 0.0,
                     )
+                    two_sided = quotes.is_two_sided
 
                     force = market.condition_id in filled_cids
                     result = await order_mgr.cancel_and_replace(quotes, force_replace=force)
@@ -658,13 +708,23 @@ async def run_quoting_cycle(
             except Exception as exc:
                 errors = 1
                 logger.error("Cycle error for {}: {}", market.condition_id[:12], exc)
-            return (posted, kept, errors)
+            return (market.condition_id, posted, kept, errors, two_sided)
 
     tasks = [_process_market(m) for m in markets_this_cycle]
     cycle_results = await asyncio.gather(*tasks)
-    cycle_posted = sum(r[0] for r in cycle_results)
-    cycle_kept = sum(r[1] for r in cycle_results)
-    cycle_errors = sum(r[2] for r in cycle_results)
+    cycle_posted = 0
+    cycle_kept = 0
+    cycle_errors = 0
+    for cid, posted, kept, errors, two_sided in cycle_results:
+        cycle_posted += posted
+        cycle_kept += kept
+        cycle_errors += errors
+        market_results[cid] = {
+            "posted": posted,
+            "kept": kept,
+            "errors": errors,
+            "two_sided": two_sided,
+        }
 
     # ── Step 6: Scoring check + auto-remediation ─────────────────
     remediate_cids = await scoring_monitor.check_if_due(markets_this_cycle)
@@ -708,24 +768,125 @@ async def run_quoting_cycle(
             total_deployed, total_allocated, capital_utilization,
         )
 
+    # ── Step 7: Classify markets + cycle summary table (Issue 3/4/6) ──
     elapsed = asyncio.get_event_loop().time() - cycle_start
-    logger.info(
-        "Cycle #{} complete: {}/{} markets, {} posted / {} kept, {} errors, {:.1f}s",
-        cycle_index,
-        len(markets_this_cycle),
-        len(markets),
-        cycle_posted,
-        cycle_kept,
-        cycle_errors,
-        elapsed,
+    scoring_rates_now = scoring_monitor.get_all_scoring_rates()
+
+    selected_count = len(markets_this_cycle)
+    active_count = 0
+    scoring_count = 0
+
+    table_rows: list[str] = []
+    skip_log_lines: list[str] = []
+    for m in markets_this_cycle:
+        cid = m.condition_id
+        prior_state = market_mgr.get_state(cid)
+        info = market_results.get(cid, {})
+        two_sided = bool(info.get("two_sided"))
+        posted = int(info.get("posted") or 0)
+        kept = int(info.get("kept") or 0)
+        errors = int(info.get("errors") or 0)
+
+        # Determine state for this cycle. SEED_FAILED is sticky from the
+        # seeder run (set_state guards against being overwritten downward).
+        if prior_state == MarketState.SEED_FAILED:
+            state = MarketState.SEED_FAILED
+            skip_log_lines.append(
+                f"  SKIP  {cid[:12]}…  reason=seed_failed"
+            )
+        elif cid in paused_set:
+            state = MarketState.INACTIVE
+            reason = skip_reasons.get(cid, "paused")
+            skip_log_lines.append(f"  SKIP  {cid[:12]}…  reason={reason}")
+        elif two_sided and (posted > 0 or kept > 0) and errors == 0:
+            # Two-sided posted (or maintained) — eligible for scoring.
+            # Confirmed scoring is asserted by scoring_monitor's last
+            # observation; until we have one, mark TWO_SIDED as SCORING
+            # since LP rewards accrue while the order is live & two-sided.
+            scoring_rate = scoring_rates_now.get(cid)
+            if scoring_rate is None or scoring_rate >= 0.5:
+                state = MarketState.SCORING
+                scoring_count += 1
+            else:
+                state = MarketState.INACTIVE
+            active_count += 1
+        elif (posted > 0 or kept > 0) and not two_sided:
+            state = MarketState.ONE_SIDED
+            active_count += 1  # actively quoting, just not two-sided
+            skip_log_lines.append(f"  SKIP  {cid[:12]}…  reason=skew_one_sided")
+        else:
+            state = MarketState.INACTIVE
+            if errors > 0:
+                skip_log_lines.append(f"  SKIP  {cid[:12]}…  reason=cycle_error")
+
+        market_mgr.set_state(cid, state)
+
+        # Build summary table row
+        pos = inventory.get_position(cid)
+        skew_str = "—"
+        net_str = "—"
+        if pos is not None:
+            ratio = pos.skew_ratio
+            sign = "+" if pos.heavy_side == "NO" else ("-" if pos.heavy_side == "YES" else "")
+            skew_str = f"{sign}{ratio:.0%}"
+            yes_mid = midpoints.get(m.token_id_yes, m.midpoint)
+            net_str = f"${pos.gross_exposure_at_mid(yes_mid):.1f}"
+
+        live_mid = midpoints.get(m.token_id_yes, m.midpoint)
+        if state in (MarketState.SEED_FAILED, MarketState.INACTIVE):
+            bid_disp = ask_disp = "  ---"
+        else:
+            tick = {"0.1": 0.1, "0.01": 0.01, "0.001": 0.001, "0.0001": 0.0001}.get(m.tick_size, 0.01)
+            offset = settings.QUOTE_OFFSET_TICKS * tick if settings.QUOTE_OFFSET_TICKS else m.max_spread * settings.tightness_factor
+            bid_disp = f"{max(0.01, live_mid - offset):.3f}"
+            ask_disp = f"{min(0.99, live_mid + offset):.3f}" if state != MarketState.ONE_SIDED else "  ---"
+
+        question = (m.question or cid[:18])[:20]
+        table_rows.append(
+            f"│  {question:<20}  {state.value:<11}  {bid_disp:>5}  {ask_disp:>5}  "
+            f"{skew_str:>6}  {net_str:>7}  │"
+        )
+
+    # Cycle summary table (Issue 6)
+    title = (
+        f"┌─ Cycle #{cycle_index} "
+        + "─" * max(0, 80 - 13 - len(str(cycle_index)))
+        + "─┐"
     )
+    header_row = (
+        f"│  {'Market':<20}  {'State':<11}  {'Bid':>5}  {'Ask':>5}  "
+        f"{'Skew':>6}  {'Net($)':>7}  │"
+    )
+    bottom_summary = (
+        f"│  posted={cycle_posted}  kept={cycle_kept}  errors={cycle_errors}  "
+        f"elapsed={elapsed:.1f}s"
+    )
+    bottom_summary = bottom_summary + " " * max(0, len(title) - len(bottom_summary) - 1) + "│"
+    bottom = "└" + "─" * (len(title) - 2) + "┘"
+
+    logger.info(title)
+    logger.info(header_row)
+    for row in table_rows:
+        logger.info(row)
+    logger.info(bottom_summary)
+    logger.info(bottom)
+
+    logger.info(
+        "Cycle #{} complete — selected={} active={} scoring={} | "
+        "posted={} kept={} errors={} | {:.1f}s",
+        cycle_index, selected_count, active_count, scoring_count,
+        cycle_posted, cycle_kept, cycle_errors, elapsed,
+    )
+    if active_count < selected_count:
+        for line in skip_log_lines:
+            logger.info(line)
 
     fill_count = len(new_fills) if new_fills else 0
     has_news = fill_count > 0 or cycle_errors > 0 or cycle_index == 0
     if has_news:
         await discord.send_cycle_summary(
             cycle_index=cycle_index,
-            markets_count=len(markets_this_cycle),
+            markets_count=active_count,
             orders_posted=cycle_posted,
             errors=cycle_errors,
             elapsed=elapsed,
@@ -1041,9 +1202,18 @@ async def main() -> None:
         seeder = InventorySeeder(client, settings, discord)
         unseeded_markets, seed_costs = await seeder.seed_all(market_mgr.markets)
 
+        # Mark per-market state up front (Issue 4): SEED_FAILED is sticky
+        # across cycles via market_mgr.set_state(); other states transition
+        # freely as the bot quotes.
+        for m in market_mgr.markets:
+            if m.condition_id in unseeded_markets:
+                market_mgr.set_state(m.condition_id, MarketState.SEED_FAILED)
+            else:
+                market_mgr.set_state(m.condition_id, MarketState.UNKNOWN)
+
         if unseeded_markets:
             logger.info(
-                "{} market(s) failed seeding — BID-only (no ASK without tokens, won't score LP)",
+                "{} market(s) failed seeding — atomic skip (no position, excluded from quoting)",
                 len(unseeded_markets),
             )
 

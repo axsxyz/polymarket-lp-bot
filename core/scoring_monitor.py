@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 from loguru import logger
 
@@ -70,7 +70,14 @@ class ScoringMonitor:
         return await self._run_check(markets)
 
     async def _run_check(self, markets: List[MarketCandidate]) -> Set[str]:
-        """Query are_orders_scoring for each market and report results."""
+        """Query are_orders_scoring for each market and report results.
+
+        Issue 6: when every per-market call fails we surface the LAST
+        captured exception (typically a ``PolyApiException`` carrying the
+        HTTP status / error message — e.g. ``status_code=425, service not
+        ready``) so the operator can distinguish rate-limiting from
+        endpoint changes without digging through DEBUG logs.
+        """
         self._remediate_cids.clear()
 
         if not markets:
@@ -79,6 +86,8 @@ class ScoringMonitor:
         scoring_count = 0
         checked = 0
         threshold = self._s.SCORING_REMEDIATION_THRESHOLD
+        last_error: Optional[BaseException] = None
+        last_error_cid: str = ""
 
         for market in markets:
             if not market.condition_id:
@@ -115,10 +124,26 @@ class ScoringMonitor:
                                 count,
                             )
             except Exception as exc:
-                logger.warning("are_orders_scoring failed for {}: {}", market.condition_id[:12], exc)
+                last_error = exc
+                last_error_cid = market.condition_id
+                logger.warning(
+                    "are_orders_scoring failed for {}: {!r}",
+                    market.condition_id[:12], exc,
+                )
 
         if checked == 0:
-            logger.warning("Scoring check: 0 markets checked (all calls failed)")
+            if last_error is not None:
+                logger.warning(
+                    "Scoring check: 0 markets checked (all calls failed) — "
+                    "last error on {}: {!r}",
+                    last_error_cid[:12] if last_error_cid else "?",
+                    last_error,
+                )
+            else:
+                logger.warning(
+                    "Scoring check: 0 markets checked (no live orders found "
+                    "for any selected market — likely paused / unseeded)",
+                )
             return set()
 
         ratio = scoring_count / checked

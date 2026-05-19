@@ -100,7 +100,9 @@ class TestQuoteSizing:
 
 class TestSkewAdjustment:
     def test_heavy_side_widens_bid(self):
-        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=3))
+        # Use SKEW_PENALTY=1.0 so a 0.30 skew * 3-tick base_offset clears
+        # the round-to-tick threshold (0.30 * 1.0 * 0.03 = 0.009 ≥ half tick).
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=3, SKEW_PENALTY=1.0))
         m = _market(max_spread=0.20)
 
         neutral = q.compute(m, live_mid=0.50, skew_ratio=0.0,
@@ -109,6 +111,19 @@ class TestSkewAdjustment:
                            yes_position=_POS, no_position=_POS)
 
         assert skewed.yes_quote.bid_price < neutral.yes_quote.bid_price
+
+    def test_skew_penalty_zero_disables_adjustment(self):
+        """SKEW_PENALTY=0 → quotes ignore inventory imbalance entirely."""
+        q = Quoter(_make_settings(QUOTE_OFFSET_TICKS=3, SKEW_PENALTY=0.0))
+        m = _market(max_spread=0.20)
+
+        neutral = q.compute(m, live_mid=0.50, skew_ratio=0.0,
+                            yes_position=_POS, no_position=_POS)
+        skewed = q.compute(m, live_mid=0.50, skew_ratio=0.50, heavy_side="YES",
+                           yes_position=_POS, no_position=_POS)
+
+        assert skewed.yes_quote.bid_price == neutral.yes_quote.bid_price
+        assert skewed.yes_quote.ask_price == neutral.yes_quote.ask_price
 
     def test_paused_side_returns_none(self):
         q = Quoter(_make_settings())

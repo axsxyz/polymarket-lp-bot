@@ -107,6 +107,19 @@ class OrderManager:
         """Sum of price * size for all tracked live orders."""
         return sum(rec.price * rec.size for rec in self._live_orders.values())
 
+    def open_order_notional_for_market(self, condition_id: str) -> float:
+        """Sum of price * size for tracked live orders on one market.
+
+        Used by the per-market exposure gate (Issue 5) to compare against
+        ``allocated_capital × MAX_MARKET_EXPOSURE_RATIO`` before the global
+        gross check kicks in.
+        """
+        return sum(
+            rec.price * rec.size
+            for rec in self._live_orders.values()
+            if rec.condition_id == condition_id
+        )
+
     def drain_quoted_notional(self) -> float:
         """Return accumulated quoted notional since last drain, then reset to zero.
 
