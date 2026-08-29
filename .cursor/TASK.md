@@ -1,5 +1,11 @@
 # LP Bot — Active Tasks
 
+## Audit 2026-08-29 (blocking vs P2e)
+- [x] **Written audit** → `AUDIT.md` (alarming / keep / next-3). No trading refactor.
+- [ ] **Move 1 — local tape** (fills/spread/pnl/errors on disk; FastAPI read-only optional). See AUDIT.md §3.
+- [ ] **Move 2 — hot-path pauses + fill ingest off the 45s clock**
+- [ ] **Move 3 — hedge-aware resolution max_loss + mark-to-mid drawdown**
+
 ## P2e — Position sizing dynamique
 - [ ] **Capital reallocation basé sur scoring réel** → `core/market_manager.py`
   - Utilise `are_orders_scoring` (déjà présent via `scoring_monitor.py`)
