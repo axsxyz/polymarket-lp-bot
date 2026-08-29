@@ -1,6 +1,6 @@
 # LP Bot Polymarket — Memory Bank
 
-Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-05-19** (Hotfix pagination Gamma — bot ne démarrait plus, +8 tests, 287/287 ✅).
+Document de référence courte pour les sessions agent. Dernière mise à jour : **2026-08-29** (audit pass — `AUDIT.md` à la racine ; pas de refactor trading).
 
 ---
 
@@ -67,10 +67,12 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ---
 
-## 3. Tous les changements récents (2026-05-19 + 2026-05-10 + 2026-05-08 + 2026-05-05 + 2026-05-04)
+## 3. Tous les changements récents (2026-08-29 + 2026-05-19 + 2026-05-10 + 2026-05-08 + 2026-05-05 + 2026-05-04)
 
 | Fichier | Changement |
 |---------|------------|
+| **2026-08-29 (audit pass — Python kept, no rewrite)** | |
+| `AUDIT.md` (nouveau, racine) | Audit lu sur le code réel (`main.py`, `core/*`, `config/*`, `tests/*`). L'audit May 2026 (`audit_opus4_7_max_may_2026.txt`) est **stale** (rate limit / jitter / drawdown / midpoint / seeder / P2a–d déjà livrés). Alarming : (A1) hot path re-poste après toxicity/resolution/exposure pause ; (A2) `max_loss = max(yes,no)×$1` déliste un livre hedgé ; (A3–A4) fills à 45s + watermark avant `record_fills` ; (A5) WS `last_trade` écrase le mid ; (A6) fill-vs-mid mort (tolérance 2s, mids toxicity cold-only) ; (A7) reconcile `get_balance_allowance()` sans token ; (A8) drawdown realised-only ; (A9) `TICK_SIZE=0.01` hardcodé ; (A10) refresh sans cancel OUT / seed IN ; (A11) pas de tape (FastAPI unused, pas de `dashboard/`). Keep : quoter Q-score, skew 4-tier, smart-diff, watermark design, seeder atomique, MarketState, settings. Next 3 : tape locale → honorer pauses hot + fills hors cycle → max_loss hedge-aware + MTM drawdown. Verdict : la stratégie (politics 120j, 1 tick, poll 45s) est le vrai plafond, pas Python. |
 | **2026-05-19 (Hotfix pagination Gamma)** | |
 | `core/market_manager.py:41-55` (nouvelles constantes module) + `:362-435` (`_fetch_gamma_markets`) | **Bug critique fixé** : bot live échouait au boot avec "After filtering: 0 markets" → "No markets available — exiting". Cause = `_fetch_gamma_markets` demandait `limit=200` mais Gamma plafonne à 100 items/réponse ; la condition `if len(items) < limit: break` sortait dès la 1re page (100 < 200), laissant les 3 marchés actifs (Becerra, Fed, Netanyahu) hors du lookup. Fix : (a) `GAMMA_PAGE_LIMIT=100` (= plafond réel API) ; (b) exit sur `if not items: break` (vraie fin de pagination) ; (c) `MAX_GAMMA_PAGES=50` safety bound (5000 marchés max) + log WARNING si bound atteint ; (d) `asyncio.sleep(0.7)` entre pages — ~1.4 RPS aligné `backtest/fetcher.py:HTTP_RATE_LIMIT_SLEEP_S`, jamais avant la 1re requête ; (e) log final enrichi `pages {}` count. |
 | `tests/test_gamma_pagination.py` (nouveau, 8 tests) | Mock manuel `aiohttp.ClientSession` via `_FakeSession`/`_FakeResp` (pas de dépendance `aioresponses`) + patch `core.market_manager.asyncio.sleep` pour vitesse. Couvre : sub-ceiling page (80 items → lookup 80, terminaison propre) ; multi-page (100+100+50 → 250 entries) ; full pages + empty probe (300) ; safety bound (queue infinie stoppée à MAX_GAMMA_PAGES) ; empty page #2 (1 page collected) ; HTTP 500 (warning + lookup partiel sans crash) ; sleep entre pages (3 sleeps pour 4 requêtes) ; no-sleep-before-first (probe immédiat). **287/287 ✅** (279 baseline + 8 nouveaux). |
@@ -130,7 +132,7 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 
 ## 5. Décisions d'architecture
 
-- **Python / asyncio**, pas Go : SDK officiel synchrone enveloppé dans `asyncio.to_thread()`.
+- **Python / asyncio**, pas Go **ni Rust** (décision owner 2026-08-29, voir `AUDIT.md`) : SDK officiel synchrone enveloppé dans `asyncio.to_thread()`. Le plafond n'est pas le langage.
 - **Règles Cursor** : `.cursor/rules/01-core-behavior.mdc`, `02-architecture.mdc`, `03-polymarket-api.mdc`, `04-airdrop-priority.mdc`.
 - **Configuration** : une seule classe `Settings` dans `config/settings.py` — ne pas inventer de variables absentes.
 - **`DRY_RUN`** : ne passer à `false` que sur instruction explicite du propriétaire du wallet.
@@ -140,6 +142,9 @@ Document de référence courte pour les sessions agent. Dernière mise à jour :
 ---
 
 ## 6. Prochain chantier prioritaire
+
+### Audit 2026-08-29 — à faire avant P2e
+Voir `AUDIT.md`. Ne pas enchaîner P2e (sizing dynamique) tant que : (1) tape locale fills/spread/pnl/errors, (2) hot path honore les pauses + fills hors clock 45s, (3) `max_loss` hedge-aware + drawdown mark-to-mid. Pas de rewrite Rust.
 
 ### P1 — Statut
 - **Terminé** : tous les items P1 sont complétés au 2026-05-05.
