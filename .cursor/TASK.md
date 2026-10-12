@@ -2,9 +2,9 @@
 
 ## Audit 2026-08-29 (blocking vs P2e)
 - [x] **Written audit** → `AUDIT.md` (alarming / keep / next-3). No trading refactor.
-- [ ] **Move 1 — local tape** (fills/spread/pnl/errors on disk; FastAPI read-only optional). See AUDIT.md §3.
-- [ ] **Move 2 — hot-path pauses + fill ingest off the 45s clock**
-- [ ] **Move 3 — hedge-aware resolution max_loss + mark-to-mid drawdown**
+- [x] **Move 1 — local tape** (fills/spread/pnl/errors on disk; FastAPI read-only optional). See AUDIT.md §3.
+- [x] **Move 2 — hot-path pauses + fill ingest off the 45s clock**
+- [x] **Move 3 — hedge-aware resolution max_loss + mark-to-mid drawdown**
 
 ## P2e — Position sizing dynamique
 - [ ] **Capital reallocation basé sur scoring réel** → `core/market_manager.py`
@@ -50,6 +50,26 @@
 ---
 
 ## Complété
+
+### 2026-08-31
+- [x] **PnL top-up incremental cost** → `.cursor/TASK-PNL-TOPUP.md`. `apply_seed_costs_once` write-once kept; `add_seed_costs` / `absorb_seed_acquisition` ADD seeder USD on size growth; `seed_cost_gap` init delta@mid; Iran 248→347 avg~0.615/0.405, ASK 200@0.41 `|realised|<5`, keep-50 haircut not +$23. DRY_RUN / $50 / .env / tightness / Gamma / ASK-UNMATCH / keep-50 / write-once untouched. **416 passed**
+
+### 2026-08-30
+- [x] **PnL cost basis write-once** → `.cursor/TASK-PNL-BASIS.md`. Kill paper/seed sync re-assign of `yes_cost`/`no_cost`; only `record_fills`/`reduce_position` mutate after seed. Missing basis → size×mid once + tape `cost_basis_missing`. Token map YES/NO only (no guess). US-Iran-ish `|realised|<15` after BID/ASK+keep-50. DRY_RUN / $50 / .env / tightness / Gamma / ASK-UNMATCH untouched. **413 passed**
+- [x] **ASK unmatched cap + rebalance keep-$50** → `.cursor/TASK-ASK-UNMATCH.md`. `max_ask_shares` caps ASK like BID; `min_size≤50` never floors ASK past cap; `min_size>50` posts min_size + `ask_over_cap`. `rebalance_unmatched` sells to unmatched≤$50 (0/311→0/50), never 0/0; no re-seed on one-sided leftover. DRY_RUN / $50 / .env capital / tightness / Gamma untouched. **408 passed**
+- [x] **max_loss rebalance (not nuke seed)** → `.cursor/TASK-MAXLOSS-REBALANCE.md`. `max_loss` sells unmatched surplus only, stays SCORING; `extreme_mid`/`move_24h` still full flatten+INACTIVE; escape hatch if unmatched still >$50. BID cap only when `min_size ≤ $50`; `min_size > 50` still posts two-sided + tape `bid_over_cap`. No hard-skip min_size>50. DRY_RUN / $50 / .env capital / tightness / Gamma untouched. **400 passed**
+
+### 2026-08-29
+- [x] **Gamma join by CLOB condition_ids** → `.cursor/TASK-GAMMA-JOIN.md`. Drop keyset/offset walk from refresh; chunk `GET /markets?condition_ids=` ×100; 422 split 50/20/1; 429 retry; CLOB end_date fills. Rank/filters unchanged. DRY_RUN / capital / exposure/seed/quoter untouched. **374 passed**
+- [x] **Gamma keyset-only pagination** → `.cursor/TASK-GAMMA-KEYSET.md`. Drop `/markets?offset=` entirely; only `GET /markets/keyset?limit=100&after_cursor=`; stop empty/no-cursor/repeat; `MAX_GAMMA_PAGES=250`. Fallback cap 200 + gamma_miss unchanged. DRY_RUN / capital / exposure/sticky/seed/quoter untouched. **378 passed**
+- [x] **Guards + Gamma (exposure BID-only, sticky delist, universe)** → `.cursor/TASK-GUARDS-GAMMA.md`. Deployed=inv+BID (ASK excluded); leftover BID + min_size two-sided floor (no naked ASK); sticky max_loss scrubbed/not persisted; Gamma page retry + capped fallback (~200); rank matched-pair seed. DRY_RUN / $50 / .env capital unchanged. **376 passed**
+- [x] **Seed matched shares (not matched dollars)** → `.cursor/TASK-SEED.md`. `N=min(ideal_yes,ideal_no)` capped by expensive side; max_loss preflight before post; ASK clips via inventory=N; resolution delist flattens inventory (paper+live path). DRY_RUN unchanged. **364 passed**
+- [x] **TOTAL_CAPITAL → quote+seed size** → `.cursor/TASK-SIZE.md`. Alloc-based shares (`alloc/2/price`); seed target = planned ask (capped by SEED_MAX/SEED_BUDGET); N capped at `floor(TOTAL/MIN)`; `MAX_MARKETS_PER_CYCLE` default 60; `SEED_BUDGET_PCT` default 0.65. DRY_RUN unchanged. **344 passed**
+- [x] **Tape clean (hot skip dedupe + rewards ESTIM)** → `.cursor/TASK-TAPE-CLEAN.md`. Transition-only `hot_*` tape/digest skips; digest/terminal `est_rewards_usd` separate from realised. DRY_RUN unchanged. **336 passed**
+- [x] **Operator terminal (qv/Polymarket)** → `terminal/` + tape events `universe/filter/seed/cycle/state` + `GET /` `/digest` `/events` `/stream` on `127.0.0.1:TAPE_HTTP_PORT`. Read-only. No strategy/`.env` change. See `.cursor/TASK-TERMINAL.md`.
+  - `pytest tests/` **317 passed**
+  - `pytest tests/` **310 passed**
+  - A1–A12 status in `AUDIT.md` (user WS **wontfix** — SDK REST-only)
 
 ### 2026-05-19
 - [x] **P2d — Resolution guard** → `core/resolution_guard.py` + `config/settings.py` + `main.py` + `tests/test_resolution_guard.py`

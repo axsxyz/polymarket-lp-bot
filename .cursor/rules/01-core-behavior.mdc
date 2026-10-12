@@ -54,7 +54,7 @@ RÈGLE ANTI-DOUBLON :
 ## Hard limits — hallucination prevention
 - NEVER invent a function, class, or module that you have not seen in the code
 - NEVER assume a file exists because CLAUDE.md or AGENTS.md mentions it — verify with ls/grep first
-- NEVER generate code that references `dashboard/`, `core/positions_aggregator.py`, or `scripts/positions_cli.py` — these DO NOT EXIST in the repo (doc is stale)
+- NEVER generate code that references `dashboard/`, `core/positions_aggregator.py`, or `scripts/positions_cli.py` — these DO NOT EXIST. The operator UI is `terminal/` served by `utils/tape_server.py` (`GET /`), read-only.
 - NEVER suggest `DRY_RUN=false` changes without explicit user confirmation — bot is live on mainnet
 - If a config key is not in `config/settings.py`, it does not exist. Do not invent env vars.
 

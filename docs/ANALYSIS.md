@@ -78,7 +78,7 @@ The composite ranking formula in `markets_filter.py` is thoughtful:
 
 - Discord webhook notifications with rich embeds (fills, skew warnings, cycle summaries, daily reports)
 - Structured JSON + rotating file logging
-- CLI dashboard (`scripts/positions_cli.py` with `--watch`)
+- Local JSONL tape + optional localhost FastAPI (`GET /health` `/fills` `/pnl`)
 - Position liquidation script
 - On-chain allowance checker
 - Market cache for crash recovery
@@ -251,14 +251,14 @@ The bot is tightly coupled to this SDK. If Polymarket updates their API (which t
 2. **Ghost order reconciliation** — unique safety feature; prevents token lock-up
 3. **Multi-tier skew management** — more nuanced than simple threshold-based systems
 4. **Smart-diff order updates** — preserves book presence, maximizes scoring uptime
-5. **Comprehensive operational tooling** — Discord, logging, CLI dashboard
+5. **Comprehensive operational tooling** — Discord, logging, local JSONL tape
 6. **Production-ready** — DRY_RUN default, graceful shutdown, crash recovery
 
 ### Competitive Disadvantages
 
 1. **Latency** — Python + WebSocket + REST API = 100-500ms response time. Pros operate at <10ms
 2. **No market microstructure intelligence** — no order flow analysis, no adverse selection defense
-3. **No backtesting** — can't empirically optimize parameters
+3. **Backtest is naive** — `backtest/` exists; fill model pairs BID+ASK so absolute PnL is not live evidence
 4. **Single strategy** — same approach for all markets regardless of characteristics
 5. **No cross-market hedging** — can't offset risk across correlated markets
 6. **Capital limited** — designed for $10-50K; pros deploy $100K-1M+

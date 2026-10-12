@@ -36,16 +36,18 @@ alwaysApply: true
 | `config/markets_filter.py` | Market scoring composite, filters, double-shape parser |
 | `config/market_manager.py` | Market discovery (Gamma paginated), capital allocation |
 | `config/settings.py` | Pydantic-settings: ALL valid env vars live here |
-| `utils/discord.py` | Discord alerts, rate-limited 5 msg/sec |
+| `core/paper_broker.py` | DRY_RUN paper cash + GTC book + WS print fills (never CLOB writes) |
+| `core/operator_digest.py` | Live `/digest` blob for the terminal |
+| `utils/tape_server.py` | FastAPI GET-only `127.0.0.1:TAPE_HTTP_PORT` + `GET /` terminal |
+| `terminal/` | Vanilla qv/Polymarket operator UI (Proxima charcoal `#0b0d10` / `#12151a`, accent `#7892FF`; Markets = full selected table; favicon = `quietvault_pfp_3.jpg`) |
 | `utils/logging.py` | Loguru stderr + rotating file + JSONL |
 | `scripts/setup_allowances.py` | One-shot ERC20/ERC1155 approvals on Polygon |
 | `scripts/inventory_seeder.py` | Initial position seeding |
 
 ## What does NOT exist (doc is stale — do not generate)
-- `dashboard/` — referenced in CLAUDE.md but absent. `ENABLE_DASHBOARD=true` has NO effect.
+- `dashboard/` — absent. Operator terminal is `terminal/` served at tape HTTP `GET /` (qv/Polymarket, read-only; no trading from the browser). `ENABLE_DASHBOARD=true` has NO effect.
 - `core/positions_aggregator.py` — does not exist
 - `scripts/positions_cli.py` — does not exist
-- `backtest/` — no backtesting framework
 - `.github/workflows/` — no CI pipeline
 
 ## Key architecture patterns to preserve

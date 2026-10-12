@@ -299,3 +299,24 @@ If the live book is `$350` / 3 markets / `DRY_RUN=false` (memory-bank, 2026-05-0
 - `memory-bank/lp-bot.md`, `.cursor/TASK.md` (session protocol; P2e not started)
 
 No trading code was changed in this pass.
+
+---
+
+## Status after this pass (2026-08-29 implementation)
+
+Python kept. No new strategy. `pytest tests/` → **310 passed**. User-channel WS is **wontfix** (`py-clob-client-v2` is REST-only; fills are a 2–5s REST task). May 2026 5 RPS / jitter / realised drawdown were already fixed before this pass.
+
+| ID | Status | Why |
+|---|---|---|
+| A1 | **fixed** | `hot_skip_reason` before compute/post: toxicity, INACTIVE, SEED_FAILED, `skip_cids`, exposure, drawdown, midpoint, spike. Hot path also `toxicity.record_mid`. |
+| A2 | **fixed** | `max_loss = abs(yes − no)`. Extreme-mid `<0.05` / `>0.95` unchanged. Sticky delist file + `mark_resolution_inactive`. |
+| A3 | **fixed** / user-WS **wontfix** | `fill_ingest_task` polls every `FILL_POLL_INTERVAL_SECONDS` (default 3). SDK has no user WS. |
+| A4 | **fixed** | `fetch()` does not persist; `commit(fills)` after inventory apply. |
+| A5 | **fixed** | `_handle_last_trade` is a no-op; BBO `_process_mid_update` still writes mid + freshness. |
+| A6 | **fixed** (ingest) | Hot path feeds `toxicity.record_mid` on the same tick as the quoter. VPIN/fill-vs-mid still need live tape to prove they fire. |
+| A7 | **fixed** | Reconciliation uses per-token `get_conditional_balance`. |
+| A8 | **fixed** | Drawdown trips on realised **or** `mark_to_mid_equity − midnight_mtm`. |
+| A9 | **fixed** | `should_replace_price(old, new, tick, threshold)` uses market tick via `TwoSidedQuotes.tick_size`. |
+| A10 | **fixed** | Refresh cancels OUT, seeds or skip-lists IN, re-subscribes WS excluding `skip_cids`. |
+| A11 | **fixed** | `LocalTape` JSONL + localhost FastAPI `GET /health` `/fills` `/pnl`. Not a product dashboard. |
+| A12 | **fixed** (itemised) | Unmatched `net_exposure_usd`; scoring remedi / ghost / stale cleanup take per-market lock; startup `cancel_all` fail-closed unless `DRY_RUN`; `add_signal_handler` with Windows `signal.signal` fallback; `ALLOW_NAKED_ASKS` removed; `MIN_MARKETS` ≤ `MAX_MARKETS`; dead OrderManager fill/cleanup methods gone; inventory persist `data/inventory_state.json`. |
