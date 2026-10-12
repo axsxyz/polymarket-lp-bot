@@ -317,10 +317,10 @@ class TestDeterminism:
 
 
 class TestSizeAndScale:
-    def test_fill_size_respects_min_and_multiplier(self) -> None:
-        # SIZE_MULTIPLIER default = 2.0; min_size=5.0 → expect fills of ~10 shares
-        # (capital cap is non-binding at the default TOTAL_CAPITAL=10000).
+    def test_fill_size_uses_alloc(self) -> None:
+        # allocated_capital=100 → half=50 → @~0.50 ≈ 100 shares (not min×SIZE_MULT).
         m = _market(min_size=5.0)
+        m.allocated_capital = 100.0
         mids = _excursion_tape(n_cycles=5)
         result = simulate_market(
             m, mids, _params(), rebalance_interval_seconds=_FAST_INTERVAL_S,
@@ -328,7 +328,7 @@ class TestSizeAndScale:
         bid_fills = [f for f in result.fills if f.side == "BID"]
         assert bid_fills, "test setup must produce BID fills"
         for f in bid_fills:
-            assert f.fill_size == pytest.approx(10.0, abs=0.5)
+            assert f.fill_size == pytest.approx(100.0, abs=15.0)
 
 
 class TestLookaheadInResult:
