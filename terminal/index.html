@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>qv/Polymarket</title>
+  <link rel="icon" type="image/jpeg" href="/favicon.jpg">
+  <link rel="apple-touch-icon" href="/quietvault_pfp_3.jpg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="/terminal.css?v=12">
+</head>
+<body data-view="markets">
+  <aside class="sidebar" id="sidebar">
+    <button type="button" class="brand" data-nav="markets">
+      <img src="/quietvault_pfp_3.jpg" alt="qv" class="mark-img" width="36" height="36">
+      <div>
+        <div class="brand-qv">qv / Polymarket</div>
+        <div class="brand-sub">LP operator</div>
+      </div>
+    </button>
+    <nav class="nav">
+      <button type="button" class="nav-a on" data-nav="markets">Markets</button>
+      <button type="button" class="nav-a" data-nav="funnel">Universe</button>
+      <button type="button" class="nav-a" data-nav="ticker">Tape</button>
+      <button type="button" class="nav-a" data-nav="detail">Quote</button>
+      <button type="button" class="nav-a" data-nav="right">PnL / seed</button>
+    </nav>
+    <div class="side-foot">
+      <button type="button" class="nav-settings" data-nav="settings" title="Settings">
+        <svg class="gear-ico" viewBox="0 0 24 24" aria-hidden="true" width="15" height="15">
+          <path fill="currentColor" d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.55-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.7 8.48a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94L2.82 14.16a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.43.34.68.22l2.39-.96c.5.39 1.04.7 1.63.94l.36 2.54c.05.24.26.42.5.42h3.8c.24 0 .45-.18.5-.42l.36-2.54c.59-.24 1.13-.55 1.63-.94l2.39.96c.25.12.54.02.68-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/>
+        </svg>
+        <span>Settings</span>
+      </button>
+    </div>
+  </aside>
+
+  <button type="button" class="side-collapse" id="nav-toggle" title="Hide nav" aria-label="Toggle navigation">
+    <span class="chev" aria-hidden="true">‹</span>
+  </button>
+
+  <div id="app">
+    <header>
+      <div class="page-title">
+        <div class="h1">Terminal</div>
+        <div class="muted tiny" id="hdr-stats"></div>
+      </div>
+      <div id="badges" class="badges"></div>
+    </header>
+
+    <div class="metrics" id="metrics">
+      <div class="metric"><div class="ml">Realised PnL</div><div class="mv" id="m-pnl">—</div><div class="muted tiny" id="m-pnl-est"></div></div>
+      <div class="metric"><div class="ml">Config capital</div><div class="mv" id="m-cap">—</div></div>
+      <div class="metric"><div class="ml">Selected / max</div><div class="mv" id="m-sel">—</div></div>
+      <div class="metric"><div class="ml">Last cycle</div><div class="mv" id="m-cyc">—</div></div>
+    </div>
+
+    <section id="funnel" class="pane">
+      <div class="pane-h">Universe</div>
+      <div id="funnel-pipe" class="pipe"></div>
+      <div id="funnel-bars" class="funnel-bars"></div>
+      <div id="funnel-samples" class="samples muted"></div>
+    </section>
+
+    <section id="markets" class="pane">
+      <div class="pane-h row">
+        <span>Selected markets</span>
+        <span class="muted tiny" id="mkt-count"></span>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>market</th>
+              <th>cid</th>
+              <th>state</th>
+              <th>mid</th>
+              <th>spr</th>
+              <th>min</th>
+              <th>rank sc</th>
+              <th>tags</th>
+              <th>$/d</th>
+              <th class="th-yes" title="YES bid">y bid</th>
+              <th class="th-yes" title="YES ask">y ask</th>
+              <th class="th-no" title="NO bid">n bid</th>
+              <th class="th-no" title="NO ask">n ask</th>
+              <th class="th-yes">yes</th>
+              <th class="th-no">no</th>
+              <th>alloc</th>
+              <th>seed</th>
+              <th>skip</th>
+            </tr>
+          </thead>
+          <tbody id="mkt-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="ticker" class="pane">
+      <div class="pane-h row">
+        <span>Tape</span>
+        <div id="chips" class="chips"></div>
+      </div>
+      <div id="tape-list" class="tape-list"></div>
+    </section>
+
+    <div id="rail">
+      <section id="detail" class="pane">
+        <div class="pane-h">Quote / inventory</div>
+        <div id="detail-body" class="detail-body muted">Select a market.</div>
+        <canvas id="spark" width="280" height="56"></canvas>
+      </section>
+      <section id="right" class="pane stack">
+        <div class="sub pnl-pane">
+          <div class="pane-h">PnL</div>
+          <div id="pnl-body"></div>
+        </div>
+        <div class="sub seed-pane">
+          <div class="pane-h">Seeder</div>
+          <div id="seed-body" class="scroll-sm"></div>
+        </div>
+        <div class="sub col-pane">
+          <div class="pane-h">Collateral</div>
+          <div id="col-body"></div>
+        </div>
+      </section>
+    </div>
+
+    <section id="settings" class="pane">
+      <div class="pane-h row">
+        <span>Settings · Discord</span>
+        <span class="muted tiny" id="discord-wh">—</span>
+      </div>
+      <div id="discord-body" class="discord-body muted">Loading…</div>
+      <div class="muted tiny discord-note" id="discord-note"></div>
+    </section>
+  </div>
+
+  <footer>
+    <div id="foot-live" class="live-line"><span class="dot mute"></span> —</div>
+    <div class="muted tiny" id="foot-mid">qv/Polymarket · no orders from this UI</div>
+    <div id="clock-foot" class="clock">—</div>
+  </footer>
+
+  <script src="/terminal.js?v=12"></script>
+</body>
+</html>
