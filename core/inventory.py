@@ -20,10 +20,12 @@ imbalanced markets are paused until exposure drops.
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple, NamedTuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 
 from loguru import logger
 
@@ -64,18 +66,12 @@ class MarketPosition:
         return ""
 
     @property
+    @property
     def net_exposure_usd(self) -> float:
-        """
-        Approximate USD exposure of the imbalance.
-        If we hold 100 YES at avg cost 0.50 and 80 NO at 0.50,
-        net exposure ≈ (100 - 80) * 0.50 = $10 directional.
-        """
+        """Unmatched size × $0.50 when no live mid is available."""
         if self.yes_size == 0 and self.no_size == 0:
             return 0.0
-        avg_cost = 0.50
-        if self.yes_size > 0 and self.yes_cost > 0:
-            avg_cost = self.yes_cost / self.yes_size
-        return abs(self.yes_size - self.no_size) * avg_cost
+        return abs(self.yes_size - self.no_size) * 0.50
 
     def gross_exposure_at_mid(self, yes_mid: float = 0.5) -> float:
         """Gross position value using mark-to-mid pricing (primary valuation)."""
@@ -95,6 +91,10 @@ class SkewAction:
     paused_side: str = ""  # token side to stop quoting entirely (hard pause >= 0.70)
     recovery_side: str = ""  # token side in recovery mode (reduced quoting, 0.45-0.70)
     pause_triggered: bool = False  # True only on transition to paused
+
+
+INVENTORY_PATH = Path("data/inventory_state.json")
+_SIZE_DUST = 0.5
 
 
 class InventoryTracker:
@@ -118,6 +118,9 @@ class InventoryTracker:
         self._realised_pnl_day_anchor: float = 0.0
         self._current_day_utc: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._drawdown_paused: bool = False
+        self._mtm_equity_day_anchor: Optional[float] = None
+        self._persist_path = INVENTORY_PATH
+        self._tape: Optional[Any] = None
 
     @property
     def positions(self) -> Dict[str, MarketPosition]:
@@ -125,6 +128,179 @@ class InventoryTracker:
 
     def get_position(self, condition_id: str) -> Optional[MarketPosition]:
         return self._positions.get(condition_id)
+
+    def set_tape(self, tape: Any) -> None:
+        """Optional LocalTape for cost_basis_missing / diagnostics."""
+        self._tape = tape
+
+    def apply_seed_costs_once(
+        self,
+        condition_id: str,
+        yes_cost: float = 0.0,
+        no_cost: float = 0.0,
+    ) -> None:
+        """Write seed USD cost basis only when currently unset (≤ 0).
+
+        Never re-assign original seed USD after fills/rebalance have moved cost.
+        """
+        pos = self._positions.get(condition_id)
+        if pos is None:
+            return
+        yc = float(yes_cost or 0.0)
+        nc = float(no_cost or 0.0)
+        if yc > 0 and pos.yes_cost <= 0:
+            pos.yes_cost = yc
+        if nc > 0 and pos.no_cost <= 0:
+            pos.no_cost = nc
+
+    def add_seed_costs(
+        self,
+        condition_id: str,
+        yes_cost: float = 0.0,
+        no_cost: float = 0.0,
+    ) -> None:
+        """Add top-up seed USD to existing cost basis. Never replace."""
+        pos = self._positions.get(condition_id)
+        if pos is None:
+            return
+        yc = float(yes_cost or 0.0)
+        nc = float(no_cost or 0.0)
+        if yc > 0:
+            pos.yes_cost += yc
+        if nc > 0:
+            pos.no_cost += nc
+
+    def absorb_seed_acquisition(
+        self,
+        condition_id: str,
+        *,
+        prev_yes_size: float,
+        prev_no_size: float,
+        yes_cost: float = 0.0,
+        no_cost: float = 0.0,
+    ) -> None:
+        """After sizes were updated from paper/chain: write-once or add top-up.
+
+        - cost unset + seeder USD → ``apply_seed_costs_once``
+        - cost set + size grew + seeder USD → ``add_seed_costs`` (never reset)
+        - size grew + zero seeder USD → tape ``seed_cost_gap``, init delta at mid
+        - size unchanged → no-op (stale original seed USD must not reset/add)
+        """
+        pos = self._positions.get(condition_id)
+        if pos is None:
+            return
+        yc = float(yes_cost or 0.0)
+        nc = float(no_cost or 0.0)
+        eps = 1e-9
+        delta_yes = float(pos.yes_size) - float(prev_yes_size)
+        delta_no = float(pos.no_size) - float(prev_no_size)
+
+        if yc > 0 and pos.yes_cost <= 0:
+            pos.yes_cost = yc
+        elif yc > 0 and delta_yes > eps and pos.yes_cost > 0:
+            pos.yes_cost += yc
+        elif delta_yes > eps and yc <= 0:
+            self._cover_seed_cost_gap(pos, is_yes=True, delta=delta_yes)
+
+        if nc > 0 and pos.no_cost <= 0:
+            pos.no_cost = nc
+        elif nc > 0 and delta_no > eps and pos.no_cost > 0:
+            pos.no_cost += nc
+        elif delta_no > eps and nc <= 0:
+            self._cover_seed_cost_gap(pos, is_yes=False, delta=delta_no)
+
+    def _cover_seed_cost_gap(
+        self,
+        pos: MarketPosition,
+        *,
+        is_yes: bool,
+        delta: float,
+    ) -> None:
+        """Size grew without seeder USD — init delta at mid (realised +0)."""
+        if delta <= 1e-12:
+            return
+        mid = self._side_mid(pos, is_yes)
+        add_usd = delta * mid
+        side = "YES" if is_yes else "NO"
+        if is_yes:
+            pos.yes_cost += add_usd
+        else:
+            pos.no_cost += add_usd
+        logger.warning(
+            "seed_cost_gap {} {} delta={:.4f} → init @ mid={:.4f} (+${:.4f})",
+            pos.condition_id[:12], side, delta, mid, add_usd,
+        )
+        if self._tape is not None:
+            try:
+                self._tape.skip(
+                    pos.condition_id,
+                    "seed_cost_gap",
+                    side=side,
+                    delta=delta,
+                    mid=mid,
+                    cost_added=add_usd,
+                )
+            except Exception as exc:
+                logger.debug("tape seed_cost_gap failed: {}", exc)
+
+    def _side_mid(self, pos: MarketPosition, is_yes: bool) -> float:
+        """Best-effort mid for missing-basis init (token mid → complement → 0.5)."""
+        if is_yes:
+            if pos.yes_token_id and pos.yes_token_id in self._midpoints:
+                return float(self._midpoints[pos.yes_token_id])
+            if pos.no_token_id and pos.no_token_id in self._midpoints:
+                return max(0.01, 1.0 - float(self._midpoints[pos.no_token_id]))
+            return 0.5
+        if pos.no_token_id and pos.no_token_id in self._midpoints:
+            return float(self._midpoints[pos.no_token_id])
+        if pos.yes_token_id and pos.yes_token_id in self._midpoints:
+            return max(0.01, 1.0 - float(self._midpoints[pos.yes_token_id]))
+        return 0.5
+
+    def _ensure_cost_basis(self, pos: MarketPosition, is_yes: bool) -> None:
+        """If size>0 and cost==0, init cost=size×mid once. Realised unchanged."""
+        if is_yes:
+            if pos.yes_size <= 1e-12 or pos.yes_cost > 0:
+                return
+            mid = self._side_mid(pos, True)
+            pos.yes_cost = pos.yes_size * mid
+            logger.warning(
+                "cost_basis_missing {} YES size={:.4f} → init @ mid={:.4f} (realised+0)",
+                pos.condition_id[:12], pos.yes_size, mid,
+            )
+            if self._tape is not None:
+                try:
+                    self._tape.skip(
+                        pos.condition_id,
+                        "cost_basis_missing",
+                        side="YES",
+                        size=pos.yes_size,
+                        mid=mid,
+                        cost=pos.yes_cost,
+                    )
+                except Exception as exc:
+                    logger.debug("tape cost_basis_missing failed: {}", exc)
+            return
+        if pos.no_size <= 1e-12 or pos.no_cost > 0:
+            return
+        mid = self._side_mid(pos, False)
+        pos.no_cost = pos.no_size * mid
+        logger.warning(
+            "cost_basis_missing {} NO size={:.4f} → init @ mid={:.4f} (realised+0)",
+            pos.condition_id[:12], pos.no_size, mid,
+        )
+        if self._tape is not None:
+            try:
+                self._tape.skip(
+                    pos.condition_id,
+                    "cost_basis_missing",
+                    side="NO",
+                    size=pos.no_size,
+                    mid=mid,
+                    cost=pos.no_cost,
+                )
+            except Exception as exc:
+                logger.debug("tape cost_basis_missing failed: {}", exc)
 
     # ------------------------------------------------------------------
     # Position tracking
@@ -148,6 +324,80 @@ class InventoryTracker:
             pos.no_token_id = no_token_id
             self._token_map[no_token_id] = (condition_id, "no")
         return pos
+
+    def flatten_position(
+        self,
+        condition_id: str,
+        yes_price: float,
+        no_price: float,
+    ) -> float:
+        """Zero YES+NO for a market; realise PnL at given exit prices.
+
+        Returns total USD proceeds (size × price). Idempotent on empty.
+        """
+        pos = self._positions.get(condition_id)
+        if pos is None:
+            return 0.0
+        proceeds = 0.0
+        if pos.yes_size > 1e-12:
+            self._ensure_cost_basis(pos, True)
+            avg = (pos.yes_cost / pos.yes_size) if pos.yes_size > 0 else float(yes_price)
+            proceeds += pos.yes_size * float(yes_price)
+            self._realised_pnl += pos.yes_size * (float(yes_price) - avg)
+            pos.yes_size = 0.0
+            pos.yes_cost = 0.0
+        if pos.no_size > 1e-12:
+            self._ensure_cost_basis(pos, False)
+            avg = (pos.no_cost / pos.no_size) if pos.no_size > 0 else float(no_price)
+            proceeds += pos.no_size * float(no_price)
+            self._realised_pnl += pos.no_size * (float(no_price) - avg)
+            pos.no_size = 0.0
+            pos.no_cost = 0.0
+        return proceeds
+
+    def reduce_position(
+        self,
+        condition_id: str,
+        side: str,
+        size: float,
+        price: float,
+    ) -> float:
+        """Sell ``size`` shares on YES or NO; realise PnL vs avg cost.
+
+        Does not touch the other side. Size is clipped to holdings.
+        Returns USD proceeds.
+        """
+        pos = self._positions.get(condition_id)
+        if pos is None or size <= 1e-12:
+            return 0.0
+        px = float(price)
+        want = float(size)
+        key = (side or "").strip().upper()
+        if key == "YES":
+            held = pos.yes_size
+            if held <= 1e-12:
+                return 0.0
+            self._ensure_cost_basis(pos, True)
+            sold = min(want, held)
+            avg = (pos.yes_cost / pos.yes_size) if pos.yes_size > 0 else px
+            proceeds = sold * px
+            self._realised_pnl += sold * (px - avg)
+            pos.yes_size = max(0.0, pos.yes_size - sold)
+            pos.yes_cost = max(0.0, pos.yes_cost - sold * avg)
+            return proceeds
+        if key == "NO":
+            held = pos.no_size
+            if held <= 1e-12:
+                return 0.0
+            self._ensure_cost_basis(pos, False)
+            sold = min(want, held)
+            avg = (pos.no_cost / pos.no_size) if pos.no_size > 0 else px
+            proceeds = sold * px
+            self._realised_pnl += sold * (px - avg)
+            pos.no_size = max(0.0, pos.no_size - sold)
+            pos.no_cost = max(0.0, pos.no_cost - sold * avg)
+            return proceeds
+        return 0.0
 
     def update_midpoints(self, midpoints: Dict[str, float]) -> None:
         """Update mark-to-mid prices from the latest batch fetch."""
@@ -192,8 +442,6 @@ class InventoryTracker:
                 pos = MarketPosition(condition_id=f.condition_id)
                 self._positions[f.condition_id] = pos
 
-            self._total_fill_count += 1
-
             # Try to set missing token IDs from the global token map
             if not pos.yes_token_id or not pos.no_token_id:
                 mapping = self._token_map.get(f.token_id)
@@ -203,20 +451,24 @@ class InventoryTracker:
                     elif mapping[1] == "no" and not pos.no_token_id:
                         pos.no_token_id = f.token_id
 
-            if pos.yes_token_id and f.token_id == pos.yes_token_id:
+            # YES/NO attribution from token_id only — never guess.
+            is_yes: Optional[bool] = None
+            mapping = self._token_map.get(f.token_id)
+            if mapping and mapping[0] == f.condition_id:
+                is_yes = mapping[1] == "yes"
+            elif pos.yes_token_id and f.token_id == pos.yes_token_id:
                 is_yes = True
             elif pos.no_token_id and f.token_id == pos.no_token_id:
                 is_yes = False
-            elif not pos.yes_token_id and not pos.no_token_id:
+            else:
                 logger.warning(
-                    "Fill for {} with unknown token IDs — skipping (token: {})",
-                    f.condition_id[:12], f.token_id[:12],
+                    "Fill for {} unknown token {} — skip (no YES/NO guess)",
+                    f.condition_id[:12],
+                    (f.token_id[:12] if f.token_id else "?"),
                 )
                 continue
-            elif pos.yes_token_id:
-                is_yes = False
-            else:
-                is_yes = True
+
+            self._total_fill_count += 1
 
             if f.side == "BID":
                 if is_yes:
@@ -227,12 +479,14 @@ class InventoryTracker:
                     pos.no_cost += f.filled_size * f.price
             elif f.side == "ASK":
                 if is_yes:
+                    self._ensure_cost_basis(pos, True)
                     avg_cost = (pos.yes_cost / pos.yes_size) if pos.yes_size > 0 else f.price
                     pnl = (f.price - avg_cost) * f.filled_size
                     self._realised_pnl += pnl
                     pos.yes_size = max(0, pos.yes_size - f.filled_size)
                     pos.yes_cost = max(0, pos.yes_cost - f.filled_size * avg_cost)
                 else:
+                    self._ensure_cost_basis(pos, False)
                     avg_cost = (pos.no_cost / pos.no_size) if pos.no_size > 0 else f.price
                     pnl = (f.price - avg_cost) * f.filled_size
                     self._realised_pnl += pnl
@@ -314,7 +568,12 @@ class InventoryTracker:
         positions = self._positions.values()
         if active_cids is not None:
             positions = [p for p in positions if p.condition_id in active_cids]
-        return sum(p.net_exposure_usd for p in positions)
+        total = 0.0
+        for p in positions:
+            unmatched = abs(p.yes_size - p.no_size)
+            mid = self._midpoints.get(p.yes_token_id, 0.5)
+            total += unmatched * (mid if mid > 0 else 0.50)
+        return total
 
     def is_global_exposure_breached(self, active_cids: Optional[set] = None) -> bool:
         limit = self._s.GLOBAL_MAX_EXPOSURE_PCT * self._s.TOTAL_CAPITAL
@@ -323,7 +582,7 @@ class InventoryTracker:
     def gross_exposure_usd(
         self, open_order_notional: float = 0.0, active_cids: Optional[set] = None,
     ) -> float:
-        """Total gross exposure: filled positions (mark-to-mid) + open order notional."""
+        """Deployed gross: filled mark-to-mid + BID notional (ASK excluded)."""
         positions = self._positions.values()
         if active_cids is not None:
             positions = [p for p in positions if p.condition_id in active_cids]
@@ -362,26 +621,36 @@ class InventoryTracker:
     def market_exposure_usd(
         self, condition_id: str, open_order_notional_for_market: float = 0.0,
     ) -> float:
-        """Gross exposure for a single market: filled (mark-to-mid) + open orders."""
+        """Deployed for one market: inventory mark-to-mid + BID notional only."""
         pos = self._positions.get(condition_id)
         if pos is None:
             return open_order_notional_for_market
         yes_mid = self._midpoints.get(pos.yes_token_id, 0.5)
         return pos.gross_exposure_at_mid(yes_mid) + open_order_notional_for_market
 
+    def inventory_mark_usd(self, condition_id: str) -> float:
+        """Mark-to-mid inventory value for one market (0 if unknown)."""
+        pos = self._positions.get(condition_id)
+        if pos is None:
+            return 0.0
+        yes_mid = self._midpoints.get(pos.yes_token_id, 0.5)
+        return pos.gross_exposure_at_mid(yes_mid)
+
     def is_market_exposure_breached(
         self,
         condition_id: str,
         allocated_capital: float,
         open_order_notional_for_market: float = 0.0,
+        minsize_bid_floor_usd: float = 0.0,
     ) -> tuple[bool, float, float]:
         """Per-market exposure check (Issue 5).
 
-        Triggers BEFORE the global gross check so a single runaway market
-        is paused without dragging the whole bot into the global limit.
+        Deployed = inventory mark + BID notional (ASK excluded).
+        CLOB ``min_size`` two-sided BID floor may overshoot
+        ``ALLOC × MAX_MARKET_EXPOSURE_RATIO`` — that alone must not pause
+        (Q-score requires two-sided BIDs; never INACTIVE for floor overshoot).
 
-        Returns ``(breached, exposure_usd, limit_usd)`` so the caller can
-        log the actual numbers without recomputing them.
+        Returns ``(breached, exposure_usd, limit_usd)``.
         """
         if allocated_capital <= 0:
             return False, 0.0, 0.0
@@ -389,19 +658,37 @@ class InventoryTracker:
         exposure = self.market_exposure_usd(
             condition_id, open_order_notional_for_market,
         )
-        return (exposure > limit, exposure, limit)
+        if exposure <= limit:
+            return False, exposure, limit
+        # Tolerate overshoot only when resting BIDs are at/under the
+        # two-sided min_size floor (preferred path — no naked ASK).
+        if (
+            minsize_bid_floor_usd > 0
+            and open_order_notional_for_market <= minsize_bid_floor_usd + 1e-6
+        ):
+            return False, exposure, limit
+        return True, exposure, limit
 
     # ------------------------------------------------------------------
     # Daily drawdown circuit breaker
     # ------------------------------------------------------------------
 
+    def mark_to_mid_equity(self) -> float:
+        """realised PnL + current inventory mark-to-mid (gross at mid)."""
+        mtm = 0.0
+        for pos in self._positions.values():
+            yes_mid = self._midpoints.get(pos.yes_token_id, 0.5)
+            mtm += pos.gross_exposure_at_mid(yes_mid)
+        return self._realised_pnl + mtm
+
     def check_daily_drawdown(self) -> bool:
         """
         Evaluate the daily drawdown circuit breaker.
 
-        - At UTC midnight rollover the PnL anchor is re-snapshotted and the
-          pause flag cleared (the new day starts fresh).
-        - Triggers pause when realised_pnl_today < -(LIMIT_PCT × TOTAL_CAPITAL).
+        - At UTC midnight rollover the PnL/MTM anchors are re-snapshotted
+          and the pause flag cleared.
+        - Triggers pause when realised_pnl_today < -limit OR
+          (mark_to_mid_equity − midnight_mtm) < -limit.
 
         Returns True if the bot should pause new quoting for today.
         """
@@ -414,7 +701,11 @@ class InventoryTracker:
             )
             self._current_day_utc = today
             self._realised_pnl_day_anchor = self._realised_pnl
+            self._mtm_equity_day_anchor = self.mark_to_mid_equity()
             self._drawdown_paused = False
+
+        if self._mtm_equity_day_anchor is None:
+            self._mtm_equity_day_anchor = self.mark_to_mid_equity()
 
         if self._drawdown_paused:
             return True
@@ -423,12 +714,15 @@ class InventoryTracker:
         if limit <= 0:
             return False
 
-        if self.realised_pnl_today < -limit:
+        mtm_dd = self.mark_to_mid_equity() - self._mtm_equity_day_anchor
+        realised_breach = self.realised_pnl_today < -limit
+        mtm_breach = mtm_dd < -limit
+        if realised_breach or mtm_breach:
             self._drawdown_paused = True
             logger.warning(
-                "Daily drawdown breached: realised PnL today=${:.2f} < -${:.2f} "
-                "({:.1%} of ${:.0f}) — pausing quoting until UTC midnight",
-                self.realised_pnl_today, limit,
+                "Daily drawdown breached: realised today=${:.2f} mtm_dd=${:.2f} "
+                "< -${:.2f} ({:.1%} of ${:.0f}) — pausing quoting until UTC midnight",
+                self.realised_pnl_today, mtm_dd, limit,
                 self._s.DAILY_DRAWDOWN_LIMIT_PCT, self._s.TOTAL_CAPITAL,
             )
             return True
@@ -568,3 +862,95 @@ class InventoryTracker:
         out["_realised_pnl"] = round(self._realised_pnl, 4)
         out["_total_fills"] = self._total_fill_count
         return out
+
+    def save_state(self, path: Optional[Path] = None) -> None:
+        """Persist size + cost basis + realised/drawdown anchors."""
+        dest = path or self._persist_path
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            positions = {}
+            for cid, pos in self._positions.items():
+                positions[cid] = {
+                    "yes_token_id": pos.yes_token_id,
+                    "no_token_id": pos.no_token_id,
+                    "yes_size": pos.yes_size,
+                    "no_size": pos.no_size,
+                    "yes_cost": pos.yes_cost,
+                    "no_cost": pos.no_cost,
+                }
+            dest.write_text(json.dumps({
+                "realised_pnl": self._realised_pnl,
+                "realised_pnl_day_anchor": self._realised_pnl_day_anchor,
+                "mtm_equity_day_anchor": self._mtm_equity_day_anchor,
+                "current_day_utc": self._current_day_utc,
+                "positions": positions,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }))
+        except Exception as exc:
+            logger.warning("Failed to persist inventory state: {}", exc)
+
+    def apply_persisted_state(self, path: Optional[Path] = None) -> None:
+        """Merge disk state after chain seed.
+
+        File costs win when sizes match within dust. Orphan cids (not in
+        the current market list) are restored in full so capital is not
+        dropped on the floor. Realised/drawdown anchors restored as-is.
+        """
+        src = path or self._persist_path
+        try:
+            if not src.exists():
+                return
+            data = json.loads(src.read_text())
+        except Exception as exc:
+            logger.warning("Failed to load inventory state: {}", exc)
+            return
+        if not isinstance(data, dict):
+            return
+        self._realised_pnl = float(data.get("realised_pnl", self._realised_pnl) or 0.0)
+        self._realised_pnl_day_anchor = float(
+            data.get("realised_pnl_day_anchor", self._realised_pnl_day_anchor) or 0.0
+        )
+        mtm_anchor = data.get("mtm_equity_day_anchor")
+        if mtm_anchor is not None:
+            try:
+                self._mtm_equity_day_anchor = float(mtm_anchor)
+            except (TypeError, ValueError):
+                pass
+        file_day = str(data.get("current_day_utc") or "")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if file_day == today:
+            self._current_day_utc = file_day
+        recs = data.get("positions") or {}
+        if not isinstance(recs, dict):
+            return
+        for cid, rec in recs.items():
+            if not isinstance(rec, dict):
+                continue
+            pos = self.ensure_position(
+                cid,
+                yes_token_id=str(rec.get("yes_token_id") or ""),
+                no_token_id=str(rec.get("no_token_id") or ""),
+            )
+            file_yes = float(rec.get("yes_size") or 0.0)
+            file_no = float(rec.get("no_size") or 0.0)
+            file_yc = float(rec.get("yes_cost") or 0.0)
+            file_nc = float(rec.get("no_cost") or 0.0)
+            sizes_match = (
+                abs(pos.yes_size - file_yes) <= _SIZE_DUST
+                and abs(pos.no_size - file_no) <= _SIZE_DUST
+            )
+            if sizes_match:
+                pos.yes_cost = file_yc
+                pos.no_cost = file_nc
+            elif pos.yes_size == 0 and pos.no_size == 0:
+                pos.yes_size = file_yes
+                pos.no_size = file_no
+                pos.yes_cost = file_yc
+                pos.no_cost = file_nc
+            if rec.get("yes_token_id") and not pos.yes_token_id:
+                pos.yes_token_id = str(rec["yes_token_id"])
+                self._token_map[pos.yes_token_id] = (cid, "yes")
+            if rec.get("no_token_id") and not pos.no_token_id:
+                pos.no_token_id = str(rec["no_token_id"])
+                self._token_map[pos.no_token_id] = (cid, "no")
+        logger.info("Inventory state merged from {}", src)

@@ -309,6 +309,21 @@ class TestDailyDrawdown:
         inv._realised_pnl = -500.0
         assert inv.check_daily_drawdown() is False
 
+    def test_mtm_drawdown_long_yes_mid_crash(self):
+        """Unrealised 0.50 → 0.12 on a long YES book must pause even if realised is flat."""
+        s = _make_settings(TOTAL_CAPITAL=1000, DAILY_DRAWDOWN_LIMIT_PCT=0.05)
+        inv = InventoryTracker(s)
+        inv.ensure_position("c1", yes_token_id="y", no_token_id="n")
+        inv._positions["c1"].yes_size = 200.0
+        inv._positions["c1"].no_size = 0.0
+        inv._realised_pnl = 0.0
+        inv._midpoints["y"] = 0.50
+        assert inv.check_daily_drawdown() is False
+        inv._midpoints["y"] = 0.12
+        assert inv.check_daily_drawdown() is True
+        assert inv.is_drawdown_paused is True
+        assert inv.realised_pnl_today == pytest.approx(0.0)
+
 
 # ------------------------------------------------------------------
 # Seed cost basis (regression — main.py:959-969 fix)
@@ -357,3 +372,30 @@ class TestSeedCostBasis:
         inv.record_fills([_fill(side="ASK", price=0.60, size=10)])
 
         assert inv.realised_pnl == pytest.approx(1.0)  # (0.60 - 0.50) * 10
+
+
+class TestReducePosition:
+    def test_sells_surplus_only_keeps_matched(self):
+        inv = InventoryTracker(_make_settings())
+        inv.ensure_position("cond_1", yes_token_id="tok_yes", no_token_id="tok_no")
+        pos = inv.positions["cond_1"]
+        pos.yes_size = 300.0
+        pos.no_size = 200.0
+        pos.yes_cost = 300.0 * 0.40
+        pos.no_cost = 200.0 * 0.60
+
+        proceeds = inv.reduce_position("cond_1", "YES", 100.0, 0.40)
+        pos2 = inv.get_position("cond_1")
+        assert proceeds == pytest.approx(40.0)
+        assert pos2.yes_size == pytest.approx(200.0)
+        assert pos2.no_size == pytest.approx(200.0)
+        assert inv.realised_pnl == pytest.approx(0.0)
+
+    def test_clips_to_holdings(self):
+        inv = InventoryTracker(_make_settings())
+        inv.ensure_position("cond_1", yes_token_id="tok_yes", no_token_id="tok_no")
+        pos = inv.positions["cond_1"]
+        pos.yes_size = 10.0
+        pos.yes_cost = 4.0
+        inv.reduce_position("cond_1", "YES", 999.0, 0.50)
+        assert inv.get_position("cond_1").yes_size == 0.0
