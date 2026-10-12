@@ -24,9 +24,10 @@ bounded by max_spread * 0.499 (existing structural clamp).
 Replaces the legacy `_fill_rates` blunt instrument that widened on
 coarse fills/hour bins (true/false buckets, no directional info).
 
-Cold path only — hot path reads `is_toxic_paused()` for symmetry with
-midpoint guard (Quoter.is_midpoint_paused) and spike pause
-(Quoter.is_spike_paused).
+Cold path evaluates VPIN/fill-vs-mid; hot path honors
+``is_toxic_paused()`` before compute/post (same contract as
+Quoter.is_midpoint_paused / is_spike_paused) and feeds
+``record_mid`` from the WS tick.
 """
 
 from __future__ import annotations

@@ -32,7 +32,12 @@ from config.settings import Settings
 from core.client import AsyncClobClient
 from core.quoter import Quote, TwoSidedQuotes
 
-TICK_SIZE = 0.01
+
+def should_replace_price(
+    old: float, new: float, tick: float, threshold_ticks: int,
+) -> bool:
+    """True if |new-old| exceeds *threshold_ticks* of the *market* tick."""
+    return abs(new - old) > (tick * threshold_ticks) + 1e-9
 
 
 @dataclass
@@ -46,6 +51,7 @@ class OrderRecord:
     price: float
     size: float
     posted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    outcome: str = "yes"
 
 
 @dataclass
@@ -58,6 +64,8 @@ class FillEvent:
     price: float
     filled_size: float
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    trade_id: str = ""
+    mid_at_fill: Optional[float] = None
 
 
 class QuoteUpdateResult(NamedTuple):
@@ -78,46 +86,73 @@ class OrderManager:
         self._live_orders: Dict[str, OrderRecord] = {}
         self._failure_counts: Dict[str, int] = defaultdict(int)
         self._cooldown_until: Dict[str, datetime] = {}
-        self._recent_fills: List[FillEvent] = []
         self._usdc_balance: Optional[float] = None
         self._committed_capital: float = 0.0
         self._market_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._session_quoted_notional: float = 0.0
+        self._tape: Any = None
+        self._digest: Any = None
+        self._paper: Any = None
+
+    def set_tape(self, tape: Any) -> None:
+        """Optional LocalTape — posts/cancels are appended on success."""
+        self._tape = tape
+
+    def set_digest(self, digest: Any) -> None:
+        self._digest = digest
+
+    def set_paper(self, paper: Any) -> None:
+        """Optional PaperBroker — DRY_RUN posts/cancels/pre-checks only."""
+        self._paper = paper
+
+    @property
+    def usdc_balance(self) -> Optional[float]:
+        return self._usdc_balance
+
+    @property
+    def committed_capital(self) -> float:
+        return self._committed_capital
 
     def market_lock(self, condition_id: str) -> asyncio.Lock:
         """Return the per-market lock (creates on first access)."""
         return self._market_locks[condition_id]
 
     @property
-    def recent_fills(self) -> List[FillEvent]:
-        return list(self._recent_fills[-200:])
-
-    @property
     def live_order_count(self) -> int:
         return len(self._live_orders)
 
-    def drain_new_fills(self) -> List[FillEvent]:
-        """Return accumulated fills and clear the buffer. Exactly-once delivery."""
-        fills = self._recent_fills
-        self._recent_fills = []
-        return fills
-
     @property
     def open_order_notional(self) -> float:
-        """Sum of price * size for all tracked live orders."""
-        return sum(rec.price * rec.size for rec in self._live_orders.values())
-
-    def open_order_notional_for_market(self, condition_id: str) -> float:
-        """Sum of price * size for tracked live orders on one market.
-
-        Used by the per-market exposure gate (Issue 5) to compare against
-        ``allocated_capital × MAX_MARKET_EXPOSURE_RATIO`` before the global
-        gross check kicks in.
-        """
+        """BID notional only (ASK sells owned inventory — excluded from exposure)."""
         return sum(
             rec.price * rec.size
             for rec in self._live_orders.values()
-            if rec.condition_id == condition_id
+            if rec.side == BUY
+        )
+
+    @property
+    def open_ask_notional(self) -> float:
+        """ASK notional (diagnostic only — excluded from exposure gates)."""
+        return sum(
+            rec.price * rec.size
+            for rec in self._live_orders.values()
+            if rec.side == SELL
+        )
+
+    def open_order_notional_for_market(self, condition_id: str) -> float:
+        """BID notional for one market (ASK excluded from exposure gates)."""
+        return sum(
+            rec.price * rec.size
+            for rec in self._live_orders.values()
+            if rec.condition_id == condition_id and rec.side == BUY
+        )
+
+    def open_ask_notional_for_market(self, condition_id: str) -> float:
+        """ASK notional for one market (excluded from gates; for logging)."""
+        return sum(
+            rec.price * rec.size
+            for rec in self._live_orders.values()
+            if rec.condition_id == condition_id and rec.side == SELL
         )
 
     def drain_quoted_notional(self) -> float:
@@ -138,6 +173,10 @@ class OrderManager:
 
     async def refresh_usdc_balance(self) -> None:
         """Fetch current USDC balance once per cycle for collateral pre-checks."""
+        if self._s.DRY_RUN and self._paper is not None:
+            self._usdc_balance = float(self._paper.cash)
+            self._committed_capital = float(self._paper.committed)
+            return
         try:
             from py_clob_client_v2 import BalanceAllowanceParams
             resp = await self._client._call(
@@ -157,12 +196,18 @@ class OrderManager:
             logger.debug("USDC balance fetch failed: {}", exc)
             self._usdc_balance = None
 
-    def _collateral_ok(self, notional: float, side: str = BUY) -> bool:
-        """Soft pre-check: enough USDC for this order? CLOB is the final authority.
-
-        SELL orders are backed by held conditional tokens (or CTF minting),
-        so they bypass the USDC check — the CLOB validates token holdings.
-        """
+    def _collateral_ok(
+        self,
+        notional: float,
+        side: str = BUY,
+        token_id: str = "",
+        size: float = 0.0,
+    ) -> bool:
+        """Soft pre-check: enough USDC (or paper inventory) for this order?"""
+        if self._s.DRY_RUN and self._paper is not None:
+            if side == SELL:
+                return self._paper.precheck_ask(token_id, size)
+            return self._paper.precheck_bid(notional)
         if side == SELL:
             return True
         if self._usdc_balance is None:
@@ -175,6 +220,19 @@ class OrderManager:
             )
             return False
         return True
+
+    def sync_live_orders_from_paper(self) -> None:
+        """Drop/resize local records after paper fills. No-op when no paper."""
+        if self._paper is None:
+            return
+        remaining = self._paper.resting_sizes()
+        for oid in list(self._live_orders):
+            if oid not in remaining:
+                self._live_orders.pop(oid, None)
+            else:
+                self._live_orders[oid].size = remaining[oid]
+        self._committed_capital = float(self._paper.committed)
+        self._usdc_balance = float(self._paper.cash)
 
     # ------------------------------------------------------------------
     # Helpers: find & cancel individual orders
@@ -201,19 +259,72 @@ class OrderManager:
         _live_orders so it can be retried on the next cycle instead of
         becoming a ghost order that permanently locks tokens.
         """
+        rec = self._live_orders.get(order_id)
         try:
             if not self._s.DRY_RUN:
                 await self._client.cancel(order_id)
+            elif self._paper is not None:
+                self._paper.cancel(order_id)
         except Exception as exc:
             err_str = str(exc).lower()
             if "not found" in err_str or "already" in err_str:
                 logger.info("Cancel {} — already gone (filled/expired): {}", order_id[:12], exc)
                 self._live_orders.pop(order_id, None)
+                self._tape_cancel(rec, order_id)
                 return True
             logger.warning("Cancel {} FAILED — keeping in tracking to retry: {}", order_id[:12], exc)
             return False
         self._live_orders.pop(order_id, None)
+        self._tape_cancel(rec, order_id)
         return True
+
+    def _tape_cancel(self, rec: Optional[OrderRecord], order_id: str) -> None:
+        if self._tape is None:
+            return
+        try:
+            self._tape.cancel(
+                condition_id=rec.condition_id if rec else "",
+                token_id=rec.token_id if rec else "",
+                side=rec.side if rec else "",
+                price=rec.price if rec else 0.0,
+                size=rec.size if rec else 0.0,
+                order_id=order_id,
+            )
+        except Exception:
+            pass
+
+    def _tape_post(self, rec: OrderRecord) -> None:
+        if self._tape is None:
+            return
+        try:
+            self._tape.post(
+                condition_id=rec.condition_id,
+                token_id=rec.token_id,
+                side=rec.side,
+                price=rec.price,
+                size=rec.size,
+                order_id=rec.order_id,
+                outcome=rec.outcome or "yes",
+            )
+        except Exception:
+            pass
+
+    def _remember_computed_quotes(self, quotes: TwoSidedQuotes) -> None:
+        """Push YES+NO levels into the tape cache (covers smart-diff keeps)."""
+        if self._tape is None:
+            return
+        try:
+            mid = None
+            if quotes.yes_quote is not None:
+                mid = quotes.yes_quote.mid
+            self._tape.remember_two_sided(
+                quotes.condition_id,
+                mid=mid,
+                yes_quote=quotes.yes_quote,
+                no_quote=quotes.no_quote,
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Stale order cleanup (background safety net)
@@ -236,7 +347,8 @@ class OrderManager:
             self._s.MAX_ORDER_AGE_SECONDS,
         )
         for oid, rec in stale:
-            await self._cancel_single(oid)
+            async with self.market_lock(rec.condition_id):
+                await self._cancel_single(oid)
 
     # ------------------------------------------------------------------
     # Main entry point per cycle — SMART DIFF
@@ -263,16 +375,20 @@ class OrderManager:
 
         if force_replace:
             posted = await self._full_cancel_and_replace(quotes)
+            self._remember_computed_quotes(quotes)
             return QuoteUpdateResult(posted, 0)
 
-        threshold = TICK_SIZE * self._s.ORDER_UPDATE_THRESHOLD_TICKS
+        tick = float(getattr(quotes, "tick_size", None) or 0.01)
         now = datetime.now(timezone.utc)
         max_age = timedelta(seconds=self._s.MAX_ORDER_AGE_SECONDS)
 
         posted: List[OrderRecord] = []
         kept = 0
 
-        for quote in (quotes.yes_quote, quotes.no_quote):
+        for quote, outcome in (
+            (quotes.yes_quote, "yes"),
+            (quotes.no_quote, "no"),
+        ):
             if quote is None:
                 continue
 
@@ -297,7 +413,8 @@ class OrderManager:
                 # ── No existing order → fresh post ──
                 if not existing:
                     rec = await self._post_single(
-                        cid, quote.token_id, sdk_side, new_price, new_size
+                        cid, quote.token_id, sdk_side, new_price, new_size,
+                        outcome=outcome,
                     )
                     if rec:
                         posted.append(rec)
@@ -308,7 +425,9 @@ class OrderManager:
                 price_diff = abs(new_price - old_rec.price)
                 age = now - old_rec.posted_at
                 is_stale = age > max_age
-                price_moved = price_diff > threshold + 1e-9
+                price_moved = should_replace_price(
+                    old_rec.price, new_price, tick, self._s.ORDER_UPDATE_THRESHOLD_TICKS,
+                )
                 size_changed = abs(new_size - old_rec.size) > max(
                     0.5, old_rec.size * 0.10
                 )
@@ -319,7 +438,7 @@ class OrderManager:
 
                 reasons: List[str] = []
                 if price_moved:
-                    ticks = price_diff / TICK_SIZE
+                    ticks = price_diff / tick if tick > 0 else 0.0
                     reasons.append(
                         f"price Δ{ticks:.0f}t ({old_rec.price:.4f}→{new_price:.4f})"
                     )
@@ -346,13 +465,15 @@ class OrderManager:
                         kept += 1
                         continue
                     rec = await self._post_single(
-                        cid, quote.token_id, sdk_side, new_price, new_size
+                        cid, quote.token_id, sdk_side, new_price, new_size,
+                        outcome=outcome,
                     )
                     if rec:
                         posted.append(rec)
                 else:
                     rec = await self._post_single(
-                        cid, quote.token_id, sdk_side, new_price, new_size
+                        cid, quote.token_id, sdk_side, new_price, new_size,
+                        outcome=outcome,
                     )
                     cancelled = await self._cancel_single(oid)
                     if not cancelled:
@@ -373,6 +494,7 @@ class OrderManager:
                 self._s.ORDER_UPDATE_THRESHOLD_TICKS,
             )
 
+        self._remember_computed_quotes(quotes)
         return QuoteUpdateResult(posted, kept)
 
     # ------------------------------------------------------------------
@@ -399,10 +521,13 @@ class OrderManager:
             await self._cancel_market_orders(cid, set(prev_orders.keys()))
 
         posted: List[OrderRecord] = []
-        for quote in (quotes.yes_quote, quotes.no_quote):
+        for quote, outcome in (
+            (quotes.yes_quote, "yes"),
+            (quotes.no_quote, "no"),
+        ):
             if quote is None:
                 continue
-            records = await self._post_quote(cid, quote)
+            records = await self._post_quote(cid, quote, outcome=outcome)
             posted.extend(records)
 
         if posted:
@@ -410,26 +535,29 @@ class OrderManager:
 
         return posted
 
-    async def cancel_all_orders(self) -> None:
-        """Emergency / shutdown: cancel every open order."""
+    async def cancel_all_orders(self) -> bool:
+        """Emergency / shutdown: cancel every open order.
+
+        Returns True on success (including DRY_RUN). Returns False on API
+        failure — the caller decides whether that is fatal (startup) or
+        best-effort (shutdown).
+        """
         try:
             if self._s.DRY_RUN:
                 logger.info("[DRY RUN] Would cancel all {} orders", len(self._live_orders))
+                if self._paper is not None:
+                    self._paper.cancel_all()
+                    self._committed_capital = float(self._paper.committed)
+                    self._usdc_balance = float(self._paper.cash)
                 self._live_orders.clear()
-                return
+                return True
             await self._client.cancel_all()
             logger.info("Cancelled all open orders")
             self._live_orders.clear()
+            return True
         except Exception as exc:
             logger.error("Failed to cancel all orders: {}", exc)
-
-    async def periodic_cleanup(self) -> None:
-        """
-        Safety net: cancel everything and rebuild from scratch.
-        Called every ~4 hours by the scheduler to clear any ghost orders.
-        """
-        logger.info("Periodic cleanup — cancelling all orders")
-        await self.cancel_all_orders()
+            return False
 
     async def reconcile_ghost_orders(self) -> int:
         """Detect and cancel ghost orders (live on CLOB but not tracked locally).
@@ -449,13 +577,14 @@ class OrderManager:
             return 0
 
         tracked_ids = set(self._live_orders.keys())
-        ghosts: List[str] = []
+        ghosts: List[Tuple[str, str]] = []
         for order in exchange_orders:
             if not isinstance(order, dict):
                 continue
             oid = order.get("id") or order.get("orderID") or order.get("order_id", "")
             if oid and oid not in tracked_ids:
-                ghosts.append(oid)
+                cid = str(order.get("market") or order.get("condition_id") or "")
+                ghosts.append((str(oid), cid))
 
         if not ghosts:
             return 0
@@ -465,9 +594,13 @@ class OrderManager:
             len(ghosts),
         )
         cancelled = 0
-        for oid in ghosts:
+        for oid, cid in ghosts:
             try:
-                await self._client.cancel(oid)
+                if cid:
+                    async with self.market_lock(cid):
+                        await self._client.cancel(oid)
+                else:
+                    await self._client.cancel(oid)
                 cancelled += 1
                 logger.info("Ghost order {} cancelled", oid[:12])
             except Exception as exc:
@@ -484,7 +617,13 @@ class OrderManager:
         """Cancel all our orders for a given market."""
         if self._s.DRY_RUN:
             for oid in known_ids:
-                self._live_orders.pop(oid, None)
+                rec = self._live_orders.pop(oid, None)
+                if self._paper is not None:
+                    self._paper.cancel(oid)
+                self._tape_cancel(rec, oid)
+            if self._paper is not None:
+                self._committed_capital = float(self._paper.committed)
+                self._usdc_balance = float(self._paper.cash)
             return
 
         bulk_ok = True
@@ -505,11 +644,13 @@ class OrderManager:
                             oid[:12], exc,
                         )
                         continue
-                self._live_orders.pop(oid, None)
+                rec = self._live_orders.pop(oid, None)
+                self._tape_cancel(rec, oid)
 
         if bulk_ok:
             for oid in known_ids:
-                self._live_orders.pop(oid, None)
+                rec = self._live_orders.pop(oid, None)
+                self._tape_cancel(rec, oid)
 
     async def cancel_orders_for_market(self, condition_id: str) -> int:
         """Cancel all tracked orders for a specific market.  Returns count cancelled."""
@@ -524,19 +665,11 @@ class OrderManager:
         return len(to_cancel)
 
     # ------------------------------------------------------------------
-    # Internal: detect fills (stub — real impl in FillCollector)
-    # ------------------------------------------------------------------
-
-    async def _detect_fills(self, prev_orders: Dict[str, OrderRecord]) -> None:
-        """Stub — fill detection handled by FillCollector via trades API."""
-        pass
-
-    # ------------------------------------------------------------------
     # Internal: post
     # ------------------------------------------------------------------
 
     async def _post_quote(
-        self, condition_id: str, quote: Quote
+        self, condition_id: str, quote: Quote, *, outcome: str = "yes"
     ) -> List[OrderRecord]:
         """Post ask then bid for a single token book.
 
@@ -553,6 +686,7 @@ class OrderManager:
                 side=SELL,
                 price=quote.ask_price,
                 size=quote.ask_size,
+                outcome=outcome,
             )
             if ask_rec:
                 records.append(ask_rec)
@@ -564,6 +698,7 @@ class OrderManager:
                 side=BUY,
                 price=quote.bid_price,
                 size=quote.bid_size,
+                outcome=outcome,
             )
             if bid_rec:
                 records.append(bid_rec)
@@ -577,16 +712,50 @@ class OrderManager:
         side: str,
         price: float,
         size: float,
+        *,
+        outcome: str = "yes",
     ) -> Optional[OrderRecord]:
         """Post one GTC limit order. Returns OrderRecord on success."""
         side_label = "BID" if side == BUY else "ASK"
         notional = price * size
-
-        if not self._collateral_ok(notional, side):
+        outcome_s = outcome if outcome in ("yes", "no") else "yes"
+        if not self._collateral_ok(notional, side, token_id=token_id, size=size):
+            if self._s.DRY_RUN and self._paper is not None:
+                remaining = (
+                    self._paper.spendable if side == BUY
+                    else self._paper.free_ask_size(token_id)
+                )
+            else:
+                remaining = (self._usdc_balance or 0.0) - self._committed_capital
+            skip_reason = "collateral" if side == BUY else "inventory"
             logger.info(
-                "Skipping {} {} — collateral pre-check failed (${:.2f})",
-                side_label, token_id[:12], notional,
+                "Skipping {} {} — {} pre-check failed (${:.2f})",
+                side_label, token_id[:12], skip_reason, notional,
             )
+            if skip_reason == "collateral" and self._tape is not None:
+                try:
+                    self._tape.skip(
+                        condition_id,
+                        "collateral",
+                        needed_usd=round(notional, 4),
+                        available_usd=round(remaining, 4),
+                        side=side_label,
+                    )
+                except Exception:
+                    pass
+            if skip_reason == "collateral" and self._digest is not None:
+                try:
+                    self._digest.record_skip(
+                        condition_id,
+                        "collateral",
+                        {
+                            "needed_usd": round(notional, 4),
+                            "available_usd": round(remaining, 4),
+                            "side": side_label,
+                        },
+                    )
+                except Exception:
+                    pass
             return None
 
         if self._s.DRY_RUN:
@@ -598,15 +767,47 @@ class OrderManager:
                 size,
                 condition_id[:12],
             )
-            self._session_quoted_notional += notional
-            return OrderRecord(
-                order_id=f"dry_{token_id[:8]}_{side_label}",
+            order_id = (
+                self._paper.next_order_id()
+                if self._paper is not None
+                else f"dry_{token_id[:8]}_{side_label}"
+            )
+            if self._paper is not None:
+                posted = self._paper.post(
+                    order_id, condition_id, token_id, side_label, price, size,
+                )
+                if not posted:
+                    remaining = (
+                        self._paper.spendable if side == BUY
+                        else self._paper.free_ask_size(token_id)
+                    )
+                    if side == BUY and self._tape is not None:
+                        try:
+                            self._tape.skip(
+                                condition_id,
+                                "collateral",
+                                needed_usd=round(notional, 4),
+                                available_usd=round(remaining, 4),
+                                side=side_label,
+                            )
+                        except Exception:
+                            pass
+                    return None
+                self._committed_capital = float(self._paper.committed)
+                self._usdc_balance = float(self._paper.cash)
+            rec = OrderRecord(
+                order_id=order_id,
                 token_id=token_id,
                 condition_id=condition_id,
                 side=side_label,
                 price=price,
                 size=size,
+                outcome=outcome_s,
             )
+            self._live_orders[order_id] = rec
+            self._session_quoted_notional += notional
+            self._tape_post(rec)
+            return rec
 
         try:
             order_args = OrderArgs(
@@ -637,10 +838,12 @@ class OrderManager:
                 side=side_label,
                 price=price,
                 size=size,
+                outcome=outcome_s,
             )
             self._live_orders[order_id] = rec
             self._committed_capital += notional
             self._session_quoted_notional += notional
+            self._tape_post(rec)
 
             logger.info(
                 "✅ {} {} {:.4f} × {:.0f} = ${:.2f}  [{}]  → {}",

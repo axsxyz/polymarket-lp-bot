@@ -13,8 +13,8 @@ Our approach:
   1. Fetch the live midpoint from the CLOB orderbook.
   2. Place bid at  mid - (max_spread * tightness_factor)
      Place ask at  mid + (max_spread * tightness_factor)
-  3. Size each side at  min_size * size_multiplier, capped by the
-     per-market capital allocation (split 50/50 bid vs ask).
+  3. Size each side from allocated_capital / 2 / price (notional ≤
+     alloc/2), floored at min_size. ASK still capped by inventory.
   4. Apply inventory skew adjustments: if we're long YES, widen the
      bid (less eager to buy more YES) and tighten the ask (more eager
      to sell YES).  Vice-versa for long NO.
@@ -30,12 +30,18 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Deque, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Deque, Dict, Optional, Tuple
 
 from loguru import logger
 
 from config.markets_filter import MarketCandidate
 from config.settings import Settings
+from utils.helpers import (
+    alloc_side_shares,
+    leftover_bid_budget_usd,
+    max_ask_shares,
+    max_bid_shares,
+)
 
 if TYPE_CHECKING:
     from core.toxicity_analyzer import ToxicityAnalyzer
@@ -61,6 +67,9 @@ class TwoSidedQuotes:
     condition_id: str
     yes_quote: Optional[Quote]
     no_quote: Optional[Quote]
+    tick_size: float = 0.01
+    bid_note: str = ""
+    ask_note: str = ""
 
     @property
     def is_two_sided(self) -> bool:
@@ -144,6 +153,7 @@ class Quoter:
     def __init__(self, settings: Settings) -> None:
         self._s = settings
         self._scoring_rates: dict[str, float] = {}
+        self._tape: Any = None
         # Optional dependency, attached at startup. None → neutral 1.0
         # multiplier in _compute_offset (cold-start / DI-less safe).
         self._toxicity: Optional["ToxicityAnalyzer"] = None
@@ -171,6 +181,9 @@ class Quoter:
         multiplier of 1.0 so legacy code paths and tests work unchanged.
         """
         self._toxicity = analyzer
+
+    def set_tape(self, tape: Any) -> None:
+        self._tape = tape
 
     def evaluate_midpoint_guard(
         self, condition_id: str, live_mid: float
@@ -322,6 +335,7 @@ class Quoter:
         recovery_side: str = "",
         yes_position: float = 0.0,
         no_position: float = 0.0,
+        inventory_mark_usd: float | None = None,
     ) -> TwoSidedQuotes:
         """
         Build two-sided quotes for a market.
@@ -336,10 +350,16 @@ class Quoter:
             recovery_side: if set, reduced quoting on this side (skew 0.45-0.70).
             yes_position: Current YES token holding (used to skip sells when flat).
             no_position: Current NO token holding (used to skip sells when flat).
+            inventory_mark_usd: Optional override for BID leftover budget
+                (default = mark-to-mid of yes/no positions). Backtest passes 0
+                while using a large position sentinel so ASK is not inventory-clipped.
         """
         if not market.token_id_yes or not market.token_id_no:
             logger.debug("Skipping market %s - missing token_ids", market.condition_id[:12])
-            return TwoSidedQuotes(condition_id=market.condition_id, yes_quote=None, no_quote=None)
+            return TwoSidedQuotes(
+                condition_id=market.condition_id, yes_quote=None, no_quote=None,
+                tick_size=_TICK_MAP.get(market.tick_size, 0.01),
+            )
 
         # Fetch vol window once; reused for both YES and NO quotes so
         # _samples_in_window is not called twice per cycle.
@@ -352,6 +372,97 @@ class Quoter:
             if self._s.QUOTE_OFFSET_TICKS > 0 else []
         )
 
+        no_mid = _clamp(1.0 - live_mid)
+        if inventory_mark_usd is not None:
+            inv_mark = max(0.0, float(inventory_mark_usd))
+        else:
+            inv_mark = (
+                float(yes_position) * float(live_mid)
+                + float(no_position) * float(no_mid)
+            )
+        leftover = leftover_bid_budget_usd(
+            market.allocated_capital,
+            inv_mark,
+            self._s.MAX_MARKET_EXPOSURE_RATIO,
+        )
+        # Split leftover across YES/NO; size at mid (conservative vs bid_price).
+        half_leftover = leftover / 2.0
+        yes_bid_shares = half_leftover / max(float(live_mid), 0.01)
+        no_bid_shares = half_leftover / max(float(no_mid), 0.01)
+        min_sz = float(market.min_size)
+        limit = float(self._s.RESOLUTION_MAX_LOSS_USD)
+        unmatched = abs(float(yes_position) - float(no_position))
+        over_cap_book = min_sz > limit + 1e-12
+        bid_note = ""
+        ask_note = ""
+        yes_bid_cap: float | None = None
+        no_bid_cap: float | None = None
+        yes_ask_cap: float | None = None
+        no_ask_cap: float | None = None
+
+        if over_cap_book:
+            # CLOB eligibility: still post min_size two-sided. Fill → A rebalance.
+            if yes_bid_shares < min_sz or no_bid_shares < min_sz:
+                logger.info(
+                    "BID min_size floor | {} | leftover=${:.2f} inv=${:.2f} "
+                    "→ posting min_size={:.0f} both BIDs (no naked ASK)",
+                    market.condition_id[:12], leftover, inv_mark, min_sz,
+                )
+                yes_bid_shares = min_sz
+                no_bid_shares = min_sz
+            bid_note = "bid_over_cap"
+            ask_note = "ask_over_cap"
+            self._tape_bid_note(
+                market.condition_id, "bid_over_cap",
+                min_size=min_sz, limit=limit, unmatched=unmatched,
+            )
+            self._tape_bid_note(
+                market.condition_id, "ask_over_cap",
+                min_size=min_sz, limit=limit, unmatched=unmatched,
+            )
+        else:
+            yes_bid_cap = max_bid_shares(
+                yes_position, no_position, "YES", limit,
+            )
+            no_bid_cap = max_bid_shares(
+                yes_position, no_position, "NO", limit,
+            )
+            yes_ask_cap = max_ask_shares(
+                yes_position, no_position, "YES", limit,
+            )
+            no_ask_cap = max_ask_shares(
+                yes_position, no_position, "NO", limit,
+            )
+            planned_yes = yes_bid_shares
+            planned_no = no_bid_shares
+            if yes_bid_shares < min_sz or no_bid_shares < min_sz:
+                if min_sz <= yes_bid_cap + 1e-12:
+                    yes_bid_shares = min_sz
+                if min_sz <= no_bid_cap + 1e-12:
+                    no_bid_shares = min_sz
+            yes_capped = min(yes_bid_shares, yes_bid_cap)
+            no_capped = min(no_bid_shares, no_bid_cap)
+            if 0 < yes_capped < min_sz:
+                yes_capped = 0.0
+            if 0 < no_capped < min_sz:
+                no_capped = 0.0
+            if abs(planned_yes - yes_capped) > 1e-9:
+                logger.info(
+                    "bid_cap | {} | YES | planned={:.1f} capped={:.1f} "
+                    "unmatched={:.1f} limit={:.1f}",
+                    market.condition_id[:12], planned_yes, yes_capped,
+                    unmatched, limit,
+                )
+            if abs(planned_no - no_capped) > 1e-9:
+                logger.info(
+                    "bid_cap | {} | NO | planned={:.1f} capped={:.1f} "
+                    "unmatched={:.1f} limit={:.1f}",
+                    market.condition_id[:12], planned_no, no_capped,
+                    unmatched, limit,
+                )
+            yes_bid_shares = yes_capped
+            no_bid_shares = no_capped
+
         yes_quote = self._build_quote(
             market=market,
             token_id=market.token_id_yes,
@@ -362,9 +473,12 @@ class Quoter:
             is_recovery=(recovery_side == "YES"),
             position_size=yes_position,
             vol_samples=vol_samples,
+            bid_size_override=yes_bid_shares,
+            bid_cap=yes_bid_cap,
+            ask_cap=yes_ask_cap,
+            over_cap_book=over_cap_book,
         )
 
-        no_mid = _clamp(1.0 - live_mid)
         no_quote = self._build_quote(
             market=market,
             token_id=market.token_id_no,
@@ -375,13 +489,45 @@ class Quoter:
             is_recovery=(recovery_side == "NO"),
             position_size=no_position,
             vol_samples=vol_samples,
+            bid_size_override=no_bid_shares,
+            bid_cap=no_bid_cap,
+            ask_cap=no_ask_cap,
+            over_cap_book=over_cap_book,
         )
+
+        if not over_cap_book:
+            yb = yes_quote.bid_size if yes_quote is not None else 0.0
+            nb = no_quote.bid_size if no_quote is not None else 0.0
+            if yb <= 1e-12 and nb <= 1e-12:
+                bid_note = "bid_capped_max_loss"
+                self._tape_bid_note(
+                    market.condition_id, "bid_capped_max_loss",
+                    min_size=min_sz, limit=limit, unmatched=unmatched,
+                )
+                yes_quote = None
+                no_quote = None
 
         return TwoSidedQuotes(
             condition_id=market.condition_id,
             yes_quote=yes_quote,
             no_quote=no_quote,
+            tick_size=_TICK_MAP.get(market.tick_size, 0.01),
+            bid_note=bid_note,
+            ask_note=ask_note,
         )
+
+    def _tape_bid_note(
+        self,
+        cid: str,
+        reason: str,
+        **extra: float,
+    ) -> None:
+        if self._tape is None:
+            return
+        try:
+            self._tape.skip(cid, reason, **extra)
+        except Exception as exc:
+            logger.warning("Tape bid_note emit failed: {}", exc)
 
     def _compute_offset(
         self, market: MarketCandidate, mid: float, vol_samples: list[float] | None = None,
@@ -433,6 +579,10 @@ class Quoter:
         is_recovery: bool = False,
         position_size: float = 0.0,
         vol_samples: list[float] | None = None,
+        bid_size_override: float | None = None,
+        bid_cap: float | None = None,
+        ask_cap: float | None = None,
+        over_cap_book: bool = False,
     ) -> Optional[Quote]:
         """Build bid+ask for a single token book using tick-based offsets."""
         if not token_id:
@@ -489,14 +639,15 @@ class Quoter:
             bid_price = _clamp(mid - tick * 1.2)
             ask_price = _clamp(mid + tick * 1.2)
 
-        half_capital = market.allocated_capital / 2.0
-        base_size = market.min_size * self._s.SIZE_MULTIPLIER
+        # ASK: planned alloc/2/price, then clipped to inventory + unmatched cap.
+        planned_ask = alloc_side_shares(market.allocated_capital, ask_price)
+        ask_size = round(planned_ask, 2)
 
-        max_bid_shares = half_capital / max(bid_price, 0.01)
-        max_ask_shares = half_capital / max(1.0 - ask_price, 0.01)
-
-        bid_size = round(min(base_size, max_bid_shares), 2)
-        ask_size = round(min(base_size, max_ask_shares), 2)
+        # BID: leftover budget from compute() (split YES/NO), else legacy half-alloc.
+        if bid_size_override is not None:
+            bid_size = round(float(bid_size_override), 2)
+        else:
+            bid_size = round(alloc_side_shares(market.allocated_capital, bid_price), 2)
 
         if is_recovery and is_heavy_side:
             reduced = round(ask_size * self._s.SKEW_RECOVERY_ASK_SIZE_PCT, 2)
@@ -507,19 +658,46 @@ class Quoter:
         elif ask_size > position_size:
             ask_size = round(position_size, 2)
 
+        # Unmatched ASK cap (min_size ≤ limit): never sell past the cap.
+        # Over-cap books keep CLOB min_size floor (tape ask_over_cap in compute).
+        if ask_cap is not None and not over_cap_book:
+            planned_before_cap = ask_size
+            ask_size = round(min(ask_size, float(ask_cap)), 2)
+            if abs(planned_before_cap - ask_size) > 1e-9:
+                logger.info(
+                    "ask_cap | {} | planned={:.1f} capped={:.1f} inv={:.1f}",
+                    token_id[:12], planned_before_cap, ask_size, position_size,
+                )
+            if 0 < ask_size < market.min_size:
+                ask_size = 0.0
+        elif over_cap_book and position_size > 0:
+            # CLOB eligibility: post exactly min_size when inventory allows.
+            if position_size + 1e-12 >= market.min_size:
+                ask_size = round(float(market.min_size), 2)
+            else:
+                ask_size = 0.0
+
+        # BID below min_size: never drop BID alone while keeping ASK (naked ASK
+        # → Q-score 0). Floor is applied in compute() for both tokens together.
+        # Max-loss cap (min_size ≤ limit): never floor up past cap — post 0
+        # and drop the naked ASK. Over-cap books keep the CLOB min_size floor.
+        if bid_cap is not None:
+            bid_size = round(min(bid_size, float(bid_cap)), 2)
         if bid_size > 0 and bid_size < market.min_size:
-            logger.info(
-                "Skipping BID for {} — need {} shares but capital only covers {:.0f} (min_size={})",
-                token_id[:12], market.min_size, max_bid_shares, market.min_size,
-            )
-            bid_price = 0.0
-            bid_size = 0.0
+            if bid_cap is None or market.min_size <= float(bid_cap) + 1e-12:
+                bid_size = round(float(market.min_size), 2)
+            else:
+                bid_size = 0.0
 
         if ask_size > 0 and ask_size < market.min_size:
             logger.info(
-                "Skipping ASK for {} — need {} shares but capital only covers {:.0f} (min_size={})",
-                token_id[:12], market.min_size, max_ask_shares, market.min_size,
+                "Skipping ASK for {} — need {} shares but only {:.0f} available (min_size={})",
+                token_id[:12], market.min_size, ask_size, market.min_size,
             )
+            ask_price = 0.0
+            ask_size = 0.0
+
+        if bid_size <= 0 and ask_size > 0 and bid_cap is not None:
             ask_price = 0.0
             ask_size = 0.0
 

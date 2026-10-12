@@ -35,8 +35,12 @@ class WebSocketFeed:
     def __init__(
         self,
         on_mid_change: Callable[[str, float, bool], Awaitable[None]],
+        on_last_trade: Optional[Callable[[str, float, float], Awaitable[None]]] = None,
+        on_bbo: Optional[Callable[[str, float, float], Awaitable[None]]] = None,
     ) -> None:
         self._on_mid_change = on_mid_change
+        self._on_last_trade = on_last_trade
+        self._on_bbo = on_bbo
         self._mid_prices: Dict[str, float] = {}
         self._last_update: Dict[str, float] = {}
         self._order_centers: Dict[str, float] = {}
@@ -162,7 +166,7 @@ class WebSocketFeed:
         elif event_type == "best_bid_ask":
             await self._handle_best_bid_ask(msg)
         elif event_type == "last_trade_price":
-            self._handle_last_trade(msg)
+            await self._handle_last_trade(msg)
 
     async def _handle_book(self, msg: dict) -> None:
         """Full orderbook snapshot — extract top-of-book mid."""
@@ -204,14 +208,36 @@ class WebSocketFeed:
         if best_bid > 0 and best_ask > 0 and best_ask > best_bid:
             mid = (best_bid + best_ask) / 2.0
             await self._process_mid_update(asset_id, mid)
+        if self._on_bbo is not None and best_bid > 0 and best_ask > 0:
+            try:
+                await self._on_bbo(asset_id, best_bid, best_ask)
+            except Exception as exc:
+                logger.debug("on_bbo callback error: {}", exc)
 
-    def _handle_last_trade(self, msg: dict) -> None:
-        """last_trade_price — update cache but don't trigger requote."""
-        asset_id = msg.get("asset_id", "")
-        price = msg.get("price")
-        if asset_id and price:
-            self._mid_prices[asset_id] = float(price)
-            self._last_update[asset_id] = time.monotonic()
+    async def _handle_last_trade(self, msg: dict) -> None:
+        """last_trade_price is a print, not BBO mid.
+
+        Ignored for the mid cache and the staleness clock. A last-sale
+        must not make a stale book look fresh or recenter quotes.
+        Optional on_last_trade is for the DRY_RUN paper matcher only.
+        """
+        asset_id = str(msg.get("asset_id") or msg.get("token_id") or "")
+        if not asset_id or self._on_last_trade is None:
+            return
+        try:
+            price = float(msg.get("price") or 0)
+        except (TypeError, ValueError):
+            return
+        if price <= 0:
+            return
+        try:
+            size = float(msg.get("size") or msg.get("amount") or 0)
+        except (TypeError, ValueError):
+            size = 0.0
+        try:
+            await self._on_last_trade(asset_id, price, size)
+        except Exception as exc:
+            logger.debug("on_last_trade callback error: {}", exc)
 
     # ------------------------------------------------------------------
     # Core: mid update + order-relative trigger + velocity guard

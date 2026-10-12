@@ -67,6 +67,12 @@ class ScoringMonitor:
         if now - self._last_check < self._s.SCORING_CHECK_INTERVAL_SECONDS:
             return set()
         self._last_check = now
+        if self._s.DRY_RUN:
+            logger.debug(
+                "Scoring check skipped (DRY_RUN) — estimate in-band only, "
+                "not calling are_orders_scoring"
+            )
+            return set()
         return await self._run_check(markets)
 
     async def _run_check(self, markets: List[MarketCandidate]) -> Set[str]:
