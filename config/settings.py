@@ -9,7 +9,7 @@ profile (~10 k USDC across 30-60 long-dated Polymarket markets).
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, List
+from typing import Annotated, List, Optional, Set
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -49,10 +49,14 @@ class Settings(BaseSettings):
     # ── Strategy ────────────────────────────────────────────────────
     MODE: BotMode = BotMode.SAFE
     DRY_RUN: bool = True
+    # Starting paper cash when DRY_RUN=true. None → TOTAL_CAPITAL.
+    PAPER_CASH: Optional[float] = None
     TIGHTNESS_FACTOR_SAFE: float = Field(default=0.48, ge=0.05, le=0.9)
     TIGHTNESS_FACTOR_AGGRESSIVE: float = Field(default=0.35, ge=0.05, le=0.9)
-    SIZE_MULTIPLIER: float = Field(default=2.0, ge=1.0, le=5.0)
-    ALLOW_NAKED_ASKS: bool = True
+    SIZE_MULTIPLIER: float = Field(
+        default=2.0, ge=1.0, le=5.0,
+        description="Legacy; quote size is alloc/2/price (not min_size×this).",
+    )
     REBALANCE_INTERVAL_SECONDS: int = Field(default=15, ge=3, le=300)
     MAX_ORDER_AGE_SECONDS: int = Field(default=600, ge=60, le=3600)
     ORDER_UPDATE_THRESHOLD_TICKS: int = Field(default=1, ge=1, le=10)
@@ -83,11 +87,11 @@ class Settings(BaseSettings):
     # ── API Rate Limiting ───────────────────────────────────────────
     API_RATE_LIMIT_RPS: float = Field(default=1.5, ge=0.1, le=10.0)
     API_RATE_LIMIT_BURST: float = Field(default=20.0, ge=1.0, le=50.0)
-    MAX_MARKETS_PER_CYCLE: int = Field(default=20, ge=1, le=200)
+    MAX_MARKETS_PER_CYCLE: int = Field(default=60, ge=1, le=200)
 
     # ── Market Selection ────────────────────────────────────────────
     MAX_MARKETS: int = Field(default=60, ge=1)
-    MIN_MARKETS: int = Field(default=30, ge=1)
+    MIN_MARKETS: int = Field(default=1, ge=1)
     MIN_END_DATE_DAYS: int = Field(default=120, ge=1)
     MIN_REWARDS_MAX_SPREAD: float = Field(default=0.03, ge=0.0)
     MAX_24H_VOLUME: float = Field(default=800_000.0, ge=0.0)
@@ -157,7 +161,7 @@ class Settings(BaseSettings):
     # market approaches its resolution event.
     #
     #  - RESOLUTION_MAX_LOSS_USD:    worst-case USD loss tolerated per market,
-    #    computed as max(yes_size, no_size) * 1.0 (heavy side → 0 payout).
+    #    computed as abs(yes_size - no_size) (unmatched tokens × $1).
     #  - RESOLUTION_MAX_MOVE_24H_PCT: max permitted relative midpoint move
     #    over the last 24h (|now − 24h_ago| / 24h_ago * 100). Requires
     #    ≥ 20 min of recorded history; lookup tolerance ±30 min around the
@@ -171,7 +175,7 @@ class Settings(BaseSettings):
     SEED_SHARES: float = Field(default=1.0, ge=1.0, le=100.0)
     SEED_MAX_USD_PER_SIDE: float = Field(default=150.0, ge=0.5, le=500.0)
     SEED_AGGRESSIVE_TICKS: int = Field(default=3, ge=1, le=10)
-    SEED_BUDGET_PCT: float = Field(default=0.30, ge=0.05, le=0.80)
+    SEED_BUDGET_PCT: float = Field(default=0.65, ge=0.05, le=0.80)
 
     # ── Scoring ─────────────────────────────────────────────────────
     SCORING_CHECK_INTERVAL_SECONDS: int = Field(default=300, ge=60, le=3600)
@@ -190,8 +194,19 @@ class Settings(BaseSettings):
     CIRCUIT_BREAKER_MAX_FAILURES: int = Field(default=3, ge=1, le=20)
     CIRCUIT_BREAKER_COOLDOWN_SECONDS: int = Field(default=300, ge=30, le=3600)
 
+    # ── Local tape (fills / quotes / skips / errors / snapshots) ──
+    TAPE_HTTP_ENABLED: bool = True
+    TAPE_HTTP_PORT: int = Field(default=8765, ge=1024, le=65535)
+    FILL_POLL_INTERVAL_SECONDS: int = Field(default=3, ge=2, le=15)
+
     # ── Discord ─────────────────────────────────────────────────────
+    # One webhook; embeds / username tagged DRY_RUN vs LIVE from settings.DRY_RUN.
     DISCORD_WEBHOOK_URL: str = ""
+    # Comma-separated kinds that may fire. Empty = none. Unknown tokens ignored.
+    # Kinds: startup, orders, cycle, fills, skew, errors, daily, alerts
+    DISCORD_CHANNELS: str = (
+        "startup,orders,cycle,fills,skew,errors,daily,alerts"
+    )
 
     # ── Logging ─────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
@@ -204,6 +219,18 @@ class Settings(BaseSettings):
         if self.MODE == BotMode.AGGRESSIVE:
             return self.TIGHTNESS_FACTOR_AGGRESSIVE
         return self.TIGHTNESS_FACTOR_SAFE
+
+    @property
+    def paper_cash_start(self) -> float:
+        """Paper broker starting cash (DRY_RUN only). Defaults to TOTAL_CAPITAL."""
+        if self.PAPER_CASH is not None:
+            return float(self.PAPER_CASH)
+        return float(self.TOTAL_CAPITAL)
+
+    @property
+    def discord_channels(self) -> Set[str]:
+        """Parsed allowlist of Discord notification kinds."""
+        return parse_discord_channels(self.DISCORD_CHANNELS)
 
     @field_validator("PREFERRED_TAGS", mode="before")
     @classmethod
@@ -219,3 +246,28 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return v.lower()
         return v
+
+
+# Known DiscordNotifier channel kinds (also documented on DISCORD_CHANNELS).
+DISCORD_CHANNEL_KINDS = frozenset({
+    "startup",
+    "orders",
+    "cycle",
+    "fills",
+    "skew",
+    "errors",
+    "daily",
+    "alerts",
+})
+
+
+def parse_discord_channels(raw: str) -> Set[str]:
+    """Parse CSV channel allowlist; drop unknown tokens."""
+    if not raw or not str(raw).strip():
+        return set()
+    out: Set[str] = set()
+    for part in str(raw).split(","):
+        kind = part.strip().lower()
+        if kind in DISCORD_CHANNEL_KINDS:
+            out.add(kind)
+    return out
