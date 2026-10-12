@@ -385,8 +385,35 @@ class AsyncClobClient:
 
     @_with_retry(max_retries=2)
     async def get_trades_since(self, after_ts: int) -> List[Dict]:
-        """Fetch user's own trades since the given Unix timestamp."""
-        return await self._call("get_trades", TradeParams(after=after_ts))
+        """Fetch user's own trades since the given Unix timestamp.
+
+        Uses get_trades_paginated when available so a burst of fills is
+        not truncated to a single page. Falls back to get_trades.
+        """
+        params = TradeParams(after=after_ts)
+        if self._client is not None and hasattr(self._client, "get_trades_paginated"):
+            all_trades: List[Dict] = []
+            cursor: Optional[str] = None
+            for _ in range(20):
+                if cursor is None:
+                    result = await self._call("get_trades_paginated", params)
+                else:
+                    result = await self._call("get_trades_paginated", params, cursor)
+                if isinstance(result, dict):
+                    data = result.get("data") or result.get("trades") or []
+                    if isinstance(data, list):
+                        all_trades.extend(d for d in data if isinstance(d, dict))
+                    nxt = result.get("next_cursor")
+                    if not nxt or nxt in ("LTE=", "MA==", cursor):
+                        break
+                    cursor = str(nxt)
+                elif isinstance(result, list):
+                    all_trades.extend(d for d in result if isinstance(d, dict))
+                    break
+                else:
+                    break
+            return all_trades
+        return await self._call("get_trades", params)
 
     async def create_order(self, order_args: OrderArgs) -> Any:
         """Sign a limit order (EIP-712) — local crypto, no network call."""

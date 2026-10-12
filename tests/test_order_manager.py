@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from core.order_manager import FillEvent
+from core.order_manager import FillEvent, should_replace_price
 
 
 class TestFillEvent:
@@ -41,3 +41,16 @@ class TestFillEvent:
         )
         assert fill.timestamp is not None
         assert fill.timestamp.tzinfo is not None
+
+
+class TestSmartDiffTick:
+    def test_fine_tick_requires_smaller_move(self):
+        # 0.001 market: 0.005 move is 5 ticks — replace
+        assert should_replace_price(0.50, 0.505, tick=0.001, threshold_ticks=1) is True
+        # 0.005 is only 0.5 of a 0.01 tick — must NOT replace if we wrongly used 0.01
+        assert should_replace_price(0.50, 0.505, tick=0.01, threshold_ticks=1) is False
+
+    def test_coarse_tick_ignores_subtick(self):
+        # 0.1 market: 0.01 move is 0.1 tick — keep
+        assert should_replace_price(0.50, 0.51, tick=0.1, threshold_ticks=1) is False
+        assert should_replace_price(0.50, 0.61, tick=0.1, threshold_ticks=1) is True

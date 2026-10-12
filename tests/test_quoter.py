@@ -11,10 +11,20 @@ from config.settings import Settings
 from core.quoter import Quoter, estimate_q_score
 
 
+class _FakeTape:
+    def __init__(self) -> None:
+        self.skips: list[tuple[str, str, dict]] = []
+
+    def skip(self, cid: str, reason: str, **extra) -> None:
+        self.skips.append((cid, reason, extra))
+
+
 def _make_settings(**overrides) -> Settings:
     defaults = {
         "PRIVATE_KEY": "0x" + "ab" * 32,
         "TOTAL_CAPITAL": 10000,
+        # Leftover-size tests are independent of the unmatched cap.
+        "RESOLUTION_MAX_LOSS_USD": 10_000.0,
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -90,12 +100,154 @@ class TestQuoteSizing:
         assert result.yes_quote.ask_size >= 5.0
 
     def test_sizes_bounded_by_capital(self):
-        q = Quoter(_make_settings())
-        result = q.compute(_market(capital=10.0, min_size=1.0), live_mid=0.50,
-                           yes_position=_POS, no_position=_POS)
-
+        # Flat inventory → leftover ≈ headroom; BID notional ≤ alloc×ratio/2 per side
+        q = Quoter(_make_settings(MAX_MARKET_EXPOSURE_RATIO=0.90))
+        result = q.compute(
+            _market(capital=10.0, min_size=1.0),
+            live_mid=0.50,
+            yes_position=0.0,
+            no_position=0.0,
+        )
         bid_notional = result.yes_quote.bid_price * result.yes_quote.bid_size
-        assert bid_notional <= 10.0  # half_capital = 5.0 per book, total 10
+        assert bid_notional <= 5.0 + 1e-6
+
+    def test_size_uses_leftover_when_inventory_small(self):
+        """With flat inventory, BID sizes from leftover under ALLOC×ratio."""
+        q = Quoter(_make_settings(MAX_MARKET_EXPOSURE_RATIO=0.90, SIZE_MULTIPLIER=1.0))
+        result = q.compute(
+            _market(capital=500.0, min_size=5.0),
+            live_mid=0.50,
+            yes_position=0.0,
+            no_position=0.0,
+        )
+        assert result.yes_quote is not None
+        # leftover = 450, half=225 → @0.50 ≈ 450 shares
+        assert result.yes_quote.bid_size > 100.0
+        # ASK still alloc/2/price clipped to inventory=0 → no ASK
+        assert result.yes_quote.ask_size == 0.0
+
+    def test_matched_inventory_minsize_floor_when_under_limit(self):
+        """min_size=20 ≤ limit 50, leftover too small → floor both BIDs to 20."""
+        tape = _FakeTape()
+        q = Quoter(_make_settings(
+            MAX_MARKET_EXPOSURE_RATIO=0.90,
+            RESOLUTION_MAX_LOSS_USD=50.0,
+        ))
+        q.set_tape(tape)
+        result = q.compute(
+            _market(capital=500.0, min_size=20.0),
+            live_mid=0.50,
+            yes_position=440.0,
+            no_position=440.0,
+        )
+        assert result.yes_quote is not None
+        assert result.no_quote is not None
+        assert result.yes_quote.bid_size == pytest.approx(20.0)
+        assert result.no_quote.bid_size == pytest.approx(20.0)
+        assert result.yes_quote.bid_size > 0 and result.yes_quote.ask_size > 0
+        assert result.bid_note != "bid_capped_max_loss"
+        assert result.bid_note != "bid_over_cap"
+
+    def test_matched_inventory_minsize_over_limit_posts_and_tapes(self):
+        """min_size=200 > limit 50 → still BID/ASK 200 two-sided + over_cap (not skip)."""
+        tape = _FakeTape()
+        q = Quoter(_make_settings(
+            MAX_MARKET_EXPOSURE_RATIO=0.90,
+            RESOLUTION_MAX_LOSS_USD=50.0,
+        ))
+        q.set_tape(tape)
+        result = q.compute(
+            _market(capital=500.0, min_size=200.0),
+            live_mid=0.50,
+            yes_position=315.0,
+            no_position=315.0,
+        )
+        assert result.yes_quote is not None
+        assert result.no_quote is not None
+        assert result.yes_quote.bid_size == pytest.approx(200.0)
+        assert result.no_quote.bid_size == pytest.approx(200.0)
+        assert result.yes_quote.ask_size == pytest.approx(200.0)
+        assert result.no_quote.ask_size == pytest.approx(200.0)
+        assert result.bid_note == "bid_over_cap"
+        assert result.ask_note == "ask_over_cap"
+        assert any(r == "bid_over_cap" for _, r, _ in tape.skips)
+        assert any(r == "ask_over_cap" for _, r, _ in tape.skips)
+        assert not any(r == "bid_capped_max_loss" for _, r, _ in tape.skips)
+
+    def test_ask_cap_matched_200_limit_50(self):
+        """min_size=20 ≤ 50: matched 200/200 ASK max 50 (not full inventory)."""
+        q = Quoter(_make_settings(
+            MAX_MARKET_EXPOSURE_RATIO=0.90,
+            RESOLUTION_MAX_LOSS_USD=50.0,
+        ))
+        result = q.compute(
+            _market(capital=500.0, min_size=20.0),
+            live_mid=0.50,
+            yes_position=200.0,
+            no_position=200.0,
+        )
+        assert result.yes_quote is not None
+        assert result.no_quote is not None
+        assert result.yes_quote.ask_size == pytest.approx(50.0)
+        assert result.no_quote.ask_size == pytest.approx(50.0)
+        assert result.ask_note != "ask_over_cap"
+
+    def test_cap_path_does_not_floor_bid_above_max_bid_shares(self):
+        """min_size=20 ≤ 50: heavy YES at unmatched 50 cannot post a 20 YES BID."""
+        q = Quoter(_make_settings(
+            MAX_MARKET_EXPOSURE_RATIO=0.90,
+            RESOLUTION_MAX_LOSS_USD=50.0,
+        ))
+        result = q.compute(
+            _market(capital=500.0, min_size=20.0),
+            live_mid=0.50,
+            yes_position=250.0,
+            no_position=200.0,
+        )
+        yes_bid = result.yes_quote.bid_size if result.yes_quote else 0.0
+        no_bid = result.no_quote.bid_size if result.no_quote else 0.0
+        assert yes_bid == pytest.approx(0.0)
+        assert no_bid > 0.0
+        assert no_bid <= 50.0 + 100.0 + 1e-6  # light side may hedge up to cap+unmatched
+        assert result.bid_note != "bid_capped_max_loss"
+
+    def test_both_bids_capped_to_zero_skips(self):
+        """Defensive: leftover 0 and min_size just at limit with both caps 0.
+
+        Matched at-limit unmatched cannot zero both when min_size ≤ limit
+        (light/matched cap ≥ min_size). Force via paused_side is not this
+        path — use a book already over on BOTH via impossible math: skip
+        is triggered when compute ends with BID 0/0 under the cap branch.
+        Heavy YES over + paused NO → both BIDs dead.
+        """
+        tape = _FakeTape()
+        q = Quoter(_make_settings(
+            MAX_MARKET_EXPOSURE_RATIO=0.90,
+            RESOLUTION_MAX_LOSS_USD=50.0,
+        ))
+        q.set_tape(tape)
+        result = q.compute(
+            _market(capital=500.0, min_size=20.0),
+            live_mid=0.50,
+            yes_position=300.0,
+            no_position=200.0,
+            paused_side="NO",
+        )
+        assert result.yes_quote is None or (
+            result.yes_quote.bid_size == 0.0 and result.yes_quote.ask_size == 0.0
+        )
+        assert result.no_quote is None
+        assert result.bid_note == "bid_capped_max_loss"
+        assert any(r == "bid_capped_max_loss" for _, r, _ in tape.skips)
+
+    def test_size_math_independent_of_dry_run(self):
+        q_dry = Quoter(_make_settings(DRY_RUN=True, MAX_MARKET_EXPOSURE_RATIO=0.90))
+        q_live = Quoter(_make_settings(DRY_RUN=False, MAX_MARKET_EXPOSURE_RATIO=0.90))
+        m = _market(capital=400.0, min_size=5.0)
+        a = q_dry.compute(m, live_mid=0.50, yes_position=0.0, no_position=0.0)
+        b = q_live.compute(m, live_mid=0.50, yes_position=0.0, no_position=0.0)
+        assert a.yes_quote.bid_size == b.yes_quote.bid_size
+        assert a.yes_quote.ask_size == b.yes_quote.ask_size
 
 
 class TestSkewAdjustment:
@@ -232,7 +384,6 @@ class TestRecoveryMode:
         """Heavy side ask size should be reduced in recovery but not below min_size."""
         q = Quoter(_make_settings(
             SKEW_RECOVERY_ASK_SIZE_PCT=0.50,
-            SIZE_MULTIPLIER=3.0,
         ))
         normal = q.compute(_market(), live_mid=0.50, skew_ratio=0.0,
                            yes_position=_POS, no_position=_POS)

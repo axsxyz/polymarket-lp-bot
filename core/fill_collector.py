@@ -1,14 +1,11 @@
 """
 Fill collection via the CLOB trades API.
 
-Replaces the broken "order disappeared → must be a fill" heuristic with
-actual trade data from the authenticated get_trades endpoint.
-
 Design:
-  - Poll get_trades(after=watermark) once per cycle (not per-market)
+  - Fetch get_trades(after=watermark) on its own 2–5s task (not the 45s cycle)
   - Deduplicate by trade ID (bounded set of recently seen IDs)
   - Advance watermark to max observed trade timestamp (not wall-clock now)
-  - Persist watermark to disk for crash recovery
+  - Persist watermark ONLY after inventory has applied the fills (apply-then-commit)
   - On any API error, abort without recording fills (watermark unchanged)
 """
 
@@ -18,7 +15,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -33,57 +30,55 @@ WATERMARK_SAFETY_MARGIN = 1  # advance watermark to max_ts - this many seconds
 
 class FillCollector:
     """
-    Cycle-level fill collection from the CLOB trades API.
+    Fill collection from the CLOB trades API.
 
     Usage::
 
-        collector = FillCollector(client)
-        # Once per cycle:
-        await collector.poll()
-        fills = collector.drain()
-        inventory.record_fills(fills)
+        fills = await collector.fetch()          # no disk mutation
+        inventory.record_fills(fills)           # apply
+        collector.commit(fills)                  # then persist watermark
     """
 
-    def __init__(self, client: AsyncClobClient) -> None:
+    def __init__(self, client: AsyncClobClient, path: Optional[Path] = None) -> None:
         self._client = client
+        self._path = path or WATERMARK_PATH
         wm, seen = self._load_watermark()
         self._watermark_ts: int = wm
         self._seen_ids: Dict[str, None] = seen
-        self._pending_fills: List[FillEvent] = []
 
     @property
     def watermark_ts(self) -> int:
         return self._watermark_ts
 
-    async def poll(self) -> None:
-        """
-        Fetch trades since watermark, create FillEvents, deduplicate.
+    @property
+    def path(self) -> Path:
+        return self._path
 
-        Contract: on any API error, abort without recording fills.
-        The watermark is not advanced on error.
+    async def fetch(self) -> List[FillEvent]:
+        """
+        Fetch trades since watermark and build FillEvents.
+
+        Does NOT mutate seen_ids or the watermark file. Trades already in
+        seen_ids are skipped. On API error returns [] and leaves state intact.
         """
         try:
             after_ts = max(0, self._watermark_ts - OVERLAP_SECONDS)
             trades = await self._client.get_trades_since(after_ts)
         except Exception as exc:
             logger.warning("Fill poll API error — no fills recorded: {}", exc)
-            return
+            return []
 
         if not trades or not isinstance(trades, list):
-            return
+            return []
 
-        max_ts = self._watermark_ts
-        new_count = 0
-
+        fills: List[FillEvent] = []
         for trade in trades:
             if not isinstance(trade, dict):
                 continue
 
-            trade_id = str(trade.get("id", ""))
+            trade_id = str(trade.get("id", "") or trade.get("trade_id", ""))
             if not trade_id or trade_id in self._seen_ids:
                 continue
-
-            self._seen_ids[trade_id] = None
 
             side_raw = str(trade.get("side", "")).upper()
             if side_raw in ("BUY", "BID", "B"):
@@ -107,49 +102,49 @@ class FillCollector:
                 continue
 
             trade_ts = _extract_timestamp(trade)
-            if trade_ts > max_ts:
-                max_ts = trade_ts
-
             trade_dt = (
                 datetime.fromtimestamp(trade_ts, tz=timezone.utc)
                 if trade_ts > 0
                 else datetime.now(timezone.utc)
             )
 
-            fill = FillEvent(
+            fills.append(FillEvent(
                 token_id=token_id,
                 condition_id=condition_id,
                 side=side,
                 price=price,
                 filled_size=size,
                 timestamp=trade_dt,
-            )
-            self._pending_fills.append(fill)
-            new_count += 1
+                trade_id=trade_id,
+            ))
 
+        if fills:
+            logger.info("Fill collector: {} new trades detected", len(fills))
+        return fills
+
+    def commit(self, fills: List[FillEvent]) -> None:
+        """Mark fills seen and persist watermark. Call AFTER inventory apply."""
+        if not fills:
+            return
+        max_ts = self._watermark_ts
+        for fill in fills:
+            if fill.trade_id:
+                self._seen_ids[fill.trade_id] = None
+            ts = int(fill.timestamp.timestamp()) if fill.timestamp else 0
+            if ts > max_ts:
+                max_ts = ts
         if max_ts > self._watermark_ts:
             self._watermark_ts = max(self._watermark_ts, max_ts - WATERMARK_SAFETY_MARGIN)
-            self._save_watermark()
-
-        # Evict oldest entries to bound memory (dict preserves insertion order)
         while len(self._seen_ids) > MAX_SEEN_IDS:
             self._seen_ids.pop(next(iter(self._seen_ids)))
-
-        if new_count > 0:
-            logger.info("Fill collector: {} new trades detected", new_count)
-
-    def drain(self) -> List[FillEvent]:
-        """Return pending fills and clear the buffer. Exactly-once delivery."""
-        fills = self._pending_fills
-        self._pending_fills = []
-        return fills
+        self._save_watermark()
 
     def _load_watermark(self) -> tuple[int, Dict[str, None]]:
         """Load persisted watermark + seen_ids from disk, fall back to current time."""
         seen: Dict[str, None] = {}
         try:
-            if WATERMARK_PATH.exists():
-                data = json.loads(WATERMARK_PATH.read_text())
+            if self._path.exists():
+                data = json.loads(self._path.read_text())
                 ts = int(data.get("watermark_ts", 0))
                 for sid in data.get("seen_ids", []):
                     seen[str(sid)] = None
@@ -168,15 +163,15 @@ class FillCollector:
     def _save_watermark(self) -> None:
         """Persist watermark + recent seen_ids to disk for crash recovery."""
         try:
-            WATERMARK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
             recent_ids = list(self._seen_ids.keys())[-MAX_SEEN_IDS:]
-            WATERMARK_PATH.write_text(json.dumps({
+            self._path.write_text(json.dumps({
                 "watermark_ts": self._watermark_ts,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "seen_ids": recent_ids,
             }))
-        except Exception as exc:
-            logger.warning("Failed to save trade watermark: {}", exc)
+        except Exception as ext:
+            logger.warning("Failed to save trade watermark: {}", ext)
 
 
 def _extract_timestamp(trade: Dict) -> int:
