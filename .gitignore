@@ -7,8 +7,14 @@ logs/*.log
 logs/*.jsonl
 data/selected_markets.json
 data/trade_watermark.json
+data/tape.jsonl
+data/tape.jsonl.*
+data/archives/*.jsonl
+data/inventory_state.json
+data/resolution_delist.json
 data/rewards_history.json
 data/airdrop_metrics.json
+data/discord_channels.json
 data/backtest.db
 data/backtest_results.csv
 .venv/
@@ -19,3 +25,7 @@ build/
 .mypy_cache/
 .pytest_cache/
 private_tests/
+
+# Local notes and agent task files (never committed)
+*.local.md
+.cursor/TASK-*.md
