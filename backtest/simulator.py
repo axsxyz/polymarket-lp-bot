@@ -199,6 +199,11 @@ def build_settings_for_params(
     return Settings(
         _env_file=None,
         PRIVATE_KEY="0x" + "ab" * 32,
+        # Flat inventory_mark in simulate_market → leftover = ALLOC × ratio.
+        # Use 1.0 so BID size matches historical alloc/2/price backtest sizing.
+        MAX_MARKET_EXPOSURE_RATIO=1.0,
+        # Backtest is not the live unmatched cap; keep alloc-based BID sizes.
+        RESOLUTION_MAX_LOSS_USD=10_000.0,
         **overrides,
     )
 
@@ -446,6 +451,8 @@ def simulate_market(
             quotes = quoter.compute(
                 market, mid_now,
                 yes_position=_INF_POSITION, no_position=_INF_POSITION,
+                # BID leftover from full headroom; INF positions only unclip ASK.
+                inventory_mark_usd=0.0,
             )
 
             # Non-overlapping fill window: starts where last window ended,
