@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from config.settings import Settings
-from core.resolution_guard import ResolutionGuard
+from core.resolution_guard import ResolutionGuard, exit_mode_for_reason
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -57,20 +57,20 @@ class TestMaxLossCheck:
         g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0))
         breached, max_loss, limit = g.max_loss_check(_CID, yes_size=10.0, no_size=8.0)
         assert breached is False
-        assert max_loss == pytest.approx(10.0)
+        assert max_loss == pytest.approx(2.0)
         assert limit == pytest.approx(25.0)
 
     def test_breached_heavy_yes(self):
         g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0))
         breached, max_loss, _ = g.max_loss_check(_CID, yes_size=40.0, no_size=10.0)
         assert breached is True
-        assert max_loss == pytest.approx(40.0)
+        assert max_loss == pytest.approx(30.0)
 
     def test_breached_heavy_no(self):
         g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0))
-        breached, max_loss, _ = g.max_loss_check(_CID, yes_size=5.0, no_size=30.0)
+        breached, max_loss, _ = g.max_loss_check(_CID, yes_size=5.0, no_size=31.0)
         assert breached is True
-        assert max_loss == pytest.approx(30.0)
+        assert max_loss == pytest.approx(26.0)
 
     def test_at_threshold_strict_not_breached(self):
         """Strict ``>``: exactly at the limit must NOT trip."""
@@ -79,16 +79,24 @@ class TestMaxLossCheck:
         assert breached is False
         assert max_loss == pytest.approx(25.0)
 
-    def test_equal_yes_no_uses_max_not_sum(self):
-        """Worst-case is heavy side → 0, not both sides summed.
-
-        25 YES + 25 NO must NOT breach a $25 limit (worst case is 25 USD
-        if the loser side resolves to 0).
-        """
+    def test_equal_yes_no_unmatched_is_zero(self):
+        """Matched book: unmatched size is 0, not max(yes, no)."""
         g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0))
         breached, max_loss, _ = g.max_loss_check(_CID, yes_size=25.0, no_size=25.0)
         assert breached is False
-        assert max_loss == pytest.approx(25.0)
+        assert max_loss == pytest.approx(0.0)
+
+    def test_hedged_26_26_not_delisted(self):
+        g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0))
+        breached, max_loss, _ = g.max_loss_check(_CID, yes_size=26.0, no_size=26.0)
+        assert breached is False
+        assert max_loss == pytest.approx(0.0)
+
+    def test_one_sided_26_yes_delisted(self):
+        g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0))
+        breached, max_loss, _ = g.max_loss_check(_CID, yes_size=26.0, no_size=0.0)
+        assert breached is True
+        assert max_loss == pytest.approx(26.0)
 
     def test_zero_positions(self):
         g = ResolutionGuard(_make_settings())
@@ -351,6 +359,53 @@ class TestShouldDelist:
         assert delist is False
         assert reason is None
 
+    def test_sticky_delist_survives_in_band_move(self, tmp_path):
+        path = tmp_path / "delist.json"
+        g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0), persist_path=path)
+        g.mark_delisted(_CID, "move_24h")
+        delist, reason = g.should_delist(_CID, yes_size=1.0, no_size=1.0, mid=0.50)
+        assert delist is True
+        assert reason == "move_24h"
+        g2 = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=25.0), persist_path=path)
+        assert g2.is_delisted(_CID) is True
+
+    def test_max_loss_not_persisted_sticky(self, tmp_path):
+        path = tmp_path / "delist.json"
+        g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=50.0), persist_path=path)
+        g.mark_delisted(_CID, "max_loss")
+        assert g.is_delisted(_CID) is False
+        g2 = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=50.0), persist_path=path)
+        assert g2.is_delisted(_CID) is False
+        # Live unmatched still delists
+        delist, reason = g2.should_delist(_CID, yes_size=200.0, no_size=0.0, mid=0.50)
+        assert delist is True
+        assert reason == "max_loss"
+
+    def test_legacy_max_loss_sticky_scrubbed_on_load(self, tmp_path):
+        path = tmp_path / "delist.json"
+        path.write_text(
+            '{"delisted": {"%s": "max_loss", "other": "extreme_mid"}, '
+            '"updated_at": "2026-08-29T00:00:00+00:00"}' % _CID
+        )
+        g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=50.0), persist_path=path)
+        assert g.is_delisted(_CID) is False
+        assert g.is_delisted("other") is True
+        # Matched / flat: no delist
+        delist, reason = g.should_delist(_CID, yes_size=0.0, no_size=0.0, mid=0.50)
+        assert delist is False
+        assert reason is None
+
+    def test_flatten_zero_clears_max_loss_no_redelist(self, tmp_path):
+        path = tmp_path / "delist.json"
+        path.write_text(
+            '{"delisted": {"%s": "max_loss"}, "updated_at": "x"}' % _CID
+        )
+        g = ResolutionGuard(_make_settings(RESOLUTION_MAX_LOSS_USD=50.0), persist_path=path)
+        # Scrub on load already dropped max_loss; clear_sticky_if_flat is idempotent
+        assert g.clear_sticky_if_flat(_CID, 0.0, 0.0) is False
+        delist, _ = g.should_delist(_CID, yes_size=0.0, no_size=0.0, mid=0.50)
+        assert delist is False
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Integration: record → evaluate on synthetic timeline
@@ -416,3 +471,17 @@ class TestIntegration:
         breached_b, _, _ = g.evaluate_move_24h(_OTHER_CID)
         assert breached_a is True
         assert breached_b is False
+
+
+class TestExitModeForReason:
+    def test_max_loss_is_rebalance(self):
+        assert exit_mode_for_reason("max_loss") == "rebalance"
+
+    def test_extreme_mid_is_flatten(self):
+        assert exit_mode_for_reason("extreme_mid") == "flatten"
+
+    def test_move_24h_is_flatten(self):
+        assert exit_mode_for_reason("move_24h") == "flatten"
+
+    def test_none_is_none(self):
+        assert exit_mode_for_reason(None) == "none"

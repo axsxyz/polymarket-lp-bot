@@ -6,9 +6,10 @@ net. All pure logic — no API calls, no I/O, no main.py imports — so the
 module is trivially unit-testable.
 
   1. Max-loss check
-     ``max_loss_usd = max(yes_size, no_size) * 1.0``
-     Worst case: the heavy side resolves to 0, costing us its full token
-     count in USD. Breached when above ``RESOLUTION_MAX_LOSS_USD``.
+     ``max_loss_usd = abs(yes_size - no_size)``
+     Unmatched tokens × $1. Matched YES+NO pairs redeem at $1 regardless
+     of outcome, so a balanced book is not naked resolution risk.
+     Breached when above ``RESOLUTION_MAX_LOSS_USD``.
 
   2. 24h move check
      ``move_pct = |mid_now − mid_24h_ago| / mid_24h_ago * 100``
@@ -34,8 +35,10 @@ Hot path only feeds the rolling history via :py:meth:`record_midpoint`.
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Deque, Dict, Optional, Tuple
 
 from config.settings import Settings
@@ -73,6 +76,25 @@ _HISTORY_MAXLEN = 100_000
 # in-band, only values strictly below / above trigger.
 _EXTREME_MID_LOW = 0.05
 _EXTREME_MID_HIGH = 0.95
+_DELIST_PATH = Path("data/resolution_delist.json")
+
+# Only terminal mid risks survive process restart. ``max_loss`` is live
+# inventory math — sticky JSON from dollar-seed eras falsely skipped
+# matched N/N preflight and caused 0/0 flatten loops.
+_TERMINAL_STICKY_REASONS = frozenset({"extreme_mid", "move_24h"})
+
+
+def exit_mode_for_reason(reason: Optional[str]) -> str:
+    """Step 3c action: surplus rebalance vs full flatten.
+
+    ``max_loss`` sells unmatched only and stays SCORING.
+    ``extreme_mid`` / ``move_24h`` still cancel + flatten + INACTIVE.
+    """
+    if reason == "max_loss":
+        return "rebalance"
+    if reason in _TERMINAL_STICKY_REASONS:
+        return "flatten"
+    return "none"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -108,12 +130,15 @@ class ResolutionGuard:
     the caller-provided sizes/mid.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, persist_path: Optional[Path] = None) -> None:
         self._s = settings
         # cid → deque of (mid, ts_utc). Caller feeds monotonically
         # increasing timestamps in production; tests may inject ordered
         # synthetic timestamps via record_midpoint.
         self._history: Dict[str, Deque[Tuple[float, datetime]]] = {}
+        self._persist_path = persist_path or _DELIST_PATH
+        self._delisted: Dict[str, str] = {}
+        self._load_delist()
 
     # ── Ingestion ──────────────────────────────────────────────────
 
@@ -152,11 +177,11 @@ class ResolutionGuard:
     def max_loss_check(
         self, cid: str, yes_size: float, no_size: float,
     ) -> Tuple[bool, float, float]:
-        """Worst-case USD loss if the heavy side resolves to 0.
+        """Worst-case USD loss on unmatched inventory.
 
-        Computed as ``max(yes_size, no_size) * 1.0`` — the side we hold
-        more of pays out 0 in the bad case, costing its full token count
-        (each token nominally worth $1).
+        Computed as ``abs(yes_size - no_size)`` — matched YES+NO pairs
+        redeem at $1 regardless of outcome. The unmatched remainder is
+        the naked binary payoff.
 
         Returns ``(breached, max_loss_usd, limit)`` where ``breached``
         is ``max_loss_usd > settings.RESOLUTION_MAX_LOSS_USD`` (strict ``>``
@@ -166,7 +191,7 @@ class ResolutionGuard:
         check; the value is not stateful for this method.
         """
         limit = float(self._s.RESOLUTION_MAX_LOSS_USD)
-        max_loss = max(float(yes_size), float(no_size)) * 1.0
+        max_loss = abs(float(yes_size) - float(no_size))
         return (max_loss > limit, max_loss, limit)
 
     def evaluate_move_24h(
@@ -241,12 +266,12 @@ class ResolutionGuard:
         Returns ``(delist, reason)`` with ``reason`` one of
         ``"extreme_mid" | "max_loss" | "move_24h" | None``.
 
-        Note: although the original P2d spec listed only the two
-        configurable reasons plus ``None``, ``"extreme_mid"`` is added
-        as a third distinct identifier so the cold-cycle log + Discord
-        alert can name the exact trigger (silent delisting without
-        reason traceability is a debugging hazard).
+        Sticky map (disk) only holds terminal reasons (``extreme_mid`` /
+        ``move_24h``). Legacy ``max_loss`` stickies are scrubbed on load.
         """
+        sticky = self._delisted.get(cid)
+        if sticky and sticky in _TERMINAL_STICKY_REASONS:
+            return (True, sticky)
         if mid < _EXTREME_MID_LOW or mid > _EXTREME_MID_HIGH:
             return (True, "extreme_mid")
         loss_breached, _, _ = self.max_loss_check(cid, yes_size, no_size)
@@ -256,6 +281,91 @@ class ResolutionGuard:
         if move_breached:
             return (True, "move_24h")
         return (False, None)
+
+    def is_delisted(self, cid: str) -> bool:
+        return cid in self._delisted
+
+    def mark_delisted(self, cid: str, reason: str) -> None:
+        """Persist sticky delist for terminal mid risks only.
+
+        ``max_loss`` is live inventory math — never written to disk (avoids
+        false preflight skips and 0/0 flatten loops after matched seed).
+        """
+        if not cid:
+            return
+        reason = reason or "sticky"
+        if reason not in _TERMINAL_STICKY_REASONS:
+            return
+        self._delisted[cid] = reason
+        self._save_delist()
+
+    def clear_max_loss_sticky(self, cid: str) -> bool:
+        """Drop a legacy ``max_loss`` sticky for ``cid``. Returns True if removed."""
+        if not cid:
+            return False
+        if self._delisted.get(cid) != "max_loss":
+            return False
+        del self._delisted[cid]
+        self._save_delist()
+        return True
+
+    def clear_sticky_if_flat(
+        self, cid: str, yes_size: float, no_size: float,
+    ) -> bool:
+        """Clear ``max_loss`` sticky when unmatched ≤ limit (incl. 0/0)."""
+        if not cid:
+            return False
+        if self._delisted.get(cid) != "max_loss":
+            return False
+        breached, _, _ = self.max_loss_check(cid, yes_size, no_size)
+        if breached:
+            return False
+        del self._delisted[cid]
+        self._save_delist()
+        return True
+
+    def _scrub_non_terminal_stickies(self) -> bool:
+        """Remove non-terminal stickies (esp. legacy ``max_loss``). Returns True if changed."""
+        drop = [
+            cid for cid, reason in self._delisted.items()
+            if reason not in _TERMINAL_STICKY_REASONS
+        ]
+        if not drop:
+            return False
+        for cid in drop:
+            del self._delisted[cid]
+        return True
+
+    def _load_delist(self) -> None:
+        try:
+            if not self._persist_path.exists():
+                return
+            data = json.loads(self._persist_path.read_text())
+            items = data.get("delisted", data) if isinstance(data, dict) else {}
+            if isinstance(items, dict):
+                self._delisted = {str(k): str(v) for k, v in items.items()}
+            if self._scrub_non_terminal_stickies():
+                self._save_delist()
+        except Exception:
+            self._delisted = {}
+
+    def _save_delist(self) -> None:
+        try:
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            # Never persist non-terminal reasons.
+            payload = {
+                cid: reason
+                for cid, reason in self._delisted.items()
+                if reason in _TERMINAL_STICKY_REASONS
+            }
+            self._persist_path.write_text(json.dumps({
+                "delisted": payload,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }))
+        except Exception:
+            pass
+
+    # ── Diagnostics (tests + cold-cycle logging) ───────────────────
 
     # ── Diagnostics (tests + cold-cycle logging) ───────────────────
 
