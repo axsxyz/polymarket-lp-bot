@@ -7,8 +7,8 @@ Orchestrates the full lifecycle:
   1. Initialise settings, logging, CLOB client, Discord notifier.
   2. Discover and filter reward-eligible markets.
   3. Run the quoting loop (cancel old quotes → compute new quotes → post).
-  4. Background tasks: market refresh (15 min), periodic cleanup (4 h),
-     daily rewards snapshot (midnight UTC).
+  4. Background tasks: market refresh (15 min), fill ingest (2–5 s),
+     daily rewards snapshot (midnight UTC), local tape HTTP (optional).
   5. Graceful shutdown on SIGINT / SIGTERM (cancel all orders first).
 
 Run with:
@@ -34,15 +34,20 @@ from core.market_manager import MarketManager, MarketState
 from core.order_manager import OrderManager, QuoteUpdateResult
 from core.fill_collector import FillCollector
 from core.quoter import Quoter, TwoSidedQuotes
-from core.resolution_guard import ResolutionGuard
+from core.resolution_guard import ResolutionGuard, exit_mode_for_reason
 from core.rewards_tracker import RewardsTracker
 from core.inventory_seeder import InventorySeeder
 from core.scoring_monitor import ScoringMonitor
 from core.toxicity_analyzer import ToxicityAnalyzer
 from core.ws_feed import WebSocketFeed
+from core.tape import LocalTape
+from core.operator_digest import OperatorDigest
+from core.hot_guards import hot_skip_reason, note_hot_skip_transition
+from core.paper_broker import PaperBroker
 from utils.discord import DiscordNotifier
 from utils.helpers import seconds_until_midnight_utc
 from utils.logging import setup_logging
+from utils.tape_server import run_tape_server
 
 # Locks protecting shared state from concurrent mutation by background tasks
 _market_lock = asyncio.Lock()
@@ -50,9 +55,17 @@ _inventory_lock = asyncio.Lock()
 
 # Per-market debounce timestamps for hot requotes
 _hot_requote_last: Dict[str, float] = {}
+# Last hot_skip_reason per cid — tape/digest emit only on appear/change
+_hot_skip_last: Dict[str, str] = {}
 
 # Track whether the daily drawdown alert has been sent for the current paused state
 _drawdown_alert_sent: bool = False
+
+# Shared with the hot path — written by cold cycle / seeder / refresh
+_skip_cids: set[str] = set()
+_exposure_paused: set[str] = set()
+_recent_filled_cids: set[str] = set()
+_recent_fill_events: list = []
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -188,56 +201,76 @@ _hot_quoter: Optional[Quoter] = None
 _hot_settings: Optional[Settings] = None
 _hot_discord: Optional[DiscordNotifier] = None
 _hot_resolution_guard: Optional[ResolutionGuard] = None
+_hot_toxicity: Optional[ToxicityAnalyzer] = None
+_hot_tape: Optional[LocalTape] = None
+_hot_digest: Optional[OperatorDigest] = None
+_hot_paper: Optional[PaperBroker] = None
+_hot_fill_collector: Optional[FillCollector] = None
 
 
 async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> None:
     """Event-driven requote triggered by WS mid-price change.
 
     Fires for a single market when its mid has moved >= 1 tick from the
-    current order center.  Lightweight: no fill collection, no skew eval,
-    no exposure checks — the cold path handles all that.
+    current order center.  Evaluates skew (inventory.evaluate) then
+    posts via smart-diff.  Honors the same pause set as the cold path
+    (toxicity, MarketState, exposure, skip_cids, drawdown, midpoint,
+    spike) *before* compute/post.
     """
     if not all((_hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings)):
-        return
-
-    if _hot_inventory.is_drawdown_paused:
         return
 
     market = _hot_market_mgr.get_market_by_token(token_id)
     if not market:
         return
 
-    if _hot_quoter.is_midpoint_paused(market.condition_id):
-        return
-
-    # P2a: feed the YES-side mid into rolling history first so the spike
-    # detector and vol multiplier see the latest tick before we decide.
+    cid = market.condition_id
     yes_mid_for_history = (
         new_mid if token_id == market.token_id_yes else (1.0 - new_mid)
     )
-    _hot_quoter.record_mid(market.condition_id, yes_mid_for_history)
-    if _hot_resolution_guard is not None:
-        _hot_resolution_guard.record_midpoint(
-            market.condition_id,
-            yes_mid_for_history,
-            datetime.now(timezone.utc),
-        )
+    try:
+        _hot_quoter.record_mid(cid, yes_mid_for_history)
+        if _hot_resolution_guard is not None:
+            _hot_resolution_guard.record_midpoint(
+                cid, yes_mid_for_history, datetime.now(timezone.utc),
+            )
+        if _hot_toxicity is not None:
+            _hot_toxicity.record_mid(cid, yes_mid_for_history)
+    except Exception as exc:
+        if _hot_tape is not None:
+            _hot_tape.exception("hot_record_mid", exc)
 
-    if _hot_quoter.is_spike_paused(market.condition_id):
+    reason = hot_skip_reason(
+        cid,
+        state=_hot_market_mgr.get_state(cid),
+        toxic_paused=bool(_hot_toxicity and _hot_toxicity.is_toxic_paused(cid)),
+        exposure_paused=cid in _exposure_paused,
+        skip_cids=_skip_cids,
+        drawdown=bool(_hot_inventory.is_drawdown_paused),
+        midpoint_paused=_hot_quoter.is_midpoint_paused(cid),
+        spike_paused=_hot_quoter.is_spike_paused(cid),
+    )
+    emit = note_hot_skip_transition(cid, reason, _hot_skip_last)
+    if emit:
+        if _hot_tape is not None:
+            _hot_tape.skip(cid, emit)
+        if _hot_digest is not None:
+            _hot_digest.record_skip(cid, emit)
+    if reason:
         return
 
     tick_value = {"0.1": 0.1, "0.01": 0.01, "0.001": 0.001, "0.0001": 0.0001}.get(
         market.tick_size, 0.01,
     )
     is_spike, ticks_moved = _hot_quoter.evaluate_spike(
-        market.condition_id, tick_value,
+        cid, tick_value,
     )
     if is_spike:
-        _hot_quoter.trigger_spike_pause(market.condition_id)
+        _hot_quoter.trigger_spike_pause(cid)
         logger.warning(
             "SPIKE detected cid={} ticks_moved={} (>={}) within {}s — "
             "cancelling orders, pausing {}s",
-            market.condition_id[:12], ticks_moved,
+            cid[:12], ticks_moved,
             _hot_settings.SPIKE_TICKS_THRESHOLD,
             _hot_settings.SPIKE_DETECTION_WINDOW_SECONDS,
             _hot_settings.SPIKE_PAUSE_SECONDS,
@@ -246,16 +279,16 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
         return
 
     now = asyncio.get_event_loop().time()
-    last = _hot_requote_last.get(market.condition_id, 0)
+    last = _hot_requote_last.get(cid, 0)
     debounce_s = _hot_settings.HOT_REQUOTE_DEBOUNCE_MS / 1000.0
     if now - last < debounce_s:
         return
-    _hot_requote_last[market.condition_id] = now
+    _hot_requote_last[cid] = now
 
     try:
-        async with _hot_order_mgr.market_lock(market.condition_id):
-            pos = _hot_inventory.get_position(market.condition_id)
-            skew_action = _hot_inventory.evaluate(market.condition_id)
+        async with _hot_order_mgr.market_lock(cid):
+            pos = _hot_inventory.get_position(cid)
+            skew_action = _hot_inventory.evaluate(cid)
 
             yes_mid = new_mid if token_id == market.token_id_yes else (1.0 - new_mid)
 
@@ -268,27 +301,26 @@ async def hot_requote(token_id: str, new_mid: float, is_fast: bool = False) -> N
                 yes_position=pos.yes_size if pos else 0.0,
                 no_position=pos.no_size if pos else 0.0,
             )
+            if getattr(quotes, "bid_note", "") == "bid_capped_max_loss":
+                return
             result = await _hot_order_mgr.cancel_and_replace(quotes)
 
         if result.posted and _ws_feed:
             _ws_feed.update_order_center(market.token_id_yes, yes_mid)
             _ws_feed.update_order_center(market.token_id_no, 1.0 - yes_mid)
-            # INFO only when an order is actually modified/cancelled
-            # (Issue 6).  Smart-diff "kept" paths emit nothing here — the
-            # underlying order_manager.cancel_and_replace() already logs
-            # at DEBUG when it keeps an order within the tick threshold.
             logger.info(
                 "Hot requote {} — {} orders posted (fast={})",
-                market.condition_id[:12], len(result.posted), is_fast,
+                cid[:12], len(result.posted), is_fast,
             )
         elif result.kept and not result.posted:
-            # All sides within tick threshold; nothing modified — DEBUG only.
             logger.debug(
                 "Hot requote {} — kept {} orders unchanged (fast={})",
-                market.condition_id[:12], result.kept, is_fast,
+                cid[:12], result.kept, is_fast,
             )
     except Exception as exc:
-        logger.error("Hot requote failed for {}: {}", market.condition_id[:12], exc)
+        logger.error("Hot requote failed for {}: {}", cid[:12], exc)
+        if _hot_tape is not None:
+            _hot_tape.exception("hot_requote", exc)
         try:
             ghosts = await _hot_order_mgr.reconcile_ghost_orders()
             if ghosts > 0:
@@ -331,6 +363,221 @@ async def _hot_spike_react(market, ticks_moved: int) -> None:
             logger.debug("Spike Discord alert failed: {}", exc)
 
 
+async def apply_fills(
+    fills,
+    inventory: InventoryTracker,
+    fill_collector: FillCollector,
+    toxicity: ToxicityAnalyzer,
+    discord: DiscordNotifier,
+    tape: Optional[LocalTape] = None,
+    *,
+    commit: bool = True,
+    persist: bool = True,
+) -> None:
+    """Apply fills under the inventory lock, then commit watermark + persist.
+
+    Orphan cids (not in the current market list) still hit inventory.
+    """
+    global _recent_filled_cids, _recent_fill_events
+    if not fills:
+        return
+    mids = getattr(inventory, "_midpoints", {}) or {}
+    async with _inventory_lock:
+        for f in fills:
+            if f.mid_at_fill is None:
+                f.mid_at_fill = mids.get(f.token_id)
+        try:
+            inventory.record_fills(fills)
+        except Exception as exc:
+            logger.error("record_fills failed — watermark not advanced: {}", exc)
+            if tape is not None:
+                tape.exception("record_fills", exc)
+            return
+        if commit:
+            fill_collector.commit(fills)
+        if persist:
+            inventory.save_state()
+    for f in fills:
+        _recent_filled_cids.add(f.condition_id)
+        _recent_fill_events.append(f)
+        toxicity.record_fill(f)
+        if tape is not None:
+            tape.fill(
+                condition_id=f.condition_id,
+                token_id=f.token_id,
+                side=f.side,
+                price=f.price,
+                filled_size=f.filled_size,
+                mid_at_fill=f.mid_at_fill,
+                trade_id=f.trade_id,
+            )
+            try:
+                tape.snapshot_one(inventory, f.condition_id)
+            except Exception:
+                pass
+        if _hot_digest is not None:
+            _hot_digest.add_filled_notional(float(f.price) * float(f.filled_size))
+        asyncio.create_task(
+            discord.send_fill(f.condition_id, f.side, f.price, f.filled_size)
+        )
+    logger.info("Recorded {} fills into inventory", len(fills))
+
+
+async def _paper_match(
+    token_id: str,
+    print_price: Optional[float] = None,
+    print_size: float = 0.0,
+    *,
+    best_bid: Optional[float] = None,
+    best_ask: Optional[float] = None,
+) -> None:
+    """DRY_RUN only: match live prints/BBO against the paper book. Fail-soft."""
+    if _hot_paper is None or _hot_settings is None or not _hot_settings.DRY_RUN:
+        return
+    if _hot_inventory is None or _hot_fill_collector is None or _hot_toxicity is None:
+        return
+    if _hot_discord is None:
+        return
+    try:
+        fills = _hot_paper.try_fill(
+            token_id,
+            print_price,
+            print_size,
+            best_bid=best_bid,
+            best_ask=best_ask,
+        )
+    except Exception as extra:
+        logger.warning("paper try_fill error: {}", extra)
+        if _hot_tape is not None:
+            _hot_tape.exception("paper_try_fill", extra)
+        return
+    if not fills:
+        return
+    if _hot_order_mgr is not None:
+        try:
+            _hot_order_mgr.sync_live_orders_from_paper()
+        except Exception as extra:
+            logger.debug("paper live-order sync failed: {}", extra)
+    try:
+        await apply_fills(
+            fills,
+            _hot_inventory,
+            _hot_fill_collector,
+            _hot_toxicity,
+            _hot_discord,
+            _hot_tape,
+            commit=False,
+            persist=False,
+        )
+    except Exception as extra:
+        logger.warning("paper apply_fills error: {}", extra)
+        if _hot_tape is not None:
+            _hot_tape.exception("paper_apply_fills", extra)
+
+
+async def _paper_on_last_trade(token_id: str, price: float, size: float) -> None:
+    await _paper_match(token_id, print_price=price, print_size=size)
+
+
+async def _paper_on_bbo(token_id: str, best_bid: float, best_ask: float) -> None:
+    await _paper_match(
+        token_id, print_price=None, print_size=0.0,
+        best_bid=best_bid, best_ask=best_ask,
+    )
+
+
+def _credit_paper_seed(
+    inventory: InventoryTracker,
+    market,
+    paper: PaperBroker,
+    seed_costs: dict,
+) -> None:
+    """Copy paper YES/NO sizes; write-once first seed or add top-up USD."""
+    pos = inventory.ensure_position(
+        market.condition_id, market.token_id_yes, market.token_id_no,
+    )
+    prev_yes = float(pos.yes_size)
+    prev_no = float(pos.no_size)
+    if market.token_id_yes:
+        pos.yes_size = paper.inventory_size(market.token_id_yes)
+    if market.token_id_no:
+        pos.no_size = paper.inventory_size(market.token_id_no)
+    costs = seed_costs.get(market.condition_id, {})
+    inventory.absorb_seed_acquisition(
+        market.condition_id,
+        prev_yes_size=prev_yes,
+        prev_no_size=prev_no,
+        yes_cost=float(costs.get("yes") or 0.0),
+        no_cost=float(costs.get("no") or 0.0),
+    )
+
+
+async def fill_ingest_task(
+    fill_collector: FillCollector,
+    inventory: InventoryTracker,
+    toxicity: ToxicityAnalyzer,
+    discord: DiscordNotifier,
+    tape: LocalTape,
+    settings: Settings,
+) -> None:
+    """Poll CLOB trades off the quote clock (2–5s). Single watermark owner."""
+    interval = settings.FILL_POLL_INTERVAL_SECONDS
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if settings.DRY_RUN:
+                continue
+            fills = await fill_collector.fetch()
+            if fills:
+                await apply_fills(
+                    fills, inventory, fill_collector, toxicity, discord, tape,
+                )
+        except Exception as extra:
+            logger.warning("Fill ingest failed: {}", extra)
+            if tape is not None:
+                tape.exception("fill_ingest", extra)
+
+
+async def digest_tick_task(
+    digest: OperatorDigest,
+    tape: LocalTape,
+    inventory: InventoryTracker,
+    market_mgr: MarketManager,
+    order_mgr: OrderManager,
+    scoring_monitor: ScoringMonitor,
+    ws_feed: Optional[WebSocketFeed],
+    rewards: Optional[RewardsTracker] = None,
+) -> None:
+    """In-memory digest refresh at 1 Hz. Does not write JSONL."""
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            digest.set_tape_ok(tape.ok)
+            digest.set_ws_connected(bool(ws_feed is not None and ws_feed.connected))
+            digest.set_wallet_collateral(
+                order_mgr.usdc_balance, order_mgr.committed_capital,
+            )
+            digest.rebuild_markets(
+                market_mgr.markets,
+                inventory,
+                tape,
+                scoring_rates=scoring_monitor.get_all_scoring_rates(),
+                states=market_mgr.get_states_snapshot(),
+            )
+            if rewards is not None:
+                est = rewards.estimate_our_share_usd(
+                    market_mgr.markets,
+                    session_started_at=digest.started_at,
+                )
+                digest.set_est_rewards(
+                    est["est_rewards_usd"],
+                    share=est["est_share"],
+                    note=est["est_note"],
+                )
+        except Exception as extra:
+            logger.debug("Digest tick failed: {}", extra)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Quoting cycle
 # ──────────────────────────────────────────────────────────────────────
@@ -355,6 +602,8 @@ async def run_quoting_cycle(
     cycle_index: int = 0,
     skip_cids: set | None = None,
     ws_feed: Optional[WebSocketFeed] = None,
+    seeder: Optional[InventorySeeder] = None,
+    paper: Optional[PaperBroker] = None,
 ) -> Optional[Tuple[int, float, float]]:
     """
     One full cycle: collect fills, fetch midpoints, iterate active markets,
@@ -369,27 +618,18 @@ async def run_quoting_cycle(
         logger.warning("No active markets — skipping cycle")
         return
 
+    if seeder is not None:
+        seeder.clear_reseed_blocks()
+
     cycle_start = asyncio.get_event_loop().time()
 
-    # ── Step 1: Collect fills once per cycle (P0-1b / P0-2) ─────
-    await fill_collector.poll()
-    all_fills = fill_collector.drain()
-    known_cids = {m.condition_id for m in markets}
-    new_fills = [f for f in all_fills if f.condition_id in known_cids]
-    if len(all_fills) > len(new_fills):
-        logger.debug(
-            "Filtered {} fills from non-active markets (orphaned orders)",
-            len(all_fills) - len(new_fills),
-        )
-    filled_cids: set = set()
-    if new_fills:
-        async with _inventory_lock:
-            inventory.record_fills(new_fills)
-        for f in new_fills:
-            filled_cids.add(f.condition_id)
-            toxicity.record_fill(f)
-            asyncio.create_task(discord.send_fill(f.condition_id, f.side, f.price, f.filled_size))
-        logger.info("Recorded {} fills into inventory", len(new_fills))
+    # ── Step 1: Fills are ingested on the 2–5s task. Drain the
+    # cids filled since last cycle so smart-diff force-replaces.
+    global _recent_filled_cids, _recent_fill_events
+    filled_cids: set = set(_recent_filled_cids)
+    _recent_filled_cids.clear()
+    new_fills = list(_recent_fill_events)
+    _recent_fill_events = []
 
     # ── Step 1b: Daily drawdown circuit breaker ──────────────────
     global _drawdown_alert_sent
@@ -427,6 +667,10 @@ async def run_quoting_cycle(
 
     # ── Step 2b: Refresh USDC balance for collateral pre-checks ──
     await order_mgr.refresh_usdc_balance()
+    if _hot_digest is not None:
+        _hot_digest.set_wallet_collateral(
+            order_mgr.usdc_balance, order_mgr.committed_capital,
+        )
 
     # ── Step 3: Batch fetch midpoints (P0-4 / P3-1) ─────────────
     midpoints = await _batch_fetch_midpoints(client, markets_this_cycle, ws_feed=ws_feed)
@@ -469,19 +713,23 @@ async def run_quoting_cycle(
         pos = inventory.get_position(cid)
         yes_sz = pos.yes_size if pos else 0.0
         no_sz = pos.no_size if pos else 0.0
+        # Flatten-to-0 / unmatched within limit: drop legacy max_loss sticky
+        # so we do not cancel+flatten 0/0 every cycle.
+        resolution_guard.clear_sticky_if_flat(cid, yes_sz, no_sz)
         delist, reason = resolution_guard.should_delist(cid, yes_sz, no_sz, live_mid)
         if not delist:
             continue
+        # Already flat + only a non-terminal sticky would have fired — skip loop.
+        if (
+            yes_sz <= 1e-9 and no_sz <= 1e-9
+            and reason == "max_loss"
+        ):
+            resolution_guard.clear_max_loss_sticky(cid)
+            continue
         _, max_loss, _ = resolution_guard.max_loss_check(cid, yes_sz, no_sz)
         _, move_pct, _ = resolution_guard.evaluate_move_24h(cid)
-        logger.warning(
-            "WARNING | resolution_guard | {} delisted — {} "
-            "(max_loss=${:.2f}, move={:.1f}%)",
-            cid[:10], reason, max_loss, move_pct,
-        )
-        market_mgr.set_state(cid, MarketState.INACTIVE)
-        paused_set.add(cid)
-        skip_reasons[cid] = f"resolution_{reason}"
+        mode = exit_mode_for_reason(reason)
+
         try:
             await order_mgr.cancel_orders_for_market(cid)
         except Exception as exc:
@@ -489,6 +737,108 @@ async def run_quoting_cycle(
                 "Resolution guard: cancel_orders_for_market({}) failed: {}",
                 cid[:10], exc,
             )
+
+        if mode == "rebalance":
+            rebalanced = False
+            try:
+                if seeder is not None:
+                    await seeder.rebalance_unmatched(m, float(live_mid), inventory)
+                elif paper is not None and settings.DRY_RUN:
+                    no_mid = round(1.0 - float(live_mid), 4)
+                    limit = float(settings.RESOLUTION_MAX_LOSS_USD)
+                    onesided_before = (
+                        min(yes_sz, no_sz) <= 1e-9
+                        and abs(yes_sz - no_sz) > limit + 1e-9
+                    )
+                    result = paper.rebalance_unmatched(
+                        cid, m.token_id_yes, m.token_id_no,
+                        float(live_mid), no_mid, limit=limit,
+                    )
+                    sold = float(result.get("sold") or 0.0)
+                    heavy = str(result.get("heavy") or "")
+                    if sold > 1e-12 and heavy:
+                        px = float(live_mid) if heavy == "YES" else no_mid
+                        inventory.reduce_position(cid, heavy, sold, px)
+                    if onesided_before and seeder is not None:
+                        seeder.note_onesided_rebalance(cid)
+                pos2 = inventory.get_position(cid)
+                y2 = pos2.yes_size if pos2 else 0.0
+                n2 = pos2.no_size if pos2 else 0.0
+                still, unmatched_after, _ = resolution_guard.max_loss_check(
+                    cid, y2, n2,
+                )
+                if still:
+                    logger.warning(
+                        "WARNING | resolution_guard | {} max_loss escape hatch "
+                        "— unmatched still ${:.2f} after rebalance",
+                        cid[:10], unmatched_after,
+                    )
+                else:
+                    rebalanced = True
+                    logger.warning(
+                        "WARNING | resolution_guard | {} rebalanced surplus "
+                        "(max_loss was ${:.2f} → unmatched ${:.2f})",
+                        cid[:10], max_loss, unmatched_after,
+                    )
+                    asyncio.create_task(discord.send_alert(
+                        title="Resolution Guard — Surplus Rebalanced",
+                        message=(
+                            f"Market `{cid[:12]}…` unmatched cap hit; sold surplus "
+                            f"only. Still **SCORING**. "
+                            f"max_loss was **${max_loss:.2f}** "
+                            f"(limit ${settings.RESOLUTION_MAX_LOSS_USD:.2f}), "
+                            f"now unmatched=**${unmatched_after:.2f}**, "
+                            f"live_mid=**{live_mid:.3f}**."
+                        ),
+                        level="warning",
+                    ))
+            except Exception as exc:
+                logger.error(
+                    "Resolution guard: rebalance_unmatched({}) failed: {}",
+                    cid[:10], exc,
+                )
+            if rebalanced:
+                continue
+
+        logger.warning(
+            "WARNING | resolution_guard | {} delisted — {} "
+            "(max_loss=${:.2f}, move={:.1f}%)",
+            cid[:10], reason, max_loss, move_pct,
+        )
+        market_mgr.mark_resolution_inactive(cid)
+        resolution_guard.mark_delisted(cid, reason or "sticky")
+        paused_set.add(cid)
+        skip_reasons[cid] = f"resolution_{reason}"
+        if skip_cids is not None:
+            skip_cids.add(cid)
+        # Flatten inventory — do not sit INACTIVE with a book (Q=0).
+        # extreme_mid / move_24h, or max_loss escape hatch after a failed
+        # surplus rebalance. Do not re-seed this cid
+        # (sticky INACTIVE + skip_cids).
+        if seeder is not None:
+            try:
+                await seeder.flatten_market(m, float(live_mid), inventory)
+            except Exception as exc:
+                logger.error(
+                    "Resolution guard: flatten_market({}) failed: {}",
+                    cid[:10], exc,
+                )
+        elif paper is not None and settings.DRY_RUN:
+            try:
+                no_mid = round(1.0 - float(live_mid), 4)
+                paper.flatten_market(
+                    cid, m.token_id_yes, m.token_id_no,
+                    float(live_mid), no_mid,
+                )
+                inventory.flatten_position(cid, float(live_mid), no_mid)
+            except Exception as exc:
+                logger.error(
+                    "Resolution guard: paper flatten({}) failed: {}",
+                    cid[:10], exc,
+                )
+        # After flatten (incl. 0/0), never leave a max_loss sticky.
+        resolution_guard.clear_sticky_if_flat(cid, 0.0, 0.0)
+        resolution_guard.clear_max_loss_sticky(cid)
         asyncio.create_task(discord.send_alert(
             title="Resolution Guard — Market Delisted",
             message=(
@@ -497,7 +847,7 @@ async def run_quoting_cycle(
                 f"(limit ${settings.RESOLUTION_MAX_LOSS_USD:.2f}), "
                 f"24h_move=**{move_pct:.1f}%** "
                 f"(limit {settings.RESOLUTION_MAX_MOVE_24H_PCT:.1f}%), "
-                f"live_mid=**{live_mid:.3f}**. Orders cancelled."
+                f"live_mid=**{live_mid:.3f}**. Orders cancelled + inventory flattened."
             ),
             level="warning",
         ))
@@ -506,17 +856,30 @@ async def run_quoting_cycle(
     # Pause individual markets that breach MAX_MARKET_EXPOSURE_RATIO
     # BEFORE the global gross check so a runaway market is contained
     # without dragging the whole bot to the global limit.
+    # Deployed = inventory mark + BID notional only (ASK excluded).
     for m in markets_this_cycle:
+        bid_n = order_mgr.open_order_notional_for_market(m.condition_id)
+        ask_n = order_mgr.open_ask_notional_for_market(m.condition_id)
+        inv_m = inventory.inventory_mark_usd(m.condition_id)
+        # Two-sided CLOB min_size BID floor (preferred overshoot — do not
+        # INACTIVE solely for this).
+        yes_mid = midpoints.get(m.token_id_yes) or m.midpoint or 0.5
+        no_mid = max(0.01, 1.0 - float(yes_mid))
+        minsize_floor = float(m.min_size) * (
+            float(yes_mid) + float(no_mid)
+        )
         breached, exposure_val, limit_val = inventory.is_market_exposure_breached(
             m.condition_id,
             allocated_capital=m.allocated_capital,
-            open_order_notional_for_market=order_mgr.open_order_notional_for_market(m.condition_id),
+            open_order_notional_for_market=bid_n,
+            minsize_bid_floor_usd=minsize_floor,
         )
         if breached:
             logger.warning(
                 "WARNING | exposure | Market {} — per-market limit breached "
-                "(net=${:.2f}, limit=${:.2f}) — pausing quotes",
-                m.condition_id[:12], exposure_val, limit_val,
+                "(inv=${:.2f}, bid=${:.2f}, ask=${:.2f}(excluded), "
+                "limit=${:.2f}) — pausing quotes",
+                m.condition_id[:12], inv_m, bid_n, ask_n, limit_val,
             )
             paused_set.add(m.condition_id)
             skip_reasons[m.condition_id] = "exposure_per_market"
@@ -567,6 +930,7 @@ async def run_quoting_cycle(
             await order_mgr.cancel_orders_for_market(cid)
 
     if skip_cids:
+        _skip_cids.update(skip_cids)
         for cid in skip_cids:
             paused_set.add(cid)
             skip_reasons.setdefault(cid, "seed_failed")
@@ -680,6 +1044,15 @@ async def run_quoting_cycle(
             level="warning",
         ))
 
+    _exposure_paused.clear()
+    _exposure_paused.update(paused_set)
+    if _hot_tape is not None:
+        for cid, reason in skip_reasons.items():
+            _hot_tape.skip(cid, reason)
+    if _hot_digest is not None:
+        for cid, reason in skip_reasons.items():
+            _hot_digest.record_skip(cid, reason)
+
     # ── Step 5: Per-market quoting (parallel with semaphore) ─────
     if markets_this_cycle:
         m0 = markets_this_cycle[0]
@@ -738,8 +1111,10 @@ async def run_quoting_cycle(
                         yes_position=pos.yes_size if pos else 0.0,
                         no_position=pos.no_size if pos else 0.0,
                     )
+                    if getattr(quotes, "bid_note", "") == "bid_capped_max_loss":
+                        skip_reasons[market.condition_id] = "bid_capped_max_loss"
+                        return (market.condition_id, 0, 0, 0, False)
                     two_sided = quotes.is_two_sided
-
                     force = market.condition_id in filled_cids
                     result = await order_mgr.cancel_and_replace(quotes, force_replace=force)
                     posted = len(result.posted)
@@ -793,20 +1168,21 @@ async def run_quoting_cycle(
             if market.condition_id not in remediate_cids:
                 continue
             try:
-                live_mid = midpoints.get(market.token_id_yes, market.midpoint)
-                pos = inventory.get_position(market.condition_id)
-                skew_action = inventory.evaluate(market.condition_id)
-                quotes = quoter.compute(
-                    market=market,
-                    live_mid=live_mid,
-                    skew_ratio=skew_action.skew_ratio,
-                    heavy_side=skew_action.heavy_side,
-                    paused_side=skew_action.paused_side,
-                    recovery_side=skew_action.recovery_side,
-                    yes_position=pos.yes_size if pos else 0.0,
-                    no_position=pos.no_size if pos else 0.0,
-                )
-                result = await order_mgr.cancel_and_replace(quotes, force_replace=True)
+                async with order_mgr.market_lock(market.condition_id):
+                    live_mid = midpoints.get(market.token_id_yes, market.midpoint)
+                    pos = inventory.get_position(market.condition_id)
+                    skew_action = inventory.evaluate(market.condition_id)
+                    quotes = quoter.compute(
+                        market=market,
+                        live_mid=live_mid,
+                        skew_ratio=skew_action.skew_ratio,
+                        heavy_side=skew_action.heavy_side,
+                        paused_side=skew_action.paused_side,
+                        recovery_side=skew_action.recovery_side,
+                        yes_position=pos.yes_size if pos else 0.0,
+                        no_position=pos.no_size if pos else 0.0,
+                    )
+                    result = await order_mgr.cancel_and_replace(quotes, force_replace=True)
                 if result.posted:
                     logger.info(
                         "Remediation: force-replaced {} orders for {}",
@@ -879,7 +1255,7 @@ async def run_quoting_cycle(
             if errors > 0:
                 skip_log_lines.append(f"  SKIP  {cid[:12]}…  reason=cycle_error")
 
-        market_mgr.set_state(cid, state)
+        market_mgr.set_state(cid, state, reason=skip_reasons.get(cid, ""))
 
         # Build summary table row
         pos = inventory.get_position(cid)
@@ -965,6 +1341,48 @@ async def run_quoting_cycle(
             logger.error("Post-error ghost sweep failed: {}", exc)
 
     cycle_quoted = order_mgr.drain_quoted_notional()
+    utilization = 0.0
+    if settings.TOTAL_CAPITAL > 0:
+        utilization = order_mgr.open_order_notional / settings.TOTAL_CAPITAL
+    if _hot_tape is not None:
+        try:
+            _hot_tape.cycle(
+                n=cycle_index,
+                selected=selected_count,
+                active=active_count,
+                posted=cycle_posted,
+                kept=cycle_kept,
+                errors=cycle_errors,
+                elapsed_s=elapsed,
+                utilization=utilization,
+            )
+            _hot_tape.snapshot_inventory(inventory, markets_this_cycle)
+        except Exception as extra:
+            logger.debug("Cycle tape snapshot failed: {}", extra)
+    if _hot_digest is not None:
+        try:
+            _hot_digest.update_cycle(
+                n=cycle_index,
+                selected=selected_count,
+                active=active_count,
+                posted=cycle_posted,
+                kept=cycle_kept,
+                errors=cycle_errors,
+                elapsed_s=elapsed,
+                utilization=utilization,
+                skip_reasons=skip_reasons,
+            )
+            _hot_digest.add_quoted_notional(cycle_quoted)
+            _hot_digest.set_clob_ok(True)
+            _hot_digest.rebuild_markets(
+                market_mgr.markets,
+                inventory,
+                _hot_tape,
+                scoring_rates=scoring_rates_now,
+                states=market_mgr.get_states_snapshot(),
+            )
+        except Exception as extra:
+            logger.debug("Cycle digest update failed: {}", extra)
     return cycle_posted, cycle_volume, cycle_quoted
 
 
@@ -973,19 +1391,89 @@ async def run_quoting_cycle(
 # ──────────────────────────────────────────────────────────────────────
 
 
-async def market_refresh_task(market_mgr: MarketManager, interval: int = 900) -> None:
-    """Refresh market universe every 15 minutes. Re-subscribes WS feed on change."""
+async def market_refresh_task(
+    market_mgr: MarketManager,
+    order_mgr: OrderManager,
+    inventory: InventoryTracker,
+    seeder: Optional[InventorySeeder],
+    client: AsyncClobClient,
+    settings: Settings,
+    interval: int = 900,
+    paper: Optional[PaperBroker] = None,
+) -> None:
+    """Refresh market universe every 15 minutes. Cancel OUT, seed or skip IN."""
+    global _skip_cids
     while True:
         await asyncio.sleep(interval)
         try:
             async with _market_lock:
                 await market_mgr.refresh()
+                went_out = list(market_mgr.last_went_out)
+                went_in = list(market_mgr.last_went_in)
 
-            # Re-subscribe WS feed with refreshed token set
+            for m in went_out:
+                try:
+                    async with order_mgr.market_lock(m.condition_id):
+                        await order_mgr.cancel_orders_for_market(m.condition_id)
+                    _skip_cids.discard(m.condition_id)
+                    logger.info("Refresh: cancelled OUT market {}", m.condition_id[:12])
+                except Exception as extra:
+                    logger.error("Refresh cancel OUT {} failed: {}", m.condition_id[:12], extra)
+
+            if went_in:
+                if settings.SEED_ENABLED and seeder is not None:
+                    failed, seed_costs = await seeder.seed_all(went_in)
+                    for m in went_in:
+                        if m.condition_id in failed:
+                            market_mgr.set_state(m.condition_id, MarketState.SEED_FAILED)
+                            _skip_cids.add(m.condition_id)
+                        else:
+                            _skip_cids.discard(m.condition_id)
+                            if settings.DRY_RUN and paper is not None:
+                                _credit_paper_seed(inventory, m, paper, seed_costs)
+                            else:
+                                pos = inventory.ensure_position(
+                                    m.condition_id, m.token_id_yes, m.token_id_no,
+                                )
+                                costs = seed_costs.get(m.condition_id, {})
+                                yc = float(costs.get("yes") or 0.0)
+                                nc = float(costs.get("no") or 0.0)
+                                # Seeder returns THIS call's spend only. First
+                                # write-once; top-up ADDs (size may lag chain).
+                                had_yes = pos.yes_cost > 0
+                                had_no = pos.no_cost > 0
+                                inventory.apply_seed_costs_once(
+                                    m.condition_id, yes_cost=yc, no_cost=nc,
+                                )
+                                if had_yes and yc > 0:
+                                    inventory.add_seed_costs(
+                                        m.condition_id, yes_cost=yc,
+                                    )
+                                if had_no and nc > 0:
+                                    inventory.add_seed_costs(
+                                        m.condition_id, no_cost=nc,
+                                    )
+                    token_ids = []
+                    for m in went_in:
+                        if m.condition_id in _skip_cids:
+                            continue
+                        if m.token_id_yes:
+                            token_ids.append(m.token_id_yes)
+                        if m.token_id_no:
+                            token_ids.append(m.token_id_no)
+                    if token_ids and not settings.DRY_RUN:
+                        await client.sync_conditional_allowances(token_ids)
+                else:
+                    for m in went_in:
+                        _skip_cids.add(m.condition_id)
+                        market_mgr.set_state(m.condition_id, MarketState.SEED_FAILED)
+
             if _ws_feed and market_mgr.markets:
                 token_ids = []
                 tick_sizes: Dict[str, float] = {}
                 for m in market_mgr.markets:
+                    if m.condition_id in _skip_cids:
+                        continue
                     tick = {"0.1": 0.1, "0.01": 0.01, "0.001": 0.001, "0.0001": 0.0001}.get(m.tick_size, 0.01)
                     for tid in (m.token_id_yes, m.token_id_no):
                         if tid:
@@ -1031,6 +1519,7 @@ async def daily_rewards_task(
     market_mgr: MarketManager,
     discord: DiscordNotifier,
     scoring_monitor: ScoringMonitor,
+    order_mgr: OrderManager,
 ) -> None:
     """Collect and report daily rewards shortly after midnight UTC."""
     while True:
@@ -1043,6 +1532,8 @@ async def daily_rewards_task(
                 active_market_count=market_mgr.market_count,
                 scored_market_count=scored_count,
                 scoring_pct=scoring_monitor.last_ratio,
+                markets=list(market_mgr.markets),
+                open_order_notional=order_mgr.open_order_notional,
             )
             summary = rewards.format_summary(snapshot)
             await discord.send_daily_summary(summary)
@@ -1118,16 +1609,22 @@ async def reconciliation_task(
     while True:
         await asyncio.sleep(interval)
         try:
-            balances = await client.get_balance_allowance()
-            if not balances:
+            exchange_pos: Dict[str, Dict[str, float]] = {}
+            for cid, pos in inventory.positions.items():
+                rec: Dict[str, float] = {"yes": 0.0, "no": 0.0}
+                if pos.yes_token_id:
+                    rec["yes"] = await client.get_conditional_balance(pos.yes_token_id)
+                if pos.no_token_id:
+                    rec["no"] = await client.get_conditional_balance(pos.no_token_id)
+                exchange_pos[cid] = rec
+            if not exchange_pos:
                 logger.debug("No balance data for reconciliation — skipping")
                 continue
 
             async with _inventory_lock:
-                exchange_pos = _parse_exchange_positions(balances, inventory)
-                if not exchange_pos:
-                    continue
                 corrected = inventory.reconcile(exchange_pos)
+                if corrected > 0:
+                    inventory.save_state()
             if corrected > 0:
                 logger.info("Reconciliation corrected {} position(s)", corrected)
                 if corrected >= 3:
@@ -1232,16 +1729,55 @@ async def main() -> None:
     fill_collector = FillCollector(client)
     scoring_monitor = ScoringMonitor(client, settings, discord, order_manager=order_mgr)
     rewards = RewardsTracker(client, settings, inventory)
+    tape = LocalTape()
+    digest = OperatorDigest()
+    digest.configure_from_settings(settings, tape_path=str(tape.path))
+    digest.set_clob_ok(True)
+    order_mgr.set_tape(tape)
+    order_mgr.set_digest(digest)
+    market_mgr.set_tape(tape)
+    market_mgr.set_digest(digest)
+    quoter.set_tape(tape)
+    inventory.set_tape(tape)
+
+    # Operator terminal ASAP — before cancel_all / refresh / seed / inventory.
+    # Markets and fills populate the UI as those steps emit tape events.
+    tape_http_task: Optional[asyncio.Task] = None
+    if settings.TAPE_HTTP_ENABLED:
+        tape_http_task = asyncio.create_task(
+            run_tape_server(
+                tape, settings.TAPE_HTTP_PORT, digest=digest, discord=discord,
+            ),
+            name="tape_http",
+        )
+        await asyncio.sleep(0.05)  # yield so uvicorn can bind before long I/O
+        logger.info(
+            "Tape HTTP on http://127.0.0.1:{}/ (early — before seed)",
+            settings.TAPE_HTTP_PORT,
+        )
+
+    paper: Optional[PaperBroker] = None
+    if settings.DRY_RUN:
+        paper = PaperBroker(settings.paper_cash_start)
+        order_mgr.set_paper(paper)
+        digest.set_wallet_collateral(paper.cash, paper.committed)
+        logger.info(
+            "Paper broker: cash ${:,.0f} (label paper, not CLOB wallet)",
+            paper.cash,
+        )
 
     # ── Cancel orphaned orders from previous sessions ───────────
     # Orders posted by earlier runs survive restarts.  If left live they
     # generate fills the inventory tracker cannot attribute correctly,
     # creating phantom one-sided exposure that triggers the global limit.
-    try:
-        await order_mgr.cancel_all_orders()
-        logger.info("Startup: cleared all pre-existing orders on exchange")
-    except Exception as exc:
-        logger.warning("Startup: failed to clear pre-existing orders: {}", exc)
+    cleared = await order_mgr.cancel_all_orders()
+    if not cleared and not settings.DRY_RUN:
+        logger.critical(
+            "Startup cancel_all failed — refusing to quote over leftover GTCs"
+        )
+        await discord.send_error("Startup cancel_all failed — exiting (fail closed).")
+        sys.exit(1)
+    logger.info("Startup: cleared all pre-existing orders on exchange")
 
     # ── Load markets ─────────────────────────────────────────────
     if not market_mgr.load_cache():
@@ -1259,16 +1795,24 @@ async def main() -> None:
     # ── Inventory seed (acquire minimal token positions for ASK orders) ──
     unseeded_markets: set = set()
     seed_costs: dict = {}
+    seeder_ref = None
     if settings.SEED_ENABLED:
-        seeder = InventorySeeder(client, settings, discord)
-        unseeded_markets, seed_costs = await seeder.seed_all(market_mgr.markets)
+        seeder_ref = InventorySeeder(client, settings, discord, resolution_guard)
+        seeder_ref.set_tape(tape)
+        seeder_ref.set_digest(digest)
+        if paper is not None:
+            seeder_ref.set_paper(paper)
+        unseeded_markets, seed_costs = await seeder_ref.seed_all(market_mgr.markets)
+        _skip_cids.update(unseeded_markets)
 
         # Mark per-market state up front (Issue 4): SEED_FAILED is sticky
         # across cycles via market_mgr.set_state(); other states transition
         # freely as the bot quotes.
         for m in market_mgr.markets:
             if m.condition_id in unseeded_markets:
-                market_mgr.set_state(m.condition_id, MarketState.SEED_FAILED)
+                market_mgr.set_state(
+                    m.condition_id, MarketState.SEED_FAILED, reason="seed_failed",
+                )
             else:
                 market_mgr.set_state(m.condition_id, MarketState.UNKNOWN)
 
@@ -1287,38 +1831,61 @@ async def main() -> None:
                 token_ids.append(m.token_id_yes)
             if m.token_id_no:
                 token_ids.append(m.token_id_no)
-        if token_ids:
+        if token_ids and not settings.DRY_RUN:
             await client.sync_conditional_allowances(token_ids)
 
-    # ── Sync on-chain balances into inventory so quoter knows position sizes ──
-    for m in market_mgr.markets:
-        if m.condition_id in unseeded_markets:
-            continue
-        pos = inventory.ensure_position(m.condition_id, m.token_id_yes, m.token_id_no)
-        if m.token_id_yes:
-            bal = await client.get_conditional_balance(m.token_id_yes)
-            if bal > 0 and bal > pos.yes_size:
-                pos.yes_size = bal
-                if pos.yes_cost <= 0:
-                    _yes_seed = seed_costs.get(m.condition_id, {}).get("yes", 0.0)
-                    if _yes_seed > 0:
-                        pos.yes_cost = _yes_seed
-                    else:
-                        mid = m.midpoint if m.midpoint > 0 else 0.50
-                        pos.yes_cost = bal * mid
-                logger.info("Inventory sync: {} YES = {:.2f}", m.condition_id[:12], bal)
-        if m.token_id_no:
-            bal = await client.get_conditional_balance(m.token_id_no)
-            if bal > 0 and bal > pos.no_size:
-                pos.no_size = bal
-                if pos.no_cost <= 0:
-                    _no_seed = seed_costs.get(m.condition_id, {}).get("no", 0.0)
-                    if _no_seed > 0:
-                        pos.no_cost = _no_seed
-                    else:
-                        no_mid = (1.0 - m.midpoint) if m.midpoint > 0 else 0.50
-                        pos.no_cost = bal * no_mid
-                logger.info("Inventory sync: {} NO = {:.2f}", m.condition_id[:12], bal)
+    # ── Sync balances into inventory so quoter knows position sizes ──
+    if settings.DRY_RUN and paper is not None:
+        for m in market_mgr.markets:
+            if m.condition_id in unseeded_markets:
+                continue
+            _credit_paper_seed(inventory, m, paper, seed_costs)
+            logger.info(
+                "Paper inventory: {} YES={:.2f} NO={:.2f}",
+                m.condition_id[:12],
+                paper.inventory_size(m.token_id_yes) if m.token_id_yes else 0.0,
+                paper.inventory_size(m.token_id_no) if m.token_id_no else 0.0,
+            )
+        digest.set_wallet_collateral(paper.cash, paper.committed)
+    else:
+        for m in market_mgr.markets:
+            if m.condition_id in unseeded_markets:
+                continue
+            pos = inventory.ensure_position(m.condition_id, m.token_id_yes, m.token_id_no)
+            prev_yes = float(pos.yes_size)
+            prev_no = float(pos.no_size)
+            synced = False
+            if m.token_id_yes:
+                bal = await client.get_conditional_balance(m.token_id_yes)
+                if bal > 0 and bal > pos.yes_size:
+                    pos.yes_size = bal
+                    synced = True
+                    logger.info("Inventory sync: {} YES = {:.2f}", m.condition_id[:12], bal)
+            if m.token_id_no:
+                bal = await client.get_conditional_balance(m.token_id_no)
+                if bal > 0 and bal > pos.no_size:
+                    pos.no_size = bal
+                    synced = True
+                    logger.info("Inventory sync: {} NO = {:.2f}", m.condition_id[:12], bal)
+            if synced:
+                if m.midpoint and m.midpoint > 0:
+                    mids = {}
+                    if m.token_id_yes:
+                        mids[m.token_id_yes] = float(m.midpoint)
+                    if m.token_id_no:
+                        mids[m.token_id_no] = max(0.01, 1.0 - float(m.midpoint))
+                    if mids:
+                        inventory.update_midpoints(mids)
+                costs = seed_costs.get(m.condition_id, {})
+                inventory.absorb_seed_acquisition(
+                    m.condition_id,
+                    prev_yes_size=prev_yes,
+                    prev_no_size=prev_no,
+                    yes_cost=float(costs.get("yes") or 0.0),
+                    no_cost=float(costs.get("no") or 0.0),
+                )
+
+        inventory.apply_persisted_state()
 
     # Advance fill collector watermark past any seed trades so they
     # don't get reported as regular fills on the first cycle.
@@ -1334,19 +1901,28 @@ async def main() -> None:
     )
 
     # ── WebSocket feed (event-driven quoting) ────────────────────
-    global _ws_feed, _hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings, _hot_discord, _hot_resolution_guard
+    global _ws_feed, _hot_market_mgr, _hot_order_mgr, _hot_inventory, _hot_quoter, _hot_settings, _hot_discord, _hot_resolution_guard, _hot_toxicity, _hot_tape, _hot_digest, _hot_paper, _hot_fill_collector
     ws_feed: Optional[WebSocketFeed] = None
+    _hot_tape = tape
+    _hot_digest = digest
+    _hot_market_mgr = market_mgr
+    _hot_order_mgr = order_mgr
+    _hot_inventory = inventory
+    _hot_quoter = quoter
+    _hot_settings = settings
+    _hot_discord = discord
+    _hot_resolution_guard = resolution_guard
+    _hot_toxicity = toxicity
+    _hot_paper = paper
+    _hot_fill_collector = fill_collector
 
     if settings.WS_ENABLED:
-        ws_feed = WebSocketFeed(on_mid_change=hot_requote)
+        ws_kwargs: Dict[str, Any] = {"on_mid_change": hot_requote}
+        if settings.DRY_RUN and paper is not None:
+            ws_kwargs["on_last_trade"] = _paper_on_last_trade
+            ws_kwargs["on_bbo"] = _paper_on_bbo
+        ws_feed = WebSocketFeed(**ws_kwargs)
         _ws_feed = ws_feed
-        _hot_market_mgr = market_mgr
-        _hot_order_mgr = order_mgr
-        _hot_inventory = inventory
-        _hot_quoter = quoter
-        _hot_settings = settings
-        _hot_discord = discord
-        _hot_resolution_guard = resolution_guard
 
         token_ids = []
         tick_sizes: Dict[str, float] = {}
@@ -1366,25 +1942,47 @@ async def main() -> None:
     # ── Graceful shutdown ────────────────────────────────────────
     shutdown_event = asyncio.Event()
 
-    def _signal_handler(sig, frame):
+    def _signal_handler(sig, frame=None):
         logger.warning("Received signal {} — initiating shutdown", sig)
         shutdown_event.set()
 
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, lambda: _signal_handler("SIGINT"))
+        loop.add_signal_handler(signal.SIGTERM, lambda: _signal_handler("SIGTERM"))
+    except (NotImplementedError, RuntimeError):
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
 
     # ── Launch background tasks ──────────────────────────────────
     bg_tasks = [
-        asyncio.create_task(market_refresh_task(market_mgr)),
+        asyncio.create_task(market_refresh_task(
+            market_mgr, order_mgr, inventory, seeder_ref, client, settings,
+            paper=paper,
+        )),
         asyncio.create_task(stale_order_cleanup_task(order_mgr)),
         asyncio.create_task(ghost_order_reconciliation_task(order_mgr)),
-        asyncio.create_task(daily_rewards_task(rewards, market_mgr, discord, scoring_monitor)),
-        asyncio.create_task(reconciliation_task(client, inventory, discord)),
+        asyncio.create_task(daily_rewards_task(
+            rewards, market_mgr, discord, scoring_monitor, order_mgr,
+        )),
         asyncio.create_task(dynamic_realloc_task(market_mgr, scoring_monitor, settings)),
         asyncio.create_task(periodic_dashboard_task(
             market_mgr, order_mgr, inventory, scoring_monitor, discord, settings,
         )),
+        asyncio.create_task(fill_ingest_task(
+            fill_collector, inventory, toxicity, discord, tape, settings,
+        )),
+        asyncio.create_task(digest_tick_task(
+            digest, tape, inventory, market_mgr, order_mgr, scoring_monitor, ws_feed,
+            rewards=rewards,
+        )),
     ]
+    if not settings.DRY_RUN:
+        bg_tasks.append(asyncio.create_task(
+            reconciliation_task(client, inventory, discord),
+        ))
+    if tape_http_task is not None:
+        bg_tasks.append(tape_http_task)
     if ws_feed:
         bg_tasks.append(asyncio.create_task(ws_feed.run_forever()))
 
@@ -1412,12 +2010,15 @@ async def main() -> None:
                     cycle_index=cycle_index,
                     skip_cids=unseeded_markets,
                     ws_feed=ws_feed,
+                    seeder=seeder_ref if settings.SEED_ENABLED else None,
+                    paper=paper,
                 )
                 if result:
                     posted, volume, quoted = result
                     rewards.record_cycle_stats(volume_usd=quoted, orders_posted=posted, filled_usd=volume)
             except Exception as exc:
                 logger.error("Unhandled cycle error: {}", exc)
+                tape.exception("run_quoting_cycle", exc)
                 await discord.send_error(f"Cycle error: {exc}")
 
             cycle_index += 1
