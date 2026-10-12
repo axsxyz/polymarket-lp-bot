@@ -38,6 +38,8 @@ class MarketCandidate:
     tick_size: str = "0.01"
     allocated_capital: float = 0.0
     score: float = 0.0
+    # True when Gamma bulk/fallback never matched this cid (vs matched but no date).
+    gamma_miss: bool = False
 
     @property
     def days_remaining(self) -> float:
@@ -52,6 +54,29 @@ class MarketCandidate:
     @property
     def has_end_date(self) -> bool:
         return self.end_date is not None
+
+
+def passes_cheap_filters(m: MarketCandidate, s: Settings) -> bool:
+    """Hard filters that do not need Gamma end_date / volume enrichment.
+
+    Kept for callers that want a pre-date gate; live enrich joins Gamma by
+    CLOB condition_ids in chunks (no capped per-cid fallback).
+    Volume is skipped when still 0 (CLOB sampling often omits it).
+    """
+    if m.max_spread < s.MIN_REWARDS_MAX_SPREAD:
+        return False
+    if not (s.MIDPOINT_MIN <= m.midpoint <= s.MIDPOINT_MAX):
+        return False
+    if m.reward_rate_daily < s.MIN_REWARD_RATE_DAILY:
+        return False
+    if m.max_spread <= 0 or m.min_size <= 0:
+        return False
+    if m.volume_24h > 0:
+        if m.volume_24h > s.MAX_24H_VOLUME:
+            return False
+        if m.volume_24h < s.MIN_24H_VOLUME:
+            return False
+    return True
 
 
 def passes_hard_filters(m: MarketCandidate, s: Settings) -> bool:
@@ -144,8 +169,17 @@ def rank_score(m: MarketCandidate, s: Settings) -> float:
     spread_bonus = min(m.max_spread / 0.05, 1.0) * 0.25
 
     expensive_side = max(m.midpoint, 1.0 - m.midpoint) if m.midpoint > 0 else 0.5
-    seed_cost = m.min_size * expensive_side * 2
+    # Matched-pair seed cost (~N shares); stop min_size×expensive×2.
+    from utils.helpers import matched_seed_usd
+
     per_market_budget = s.TOTAL_CAPITAL / max(s.MAX_MARKETS, 1)
+    yes_mid = m.midpoint if m.midpoint > 0 else 0.5
+    no_mid = max(0.01, 1.0 - yes_mid)
+    seed_max = float(getattr(s, "SEED_MAX_USD_PER_SIDE", 0.0) or 0.0)
+    seed_cost = matched_seed_usd(per_market_budget, yes_mid, no_mid, seed_max)
+    if seed_cost <= 0:
+        # Fallback when mid/alloc cannot form a pair estimate
+        seed_cost = m.min_size * expensive_side * 2
     capital_eff = 1.0 if seed_cost <= 0 else min(per_market_budget / seed_cost, 2.0) / 2.0
 
     # Longevity bonus: markets with 180+ days get full bonus (1.3x),
@@ -165,13 +199,17 @@ def rank_score(m: MarketCandidate, s: Settings) -> float:
     else:
         liquidity_factor = 0.7
 
-    base = (m.reward_rate_daily / denominator) * (1.0 + tag_bonus) * (1.0 + spread_bonus)
+    # ROI-style: reward_day / matched_seed_usd × longevity/liquidity/tag
+    roi = m.reward_rate_daily / max(seed_cost, 1.0)
+    base = (roi / denominator) * (1.0 + tag_bonus) * (1.0 + spread_bonus)
     return base * capital_eff * longevity * liquidity_factor
 
 
 def _rejection_reason(m: MarketCandidate, s: Settings) -> Optional[str]:
     """Return a short reason string if the market fails a hard filter, else None."""
     if not m.has_end_date:
+        if m.gamma_miss:
+            return "gamma_miss"
         return "no end_date"
     if m.days_remaining < s.MIN_END_DATE_DAYS:
         return f"too short ({m.days_remaining:.0f}d < {s.MIN_END_DATE_DAYS}d)"
@@ -190,30 +228,60 @@ def _rejection_reason(m: MarketCandidate, s: Settings) -> Optional[str]:
     return None
 
 
+_FILTER_SAMPLE_CAP = 8
+
+
 def filter_and_rank(
     candidates: List[MarketCandidate],
     settings: Settings,
+    stats_out: Optional[Dict[str, Any]] = None,
 ) -> List[MarketCandidate]:
     """
     Apply hard filters, compute ranking scores, sort descending, and
     return the top MAX_MARKETS candidates.
+
+    If ``stats_out`` is provided it is filled with rejection_counts,
+    per-bucket samples (cid/question), and passed_count. Thresholds unchanged.
     """
     from loguru import logger
 
     passed: List[MarketCandidate] = []
     rejection_counts: Dict[str, int] = {}
+    samples: Dict[str, List[Dict[str, Any]]] = {}
+
+    def _sample(bucket: str, m: MarketCandidate, why: str) -> None:
+        bucket_samples = samples.setdefault(bucket, [])
+        if len(bucket_samples) < _FILTER_SAMPLE_CAP:
+            bucket_samples.append({
+                "cid": m.condition_id,
+                "question": m.question or "",
+                "mid": m.midpoint,
+                "spread": m.max_spread,
+                "reward": m.reward_rate_daily,
+                "min_size": m.min_size,
+                "why": why,
+            })
 
     for m in candidates:
         reason = _rejection_reason(m, settings)
         if reason:
             bucket = reason.split("(")[0].strip()
             rejection_counts[bucket] = rejection_counts.get(bucket, 0) + 1
+            _sample(bucket, m, reason)
         else:
             # Double-check with passes_hard_filters (capital efficiency check)
             if passes_hard_filters(m, settings):
                 passed.append(m)
             else:
-                rejection_counts["capital too expensive"] = rejection_counts.get("capital too expensive", 0) + 1
+                rejection_counts["capital too expensive"] = rejection_counts.get(
+                    "capital too expensive", 0
+                ) + 1
+                _sample("capital too expensive", m, "capital too expensive")
+
+    if stats_out is not None:
+        stats_out["rejection_counts"] = rejection_counts
+        stats_out["samples"] = samples
+        stats_out["passed_count"] = len(passed)
 
     if rejection_counts:
         summary = ", ".join(f"{k}: {v}" for k, v in sorted(rejection_counts.items(), key=lambda x: -x[1]))
@@ -227,8 +295,15 @@ def filter_and_rank(
     selected = passed[: settings.MAX_MARKETS]
 
     for i, m in enumerate(selected):
-        expensive_side = max(m.midpoint, 1.0 - m.midpoint) if m.midpoint > 0 else 0.5
-        seed_est = m.min_size * expensive_side * 2
+        from utils.helpers import matched_seed_usd
+
+        per_mkt = settings.TOTAL_CAPITAL / max(settings.MAX_MARKETS, 1)
+        yes_mid = m.midpoint if m.midpoint > 0 else 0.5
+        no_mid = max(0.01, 1.0 - yes_mid)
+        seed_est = matched_seed_usd(
+            per_mkt, yes_mid, no_mid,
+            float(getattr(settings, "SEED_MAX_USD_PER_SIDE", 0.0) or 0.0),
+        )
         logger.info(
             "Rank #{}: {} score={:.2f} reward=${:.2f}/day spread={:.3f} "
             "mid={:.2f} min_size={:.0f} seed_est=${:.0f} days={:.0f} vol24h=${:,.0f} tags={}",
@@ -446,6 +521,22 @@ def parse_clob_simplified_market(raw: Dict[str, Any]) -> MarketCandidate:
     for r in rates:
         daily_rate += float(r.get("rewards_daily_rate", 0) or 0)
 
+    # CLOB sampling occasionally carries end_date (fallback before Gamma).
+    end_str = (
+        raw.get("end_date_iso")
+        or raw.get("endDateIso")
+        or raw.get("end_date")
+        or raw.get("endDate")
+    )
+    end_date = None
+    if end_str:
+        try:
+            end_date = datetime.fromisoformat(str(end_str).replace("Z", "+00:00"))
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            end_date = None
+
     return MarketCandidate(
         condition_id=raw.get("condition_id", ""),
         token_id_yes=token_yes,
@@ -454,6 +545,7 @@ def parse_clob_simplified_market(raw: Dict[str, Any]) -> MarketCandidate:
         min_size=float(rewards.get("min_size", 0) or 0),
         reward_rate_daily=daily_rate,
         midpoint=_avg_token_price(tokens),
+        end_date=end_date,
         neg_risk=bool(raw.get("neg_risk", False)),
     )
 

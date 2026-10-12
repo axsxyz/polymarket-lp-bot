@@ -21,7 +21,8 @@ import json
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import aiohttp
 from loguru import logger
@@ -42,17 +43,16 @@ CACHE_PATH = Path("data/selected_markets.json")
 TOP_TIER_COUNT = 15
 TOP_TIER_BOOST = 1.25  # top markets get 25% more capital
 
-# Gamma /markets caps each response at 100 items regardless of the requested
-# `limit` query parameter — empirically verified May 2026.  We therefore page
-# in 100-item chunks and continue until the API returns an empty list.
+# Gamma join: CLOB condition_ids ARE the fetch (no universe keyset/offset walk).
+# Chunk size = Gamma page cap. Repeated ``condition_ids=`` query params (comma
+# returns 0 — probed 2026-08-29).
 GAMMA_PAGE_LIMIT = 100
-# Safety bound: 50 × 100 = 5_000 markets ceiling so a stuck/looping API can
-# never spin forever.  If we ever hit this we log a WARNING because real
-# universes that large would indicate the bot is missing trailing markets.
-MAX_GAMMA_PAGES = 50
-# Inter-page delay (~1.4 RPS) aligned with `backtest/fetcher.py:HTTP_RATE_LIMIT_SLEEP_S`
-# and well below the documented CLOB/Gamma ~1.67 RPS plafond.
-GAMMA_PAGE_SLEEP_S = 0.7
+GAMMA_CHUNK_SLEEP_S = 0.2  # mid of 0.15–0.3s between chunk requests
+GAMMA_CHUNK_CONCURRENCY = 2
+GAMMA_PAGE_RETRIES = 3
+GAMMA_PAGE_RETRY_SLEEP_S = 0.8
+# On deterministic 422 for a fat chunk, re-request at these sizes (in order).
+GAMMA_422_SPLIT_SIZES = (50, 20, 1)
 
 
 class MarketState(str, Enum):
@@ -99,6 +99,20 @@ class MarketManager:
         # Per-market operational state (Issue 4) — survives across cycles
         # so realloc can read it without recomputing from scratch.
         self._states: Dict[str, MarketState] = {}
+        self._sticky_inactive: set[str] = set()
+        self.last_went_in: List[MarketCandidate] = []
+        self.last_went_out: List[MarketCandidate] = []
+        self._tape: Any = None
+        self._digest: Any = None
+        self._last_gamma_status: Any = None
+        self._last_gamma_pages: int = 0
+        self._last_clob_pages: int = 0
+
+    def set_tape(self, tape: Any) -> None:
+        self._tape = tape
+
+    def set_digest(self, digest: Any) -> None:
+        self._digest = digest
 
     @property
     def markets(self) -> List[MarketCandidate]:
@@ -112,20 +126,49 @@ class MarketManager:
     # Market state (Issue 4)
     # ------------------------------------------------------------------
 
-    def set_state(self, condition_id: str, state: MarketState) -> None:
+    def set_state(self, condition_id: str, state: MarketState, reason: str = "") -> None:
         """Record the latest operational state for a market.
 
         SEED_FAILED is sticky: once set by the seeder it remains until the
         next ``refresh()`` rebuilds the universe (the unseeded cid leaves
-        the candidate list).  Other states overwrite freely — they reflect
-        the most recent cycle outcome.
+        the candidate list).  Resolution-delisted INACTIVE is also sticky
+        (``mark_resolution_inactive``) so refresh cannot re-arm a delist.
         """
+        prev = self._states.get(condition_id, MarketState.UNKNOWN)
         if (
             self._states.get(condition_id) == MarketState.SEED_FAILED
             and state != MarketState.SEED_FAILED
         ):
             return
+        if (
+            condition_id in getattr(self, "_sticky_inactive", set())
+            and state != MarketState.INACTIVE
+        ):
+            return
         self._states[condition_id] = state
+        if prev != state:
+            self._emit_state(condition_id, prev.value, state.value, reason)
+
+    def _emit_state(self, cid: str, from_state: str, to_state: str, reason: str) -> None:
+        tape = getattr(self, "_tape", None)
+        if tape is None:
+            return
+        try:
+            tape.state(cid=cid, from_state=from_state, to_state=to_state, reason=reason)
+        except Exception as exc:
+            logger.warning("Tape state emit failed: {}", exc)
+
+    def mark_resolution_inactive(self, condition_id: str) -> None:
+        """INACTIVE that survives Step 7 reclassification and refresh."""
+        if not hasattr(self, "_sticky_inactive"):
+            self._sticky_inactive = set()
+        prev = self._states.get(condition_id, MarketState.UNKNOWN)
+        self._sticky_inactive.add(condition_id)
+        self._states[condition_id] = MarketState.INACTIVE
+        if prev != MarketState.INACTIVE:
+            self._emit_state(
+                condition_id, prev.value, MarketState.INACTIVE.value, "resolution",
+            )
 
     def get_state(self, condition_id: str) -> MarketState:
         return self._states.get(condition_id, MarketState.UNKNOWN)
@@ -156,7 +199,8 @@ class MarketManager:
         enriched = await self._enrich_with_gamma(clob_markets)
         logger.info("Enriched {} markets with Gamma metadata", len(enriched))
 
-        ranked = filter_and_rank(enriched, self._settings)
+        filter_stats: Dict[str, Any] = {}
+        ranked = filter_and_rank(enriched, self._settings, stats_out=filter_stats)
         logger.info(
             "After filtering: {} markets (target {}-{})",
             len(ranked),
@@ -177,6 +221,8 @@ class MarketManager:
         self._rebuild_token_index()
         self._last_refresh = datetime.now(timezone.utc)
         self._save_cache()
+        self._emit_universe_filter(len(clob_markets), ranked, filter_stats)
+        self._log_capital_sizing(ranked, filter_stats)
 
         self._log_selection_details(prev_selection)
 
@@ -188,6 +234,69 @@ class MarketManager:
         await self._client.sync_conditional_allowances(token_ids)
 
         return self._markets
+
+    def _emit_universe_filter(
+        self,
+        fetched: int,
+        ranked: List[MarketCandidate],
+        stats: Dict[str, Any],
+    ) -> None:
+        selected_rows: List[Dict[str, Any]] = []
+        for i, m in enumerate(ranked, start=1):
+            selected_rows.append({
+                "cid": m.condition_id,
+                "rank": i,
+                "score": m.score,
+                "question": m.question or "",
+                "mid": m.midpoint,
+                "spread": m.max_spread,
+                "reward": m.reward_rate_daily,
+                "min_size": m.min_size,
+                "alloc": m.allocated_capital,
+                "tags": list(m.tags[:6]) if m.tags else [],
+            })
+        rejection_counts = dict(stats.get("rejection_counts") or {})
+        samples = dict(stats.get("samples") or {})
+        ranked_n = int(stats.get("passed_count") or len(ranked))
+        gamma_matched = int(getattr(self, "_last_gamma_matched", 0) or 0)
+        gamma_status = getattr(self, "_last_gamma_status", None)
+        pages = int(getattr(self, "_last_gamma_pages", 0) or 0)
+        try:
+            if getattr(self, "_tape", None) is not None:
+                self._tape.universe(
+                    fetched=fetched,
+                    gamma_matched=gamma_matched,
+                    gamma_status=gamma_status,
+                    pages=pages,
+                )
+                self._tape.filter(
+                    rejection_counts=rejection_counts,
+                    samples=samples,
+                    selected=selected_rows,
+                    ranked=ranked_n,
+                )
+                limit = float(self._settings.RESOLUTION_MAX_LOSS_USD)
+                for m in ranked:
+                    if float(m.min_size) > limit + 1e-12:
+                        self._tape.skip(
+                            m.condition_id,
+                            "min_size_gt_max_loss",
+                            min_size=m.min_size,
+                            limit=limit,
+                        )
+            if getattr(self, "_digest", None) is not None:
+                self._digest.set_funnel(
+                    fetched=fetched,
+                    gamma_matched=gamma_matched,
+                    gamma_status=gamma_status,
+                    pages=pages,
+                    rejection_counts=rejection_counts,
+                    samples=samples,
+                    selected=selected_rows,
+                    ranked=ranked_n,
+                )
+        except Exception as exc:
+            logger.warning("Tape universe/filter emit failed: {}", exc)
 
     def _log_selection_details(
         self, prev_selection: Dict[str, MarketCandidate]
@@ -232,6 +341,8 @@ class MarketManager:
             for cid in prev_selection
             if cid not in new_cids
         ]
+        self.last_went_in = list(went_in)
+        self.last_went_out = list(went_out)
 
         for m in went_in:
             q = (m.question or "")[:50]
@@ -290,6 +401,7 @@ class MarketManager:
         """Page through get_sampling_simplified_markets until exhausted."""
         all_markets: List[MarketCandidate] = []
         cursor = ""
+        pages = 0
 
         while True:
             try:
@@ -298,6 +410,7 @@ class MarketManager:
                 logger.error("CLOB sampling fetch failed: {}", exc)
                 break
 
+            pages += 1
             data = resp.get("data", []) if isinstance(resp, dict) else []
             for raw in data:
                 try:
@@ -309,6 +422,7 @@ class MarketManager:
             if not cursor or cursor == "LTE=":
                 break
 
+        self._last_clob_pages = pages
         return all_markets
 
     # ------------------------------------------------------------------
@@ -318,20 +432,26 @@ class MarketManager:
     async def _enrich_with_gamma(
         self, candidates: List[MarketCandidate]
     ) -> List[MarketCandidate]:
+        """Join CLOB candidates to Gamma rows by condition_id (chunked GET).
+
+        No keyset/offset universe walk. Leftover cids → gamma_miss unless
+        CLOB already supplied end_date (then not a miss).
         """
-        Fetch extra metadata (end_date, tags, volume) from Gamma API and
-        merge into existing candidates keyed by condition_id.
-        """
-        gamma_lookup = await self._fetch_gamma_markets()
+        t0 = time.monotonic()
+        cids = list(dict.fromkeys(
+            m.condition_id for m in candidates if m.condition_id
+        ))
+        gamma_lookup, stats = await self._fetch_gamma_by_condition_ids(cids)
 
         enriched_count = 0
-        unenriched: List[str] = []
         for m in candidates:
             gamma = gamma_lookup.get(m.condition_id)
             if gamma is None:
-                unenriched.append(m.condition_id[:12])
+                if not m.has_end_date:
+                    m.gamma_miss = True
                 continue
             enriched_count += 1
+            m.gamma_miss = False
             if gamma.end_date is not None:
                 m.end_date = gamma.end_date
             if gamma.tags:
@@ -343,99 +463,221 @@ class MarketManager:
             if gamma.tick_size:
                 m.tick_size = gamma.tick_size
 
-        if unenriched:
-            logger.warning(
-                "Gamma enrichment: {}/{} candidates had no Gamma match "
-                "(will be rejected by hard filter — no end_date). "
-                "Sample IDs: {}",
-                len(unenriched), len(candidates),
-                ", ".join(unenriched[:5]),
-            )
-        logger.info("Gamma enrichment complete: {}/{} matched", enriched_count, len(candidates))
+        # CLOB end_date fills: not a gamma_miss when date already present.
+        for m in candidates:
+            if m.has_end_date:
+                m.gamma_miss = False
 
+        still_miss = sum(
+            1 for m in candidates if m.gamma_miss and not m.has_end_date
+        )
+        no_date = sum(
+            1 for m in candidates
+            if (not m.has_end_date) and (not m.gamma_miss)
+        )
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "Gamma join: chunks={} hits={}/{} misses={} splits_422={} "
+            "elapsed={:.1f}s gamma_miss={} no_end_date={}",
+            stats.get("chunks", 0),
+            enriched_count,
+            len(candidates),
+            stats.get("misses", max(0, len(cids) - enriched_count)),
+            stats.get("splits_422", 0),
+            elapsed,
+            still_miss,
+            no_date,
+        )
+        if still_miss or no_date:
+            logger.warning(
+                "Gamma enrichment leftovers: gamma_miss={} no_end_date={}",
+                still_miss, no_date,
+            )
+        self._last_gamma_matched = enriched_count
         return candidates
 
-    async def _fetch_gamma_markets(self) -> Dict[str, MarketCandidate]:
-        """Fetch Gamma /markets pages, parse each item, build a condition_id lookup.
+    @staticmethod
+    def _gamma_chunk_params(condition_ids: Sequence[str]) -> List[Tuple[str, str]]:
+        """Build repeated ``condition_ids`` query params (not comma-joined)."""
+        params: List[Tuple[str, str]] = [
+            ("condition_ids", cid) for cid in condition_ids
+        ]
+        params.append(("limit", str(min(GAMMA_PAGE_LIMIT, max(len(condition_ids), 1)))))
+        return params
 
-        The Gamma API caps each response at ``GAMMA_PAGE_LIMIT`` (100) items
-        regardless of the requested ``limit`` query param.  Previously this
-        function requested 200 and exited as soon as ``len(items) < limit``,
-        which meant the first page (capped at 100) always triggered the early
-        exit and the bot only ever saw the first ~100 markets.  We now page
-        until the API returns an empty list, with a ``MAX_GAMMA_PAGES`` safety
-        bound and an inter-page sleep to respect rate limits.
-        """
+    @staticmethod
+    def _parse_gamma_list_payload(data: Any) -> list:
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            items = data.get("markets") or data.get("data") or []
+            return items if isinstance(items, list) else []
+        return []
+
+    async def _gamma_get_chunk(
+        self,
+        session: aiohttp.ClientSession,
+        base: str,
+        condition_ids: Sequence[str],
+    ) -> Tuple[int, Any, str]:
+        """One GET /markets?condition_ids=… Return (status, json_or_None, body_snip)."""
+        url = f"{base}/markets"
+        params = self._gamma_chunk_params(condition_ids)
+        try:
+            async with session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=40),
+            ) as resp:
+                status = resp.status
+                if status == 200:
+                    return status, await resp.json(), ""
+                body = (await resp.text())[:240]
+                return status, None, body
+        except Exception as exc:
+            return 0, None, repr(exc)[:240]
+
+    async def _fetch_gamma_chunk_recursive(
+        self,
+        session: aiohttp.ClientSession,
+        base: str,
+        condition_ids: List[str],
+        stats: Dict[str, int],
+        sem: asyncio.Semaphore,
+    ) -> Dict[str, MarketCandidate]:
+        """Fetch one chunk; on 422 split to 50/20/1 without aborting siblings."""
+        if not condition_ids:
+            return {}
+
         lookup: Dict[str, MarketCandidate] = {}
+        data = None
+        last_status: Any = None
+
+        async with sem:
+            for attempt in range(1, GAMMA_PAGE_RETRIES + 1):
+                status, payload, body = await self._gamma_get_chunk(
+                    session, base, condition_ids,
+                )
+                last_status = status
+                self._last_gamma_status = status
+
+                if status == 200:
+                    data = payload
+                    break
+
+                if status == 422:
+                    # Deterministic — split; do not burn retries on fat chunks.
+                    break
+
+                if status in (429, 500, 502, 503, 504) or status == 0:
+                    logger.warning(
+                        "Gamma join chunk n={} status {} attempt {}/{} body={!r}",
+                        len(condition_ids), status, attempt, GAMMA_PAGE_RETRIES,
+                        body,
+                    )
+                    if attempt < GAMMA_PAGE_RETRIES:
+                        await asyncio.sleep(GAMMA_PAGE_RETRY_SLEEP_S * attempt)
+                    continue
+
+                logger.warning(
+                    "Gamma join chunk n={} status {} body={!r} — skipping chunk",
+                    len(condition_ids), status, body,
+                )
+                break
+
+            await asyncio.sleep(GAMMA_CHUNK_SLEEP_S)
+
+        if last_status == 422:
+            next_size = next(
+                (s for s in GAMMA_422_SPLIT_SIZES if s < len(condition_ids)),
+                None,
+            )
+            if next_size is None:
+                logger.warning(
+                    "Gamma join 422 on single cid {} — giving up on this id",
+                    condition_ids[0][:16],
+                )
+                return {}
+            stats["splits_422"] = stats.get("splits_422", 0) + 1
+            logger.warning(
+                "Gamma join 422 on chunk n={} — splitting to {}",
+                len(condition_ids), next_size,
+            )
+            for i in range(0, len(condition_ids), next_size):
+                sub = await self._fetch_gamma_chunk_recursive(
+                    session, base, condition_ids[i:i + next_size], stats, sem,
+                )
+                lookup.update(sub)
+            return lookup
+
+        if data is None:
+            return {}
+
+        items = self._parse_gamma_list_payload(data)
+        for raw in items:
+            try:
+                mc = parse_gamma_market(raw)
+                if mc.condition_id:
+                    lookup[mc.condition_id] = mc
+            except Exception:
+                stats["parse_failures"] = stats.get("parse_failures", 0) + 1
+        return lookup
+
+    async def _fetch_gamma_by_condition_ids(
+        self, condition_ids: Sequence[str],
+    ) -> Tuple[Dict[str, MarketCandidate], Dict[str, int]]:
+        """Batch-fetch Gamma markets for the given CLOB condition_ids.
+
+        Chunks of ``GAMMA_PAGE_LIMIT`` with concurrency ≤2. Never walks
+        ``/markets/keyset`` or ``offset=``.
+        """
+        # Preserve order, drop empties / dupes.
+        cids = list(dict.fromkeys(c for c in condition_ids if c))
+        stats: Dict[str, int] = {
+            "chunks": 0,
+            "hits": 0,
+            "misses": 0,
+            "splits_422": 0,
+            "parse_failures": 0,
+        }
+        if not cids:
+            self._last_gamma_pages = 0
+            self._last_gamma_status = None
+            return {}, stats
+
+        chunks: List[List[str]] = [
+            cids[i:i + GAMMA_PAGE_LIMIT]
+            for i in range(0, len(cids), GAMMA_PAGE_LIMIT)
+        ]
+        stats["chunks"] = len(chunks)
         base = self._settings.GAMMA_API_URL.rstrip("/")
-        offset = 0
-        limit = GAMMA_PAGE_LIMIT
-        total_items = 0
-        parse_failures = 0
-        pages = 0
+        lookup: Dict[str, MarketCandidate] = {}
+        sem = asyncio.Semaphore(GAMMA_CHUNK_CONCURRENCY)
 
         try:
             async with aiohttp.ClientSession() as session:
-                while pages < MAX_GAMMA_PAGES:
-                    if pages > 0:
-                        # Throttle between pages only — never before the first
-                        # request — to keep cycle startup latency low while
-                        # respecting Gamma's rate limit on bulk pagination.
-                        await asyncio.sleep(GAMMA_PAGE_SLEEP_S)
+                async def _one(chunk: List[str]) -> Dict[str, MarketCandidate]:
+                    return await self._fetch_gamma_chunk_recursive(
+                        session, base, chunk, stats, sem,
+                    )
 
-                    url = f"{base}/markets?active=true&closed=false&limit={limit}&offset={offset}"
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=40)) as resp:
-                        if resp.status != 200:
-                            logger.warning("Gamma API returned status {}", resp.status)
-                            break
-                        data = await resp.json()
-
-                    items: list = data if isinstance(data, list) else (data.get("data", data) or [])
-                    if not isinstance(items, list) or not items:
-                        if offset == 0:
-                            logger.warning("Gamma API returned empty list on first page")
-                        break
-
-                    page_added = 0
-                    for raw in items:
-                        total_items += 1
-                        try:
-                            mc = parse_gamma_market(raw)
-                            if mc.condition_id:
-                                lookup[mc.condition_id] = mc
-                                page_added += 1
-                        except Exception:
-                            parse_failures += 1
-
-                    if offset == 0 and page_added == 0 and items:
-                        logger.debug(
-                            "Gamma first page had {} items but none parsed successfully",
-                            len(items),
-                        )
-
-                    pages += 1
-                    offset += limit
-
-            if pages >= MAX_GAMMA_PAGES:
-                logger.warning(
-                    "Gamma pagination hit safety bound MAX_GAMMA_PAGES={} "
-                    "({} entries fetched, {} items scanned) — some markets "
-                    "may have been missed.",
-                    MAX_GAMMA_PAGES, len(lookup), total_items,
+                results = await asyncio.gather(
+                    *[_one(ch) for ch in chunks],
+                    return_exceptions=True,
                 )
-
-            logger.info(
-                "Gamma lookup built with {} entries (fetched {}, pages {}, parse failures {})",
-                len(lookup),
-                total_items,
-                pages,
-                parse_failures,
-            )
-
+                for res in results:
+                    if isinstance(res, BaseException):
+                        logger.warning("Gamma join chunk failed: {!r}", res)
+                        continue
+                    lookup.update(res)
         except Exception as exc:
-            logger.error("Gamma API fetch completely failed: {}", exc)
+            logger.error("Gamma condition_ids join completely failed: {}", exc)
+            self._last_gamma_status = "error"
 
-        return lookup
+        stats["hits"] = len(lookup)
+        stats["misses"] = max(0, len(cids) - len(lookup))
+        self._last_gamma_pages = stats["chunks"]
+        return lookup, stats
 
     # ------------------------------------------------------------------
     # Capital allocation
@@ -448,9 +690,27 @@ class MarketManager:
         - Remaining markets get weight 1.0
         - Each market is capped at MAX_CAPITAL_PER_MARKET
         - Total never exceeds TOTAL_CAPITAL
+        - If TOTAL/N < MIN_CAPITAL_PER_MARKET, truncate N to floor(TOTAL/MIN)
+          instead of silently flooring every book at MIN and over-committing
         """
         if not markets:
             return
+
+        budget = self._settings.TOTAL_CAPITAL
+        min_cap = self._settings.MIN_CAPITAL_PER_MARKET
+        max_cap = self._settings.MAX_CAPITAL_PER_MARKET
+        ranked_n = len(markets)
+
+        # Cap N so raw TOTAL/N stays ≥ MIN (MAX_MARKETS already applied upstream).
+        if min_cap > 0:
+            max_affordable = max(1, int(budget // min_cap))
+            if len(markets) > max_affordable:
+                logger.warning(
+                    "Capping n={} → {} (ranked={}, floor(TOTAL/MIN)={}): "
+                    "TOTAL/N would be below MIN_CAPITAL_PER_MARKET=${:.0f}",
+                    len(markets), max_affordable, ranked_n, max_affordable, min_cap,
+                )
+                del markets[max_affordable:]
 
         n = len(markets)
         weights = [
@@ -458,13 +718,12 @@ class MarketManager:
             for i in range(n)
         ]
         total_weight = sum(weights)
-        budget = self._settings.TOTAL_CAPITAL
 
         for i, m in enumerate(markets):
             raw_alloc = (weights[i] / total_weight) * budget
             m.allocated_capital = min(
-                max(raw_alloc, self._settings.MIN_CAPITAL_PER_MARKET),
-                self._settings.MAX_CAPITAL_PER_MARKET,
+                max(raw_alloc, min_cap),
+                max_cap,
             )
 
         # Ensure we don't exceed global budget
@@ -473,6 +732,26 @@ class MarketManager:
             scale = budget / total_allocated
             for m in markets:
                 m.allocated_capital *= scale
+
+    def _log_capital_sizing(
+        self,
+        markets: List[MarketCandidate],
+        filter_stats: Dict[str, Any],
+    ) -> None:
+        """Refresh summary: n, ranked, alloc median, seed budget, cash reserve."""
+        import statistics
+
+        n = len(markets)
+        ranked = int(filter_stats.get("passed_count") or n)
+        allocs = [m.allocated_capital for m in markets]
+        alloc_med = float(statistics.median(allocs)) if allocs else 0.0
+        seed_budget = self._settings.TOTAL_CAPITAL * self._settings.SEED_BUDGET_PCT
+        cash_reserve = self._settings.TOTAL_CAPITAL - seed_budget
+        logger.info(
+            "Capital sizing: n={} ranked={} alloc_med=${:.0f} "
+            "seed_budget=${:.0f} cash_reserve=${:.0f}",
+            n, ranked, alloc_med, seed_budget, cash_reserve,
+        )
 
     # ------------------------------------------------------------------
     # Performance-based market scoring

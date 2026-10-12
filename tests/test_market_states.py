@@ -59,6 +59,9 @@ def _make_manager(markets: List[MarketCandidate]) -> MarketManager:
     mgr._token_index = {}
     mgr._last_refresh = None
     mgr._states = {}
+    mgr._sticky_inactive = set()
+    mgr.last_went_in = []
+    mgr.last_went_out = []
     return mgr
 
 
@@ -158,3 +161,47 @@ class TestReallocSelection:
         assert adjusted == 0
         assert mgr._markets[0].allocated_capital == old_failed
         assert mgr._markets[1].allocated_capital == old_one_sided
+
+
+class TestAllocateCapitalNCap:
+    def test_caps_n_when_total_per_n_below_min(self):
+        """TOTAL/N < MIN → truncate list rather than floor every book at MIN."""
+        s = _make_settings(
+            TOTAL_CAPITAL=1000,
+            MIN_CAPITAL_PER_MARKET=200,
+            MAX_CAPITAL_PER_MARKET=500,
+        )
+        mgr = MarketManager.__new__(MarketManager)
+        mgr._settings = s
+        markets = [_candidate(f"c{i}", allocated=0.0) for i in range(10)]
+        # floor(1000/200)=5 → keep 5 of 10
+        mgr._allocate_capital(markets)
+        assert len(markets) == 5
+        total = sum(m.allocated_capital for m in markets)
+        assert total <= 1000.0 + 1e-6
+        for m in markets:
+            assert m.allocated_capital >= 200.0 - 1e-6
+
+    def test_leaves_leftover_when_raw_above_max(self):
+        """TOTAL/N > MAX → each book capped at MAX; leftover cash OK."""
+        s = _make_settings(
+            TOTAL_CAPITAL=10000,
+            MIN_CAPITAL_PER_MARKET=200,
+            MAX_CAPITAL_PER_MARKET=500,
+        )
+        mgr = MarketManager.__new__(MarketManager)
+        mgr._settings = s
+        markets = [_candidate(f"c{i}", allocated=0.0) for i in range(5)]
+        mgr._allocate_capital(markets)
+        assert len(markets) == 5
+        for m in markets:
+            assert m.allocated_capital <= 500.0 + 1e-6
+        assert sum(m.allocated_capital for m in markets) < 10000.0
+
+
+class TestStickyResolutionInactive:
+    def test_mark_resolution_inactive_survives_scoring(self):
+        mgr = _make_manager([_candidate("c1")])
+        mgr.mark_resolution_inactive("c1")
+        mgr.set_state("c1", MarketState.SCORING)
+        assert mgr.get_state("c1") == MarketState.INACTIVE
