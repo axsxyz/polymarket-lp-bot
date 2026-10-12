@@ -10,6 +10,7 @@ import pytest
 from config.markets_filter import (
     MarketCandidate,
     _normalise_spread,
+    filter_and_rank,
     parse_clob_simplified_market,
     parse_gamma_market,
     passes_hard_filters,
@@ -63,6 +64,11 @@ class TestHardFilters:
     def test_zero_min_size_fails(self):
         s = _make_settings()
         assert not passes_hard_filters(_candidate(min_size=0.0), s)
+
+    def test_min_size_above_max_loss_not_hard_rejected(self):
+        """Hormuz/Vance-class min_size 200 must still pass cheap filters."""
+        s = _make_settings(RESOLUTION_MAX_LOSS_USD=50.0)
+        assert passes_hard_filters(_candidate(min_size=200.0), s)
 
     def test_short_expiry_fails(self):
         s = _make_settings()
@@ -170,3 +176,34 @@ class TestParseClobSimplifiedSpread:
         }
         mc = parse_clob_simplified_market(raw)
         assert mc.max_spread == pytest.approx(0.035)
+
+
+class TestFilterAndRankStats:
+    def test_rejection_histogram_and_samples(self):
+        s = _make_settings(MAX_MARKETS=2)
+        cands = [
+            _candidate(condition_id="ok1", question="Keep one"),
+            _candidate(condition_id="ok2", question="Keep two"),
+            _candidate(condition_id="noend", question="No date", end_date=None),
+            _candidate(condition_id="lo", question="Low mid", midpoint=0.05),
+        ]
+        stats: dict = {}
+        selected = filter_and_rank(cands, s, stats_out=stats)
+        assert len(selected) <= 2
+        assert stats["rejection_counts"]["no end_date"] == 1
+        assert stats["rejection_counts"]["midpoint out of range"] == 1
+        assert stats["samples"]["no end_date"][0]["cid"] == "noend"
+        assert "why" in stats["samples"]["no end_date"][0]
+        assert "mid" in stats["samples"]["no end_date"][0]
+        assert stats["passed_count"] >= len(selected)
+
+    def test_gamma_miss_vs_no_end_date(self):
+        s = _make_settings(MAX_MARKETS=2)
+        miss = _candidate(condition_id="miss1", question="Miss", end_date=None)
+        miss.gamma_miss = True
+        dated_miss = _candidate(condition_id="nodate", question="Matched no date", end_date=None)
+        dated_miss.gamma_miss = False
+        stats: dict = {}
+        filter_and_rank([miss, dated_miss], s, stats_out=stats)
+        assert stats["rejection_counts"]["gamma_miss"] == 1
+        assert stats["rejection_counts"]["no end_date"] == 1

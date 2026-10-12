@@ -4,6 +4,9 @@ Invariant: a single market that exceeds
 ``allocated_capital × MAX_MARKET_EXPOSURE_RATIO`` must trip its own pause
 *before* the global gross exposure limit kicks in, so a runaway position
 on one market cannot drag the whole bot through the global gate.
+
+ASK notional is excluded (selling owned inventory). BID leftover sizing
+must keep matched books under the limit except CLOB min_size floor.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import pytest
 
 from config.settings import Settings
 from core.inventory import InventoryTracker
+from core.order_manager import BUY, SELL, OrderManager, OrderRecord
 
 
 def _make_settings(**overrides) -> Settings:
@@ -61,11 +65,10 @@ class TestMarketExposureBreached:
         assert exposure == pytest.approx(100.0)
         assert limit == pytest.approx(40.0)
 
-    def test_open_orders_count_in_exposure(self):
-        """Open ASK/BID notional must be added to filled position."""
+    def test_open_bid_orders_count_in_exposure(self):
+        """BID notional is added; ASK is excluded by the order_manager callers."""
         s = _make_settings(MAX_MARKET_EXPOSURE_RATIO=0.40)
         inv = InventoryTracker(s)
-        # No fills, but $50 of open orders > $40 cap on $100 alloc
         breached, exposure, _ = inv.is_market_exposure_breached(
             "c1", allocated_capital=100.0,
             open_order_notional_for_market=50.0,
@@ -73,27 +76,98 @@ class TestMarketExposureBreached:
         assert breached is True
         assert exposure == pytest.approx(50.0)
 
+    def test_matched_315_leftover_bid_no_breach_at_090(self):
+        """Vance-class: inv $315 + leftover BID under 0.90*500; ASK ignored."""
+        s = _make_settings(MAX_MARKET_EXPOSURE_RATIO=0.90)
+        inv = InventoryTracker(s)
+        inv.ensure_position("vance", yes_token_id="y", no_token_id="n")
+        inv._positions["vance"].yes_size = 315
+        inv._positions["vance"].no_size = 315
+        inv._midpoints["y"] = 0.50  # mark = 315
+
+        bid_notional = 135.0
+        ask_notional = 315.0  # excluded from gate input
+        breached, exposure, limit = inv.is_market_exposure_breached(
+            "vance",
+            allocated_capital=500.0,
+            open_order_notional_for_market=bid_notional,
+        )
+        assert breached is False
+        assert exposure == pytest.approx(315.0 + bid_notional)
+        assert limit == pytest.approx(450.0)
+        assert 315.0 + bid_notional + ask_notional > limit
+
+    def test_independent_alloc_half_bid_would_breach(self):
+        """alloc/2 BID on both tokens atop $315 seed would trip 0.90*500."""
+        s = _make_settings(MAX_MARKET_EXPOSURE_RATIO=0.90)
+        inv = InventoryTracker(s)
+        inv.ensure_position("vance", yes_token_id="y", no_token_id="n")
+        inv._positions["vance"].yes_size = 315
+        inv._positions["vance"].no_size = 315
+        inv._midpoints["y"] = 0.50
+        breached, exposure, limit = inv.is_market_exposure_breached(
+            "vance",
+            allocated_capital=500.0,
+            open_order_notional_for_market=500.0,
+        )
+        assert breached is True
+        assert exposure == pytest.approx(815.0)
+        assert limit == pytest.approx(450.0)
+
+    def test_minsize_floor_overshoot_not_breached(self):
+        """Two-sided min_size BID floor may exceed ratio — do not INACTIVE."""
+        s = _make_settings(MAX_MARKET_EXPOSURE_RATIO=0.90)
+        inv = InventoryTracker(s)
+        inv.ensure_position("vance", yes_token_id="y", no_token_id="n")
+        inv._positions["vance"].yes_size = 315
+        inv._positions["vance"].no_size = 315
+        inv._midpoints["y"] = 0.50
+        bid_floor = 200.0
+        breached, exposure, limit = inv.is_market_exposure_breached(
+            "vance",
+            allocated_capital=500.0,
+            open_order_notional_for_market=bid_floor,
+            minsize_bid_floor_usd=bid_floor,
+        )
+        assert exposure > limit
+        assert breached is False
+
+
+class TestBidOnlyOpenNotional:
+    def test_ask_excluded_from_open_notional(self):
+        om = OrderManager.__new__(OrderManager)
+        om._live_orders = {
+            "1": OrderRecord(
+                order_id="1", token_id="y", condition_id="c1",
+                side=BUY, price=0.40, size=100.0,
+            ),
+            "2": OrderRecord(
+                order_id="2", token_id="y", condition_id="c1",
+                side=SELL, price=0.60, size=100.0,
+            ),
+        }
+        assert om.open_order_notional_for_market("c1") == pytest.approx(40.0)
+        assert om.open_ask_notional_for_market("c1") == pytest.approx(60.0)
+        assert om.open_order_notional == pytest.approx(40.0)
+        assert om.open_ask_notional == pytest.approx(60.0)
+
 
 class TestGlobalExposureWithDeployed:
     """Global gross exposure scales with deployed capital when provided."""
 
     def test_deployed_capital_overrides_total(self):
-        # TOTAL_CAPITAL=350, but deployed only $100 → limit = 100 * 0.80 = $80
         s = _make_settings(MAX_EXPOSURE_RATIO=0.80, TOTAL_CAPITAL=350)
         inv = InventoryTracker(s)
         inv.ensure_position("c1", yes_token_id="y", no_token_id="n")
         inv._positions["c1"].yes_size = 200
         inv._midpoints["y"] = 0.50  # gross = $100
 
-        # With deployed capital $100, limit is $80 → breach
         assert inv.is_gross_exposure_breached(
             open_order_notional=0.0,
             active_cids={"c1"},
             deployed_capital=100.0,
         ) is True
 
-        # Without deployed_capital, falls back to legacy
-        # GLOBAL_MAX_GROSS_EXPOSURE_PCT × TOTAL_CAPITAL = 0.80 × 350 = $280 → no breach
         assert inv.is_gross_exposure_breached(
             open_order_notional=0.0,
             active_cids={"c1"},
