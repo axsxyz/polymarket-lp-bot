@@ -119,10 +119,10 @@
 - [x] Midpoint guard continu `[0.18, 0.82]` → `core/quoter.py:108-145` + `main.py` + `config/settings.py`
   Pause par marché après 3 cold cycles hors bande, reprise auto, Discord alerts — 84/84 ✅
 
-- [x] Drawdown daily circuit breaker → `core/inventory.py` + `main.py` (commit `76ec51f`)
+- [x] Drawdown daily circuit breaker → `core/inventory.py` + `main.py` (commit `1faf4f1`)
   Pause globale si `realised_pnl_today < -5% × TOTAL_CAPITAL`, reset minuit UTC — 76/76 ✅
 
-- [x] fix(settings) NoDecode + extra="ignore" → `config/settings.py` (commit `f531129`)
+- [x] fix(settings) NoDecode + extra="ignore" → `config/settings.py` (commit `d21ac1a`)
   PREFERRED_TAGS CSV + DASHBOARD_* legacy ne cassent plus l'init
 
 ### 2026-05-04

@@ -1,7 +1,7 @@
 # AUDIT — Polymarket LP Farmer Bot (Python)
 
 **Date:** 2026-08-29  
-**Repo:** `AXS13/Polymarket_lp` (read on `main` @ `d906d86`)  
+**Repo:** `AXS13/Polymarket_lp` (read on `main` @ `9c0fbeb`)  
 **Scope:** Read-only pass of `main.py`, `core/*`, `config/*`, `tests/*`, `requirements.txt`, `.env.example`, and the May 2026 audit (`audit_opus4_7_max_may_2026.txt`). No rewrite. No new strategy. No drive-by refactors.
 
 **What this is not:** the May 2026 audit is stale. Most of its “known bugs” (rate limit 5 RPS, no jitter, no drawdown breaker, no midpoint guard, seed cost-basis, `/10` LP share, missing resolution/toxicity/backtest) were already patched in May. This document is the current code.
