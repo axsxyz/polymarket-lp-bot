@@ -118,7 +118,7 @@ flowchart LR
 **2. CLOB V2 cutover** *(external change, fixed 2026-05-09)*
 - *Symptom:* Polymarket's V2 cutover retired the V1 SDK and moved collateral from USDC.e to pUSD.
 - *Root cause:* an external migration. SDK calls were renamed (for example `create_or_derive_api_creds` became `create_or_derive_api_key`), the exchange contracts changed, and the wallet needed pUSD.
-- *Fix:* moved the client to `py-clob-client-v2`, and the setup script to pUSD wrapping and V2 approvals (`34aa08a`). Native USDC is now swapped to USDC.e on Uniswap V3 before the wrap, with a 0.1 % minimum-out guard (`3a0887e`). Added the POA extra-data middleware to the Polygon web3 client (`4e07f59`, [TODO: the error that prompted it]). `BookParams` are now converted to dicts for the batch midpoint and order-book calls (`e4e6e26`).
+- *Fix:* moved the client to `py-clob-client-v2`, and the setup script to pUSD wrapping and V2 approvals (`34aa08a`). Native USDC is now swapped to USDC.e on Uniswap V3 before the wrap, with a 0.1 % minimum-out guard (`3a0887e`). Added the POA extra-data middleware to the Polygon web3 client (`4e07f59`). `BookParams` are now converted to dicts for the batch midpoint and order-book calls (`e4e6e26`).
 
 **3. The seeder could leave a one-sided position** *(live session, fixed 2026-05-19)*
 - *Symptom:* a seed bought YES and then skipped NO, which is a directional position the bot is not allowed to hold. Separately, the cycle log reported a positive Q-score for books that had no ask.
@@ -152,7 +152,7 @@ python main.py
 ```
 
 - `DRY_RUN=true` posts no orders. Orders, cancels and seeding go to the in-process paper broker, which starts with `TOTAL_CAPITAL` in paper cash (or `PAPER_CASH` if set).
-- DRY_RUN still talks to Polymarket. Startup derives CLOB API credentials from `PRIVATE_KEY` and reads live markets and the market WebSocket, so it needs network access and a valid key. [TODO: confirm an unfunded key is enough for DRY_RUN.]
+- DRY_RUN still talks to Polymarket. Startup derives CLOB API credentials from `PRIVATE_KEY` and reads live markets and the market WebSocket, so it needs network access and a valid key.
 - The operator terminal is at `http://127.0.0.1:8765/` (`TAPE_HTTP_ENABLED`, `TAPE_HTTP_PORT`).
 - Live mode (`DRY_RUN=false`) needs a funded wallet with pUSD and on-chain approvals (`python scripts/setup_allowances.py --all`). For the full runbook, scripts and deployment, see [docs/operations.md](docs/operations.md).
 
@@ -219,7 +219,15 @@ Known limitations:
 - Strategy risk the code cannot remove: 1-tick resting quotes are exposed to faster traders, and long-dated markets lock inventory until it is sold or the market resolves (AUDIT.md:265-266).
 - Books whose `min_size` exceeds `RESOLUTION_MAX_LOSS_USD` still post `min_size` bids on both sides and are tagged `bid_over_cap` (`core/quoter.py:403-416`).
 - There is no CI, linter or type checker (AGENTS.md:33), and `main.py` is a single ~2,050-line orchestrator.
-- Live results: [TODO: markets run live, uptime, fills and volume, rewards earned, net PnL, measured requote latency].
+- Live results (markets run live, uptime, fills and volume, rewards earned, net PnL, requote latency) are not published yet.
+
+## Open items
+
+Tracked here until they are done:
+
+- [ ] Publish live results: markets run live, uptime, fills and volume, rewards earned, net PnL, measured requote latency.
+- [ ] Confirm whether an unfunded key is enough for DRY_RUN.
+- [ ] Record the error that prompted the POA extra-data middleware (`4e07f59`).
 
 ## License
 
